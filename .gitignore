@@ -94,3 +94,7 @@ _*.cjs
 # Agent 运行时状态（本机工具目录，不入库）
 .omc/
 .claude-flow/
+
+# Trae 设备身份（含 EC 私钥），由 scripts/trae_device_gen.py 生成，绝不入库。
+/client-profile/
+/out_trae/

@@ -51,6 +51,11 @@ services:
       # 账号库、网关 Key、签到/积分记录、备份都在这里。
       # 命名卷首次创建时会继承镜像里 /data 的属主（uid 10001），无需手工 chown。
       - buddy-switch-data:/data
+      # Trae 客户端形态的设备身份（`<变体>/User/globalStorage/storage.json`）。
+      # 容器里没有 Trae 客户端，OAuth 授权与续期都要求这里有一份 EC P-256 密钥对；
+      # 由 `scripts/trae_device_gen.py` 生成后放进来，挂成只读即可。
+      # 配合下面的 XDG_CONFIG_HOME，`platform::data_dir_base()` 就会找到它。
+      - ./client-profile:/client-profile:ro
     environment:
       # 容器内必须绑 0.0.0.0，否则宿主访问不到（CLI 默认 127.0.0.1）。
       BUDDY_SWITCH_HOST: "0.0.0.0"
@@ -58,6 +63,12 @@ services:
       # 数据根目录。**必须是已存在的绝对目录**，否则 CLI 拒绝启动
       # （entrypoint 会 mkdir，但 bind mount 的属主不对时仍会失败 —— 那是故意的）。
       BUDDY_SWITCH_HOME: "/data"
+      # Trae 设备身份的查找根目录。容器是 Linux ⇒ `platform::data_dir_base()` 走
+      # `XDG_CONFIG_HOME` 分支（缺省 `~/.config`）。指到挂载点后，
+      # `<XDG_CONFIG_HOME>/Trae CN/User/globalStorage/storage.json` 就是设备凭证。
+      # ⚠️ 这是全局变量，也会影响 JetBrains / VS Code 的客户端扫描 —— 本容器里
+      #    两者都没有客户端，因此无副作用；若将来要在容器里装它们，需另设覆盖。
+      XDG_CONFIG_HOME: "/client-profile"
       # 管理面的 Host 白名单（2026-10 起有来源校验）。**默认不用设**：
       # 本文件把端口发布到宿主回环（127.0.0.1:57890），浏览器用 localhost 访问时
       # Host 是回环，天然放行；SSH 隧道同理。
