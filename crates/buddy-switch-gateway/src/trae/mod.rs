@@ -69,12 +69,33 @@ use pool::TraePool;
 /// 注意与 `modules::trae::endpoints_for(..).account_base`（`https://api.trae.cn`，签到/积分用）
 /// **不是同一个主机**：对话走 mchost.guru 的 agent 网关。两者不可互换。
 ///
-/// 取值与 [`buddy_switch_core::modules::trae::variant`] 的 CN 端点表逐字一致
-/// （实测两条 CN 产品线都是这个主机）；该表另登记了国际化的
-/// `https://core-normal.trae.ai`，**但从未对真实上游跑通过**。
-/// 想按变体/地区切换出站时，请改 [`TraeGatewayConfig::upstream`] 的取值来源，
-/// 不要在调用点写分支 —— 该字段本来就是为"可重定向出站"设计的（e2e 测试也靠它）。
+/// ⚠️ **只作 CN 的兜底值**。出站地址一律经 [`agent_host_for`] 按变体取，
+/// 不要直接引用本常量拼 URL —— 国际版走的是另一个主机
+/// （`https://core-normal.trae.ai`，见 [`agent_host_for`] 的说明）。
 pub const TRAE_AGENT_HOST: &str = "https://trae-api-cn.mchost.guru";
+
+/// 某变体的**对话出站基址**（`llm_utils_chat` 的 host）。
+///
+/// ## 为什么必须按变体分家（2026-10-29 真机实测）
+///
+/// 用国际版账号（`trae.ai` 登录、`Cloud-IDE-JWT` 有效）打 CN 的
+/// `trae-api-cn.mchost.guru`，上游一律回 **401 `AuthRejected`**（`code 1001`）——
+/// token 本身没问题，是**主机不认这个域的账号**。
+///
+/// 换到 `https://core-normal.trae.ai`（该变体在
+/// [`buddy_switch_core::modules::trae::variant`] 的端点表里**早已登记**、
+/// 只是从没被网关用过）后，同一个 JWT、同一套头立刻可用：
+///
+/// | 模型 | CN 主机 | core-normal |
+/// |:---|:---|:---|
+/// | `deepseek-v4.1-flash` | 401 | ✅ |
+/// | `kimi-k3` / `kimi-k2.7-code` / `minimax-m3` | 401 | ✅ |
+///
+/// 因此取值**只认端点表**（`endpoints_for(variant).agent_host`），不在这里
+/// 另写一张分支表 —— 那张表已经有 CN/国际两套，重写一份就是第二处会漂移的真相。
+pub fn agent_host_for(variant: TraeVariant) -> &'static str {
+    buddy_switch_core::modules::trae::endpoints_for(variant).agent_host
+}
 
 /// SOLO 对话接口路径（消耗 IDE 积分，product_id 208）。
 pub const TRAE_LLM_CHAT_PATH: &str = "/api/agent/v3/llm_utils_chat";
@@ -386,15 +407,28 @@ pub struct TraeGatewayState {
     pub http: reqwest::Client,
     /// 请求体上限字节数（构造期固化，见 [`body_limit_bytes`]）。
     pub body_limit_bytes: usize,
-    /// 出站上游基址，默认 [`TRAE_AGENT_HOST`]。
+    /// 出站上游基址**覆盖值**（`None` = 按变体取 [`agent_host_for`]）。
     ///
     /// 做成字段而不是直接引用常量，是为了让集成测试能把出站打到**本地 mock 上游**：
     /// 真实 Trae 需要有效 JWT，而鉴权、换号、SSE 转换这三块逻辑恰恰最需要端到端验证。
-    /// 生产代码从不改写它，因此对外行为与写死常量完全一致。
-    pub upstream: String,
+    ///
+    /// ★ 2026-10-29：**默认值从「写死 CN 主机」改为 `None`**。生产路径此前恒用 CN
+    /// 主机，国际版账号的请求因此全部 401（见 [`agent_host_for`] 的实测表）。
+    /// `Some` 只该由测试设置；生产代码从不改写它。
+    pub upstream: Option<String>,
 }
 
 impl TraeGatewayState {
+    /// 本次出站该用哪个 host：覆盖值优先，否则按变体取。
+    ///
+    /// **唯一取值点** —— 真实中继与探测旁路都走这里，两处不可能各说一套。
+    pub fn upstream_for(&self, variant: TraeVariant) -> &str {
+        self.upstream
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| agent_host_for(variant))
+    }
+
     /// 依据配置构造一份完整运行状态。
     ///
     /// **不在此处自动生成 Key**：多 Key 化后 Key 只存哈希，自动生成的明文无处可取，
@@ -422,7 +456,7 @@ impl TraeGatewayState {
             last_error: Arc::new(RwLock::new(None)),
             http: build_http_client(),
             body_limit_bytes: body_limit_bytes(config.max_body_mb),
-            upstream: TRAE_AGENT_HOST.to_string(),
+            upstream: None,
         }
     }
 
@@ -712,7 +746,11 @@ pub async fn status_view(
     };
     body.insert("accounts".into(), serde_json::json!(accounts));
     body.insert("diagnose".into(), serde_json::json!(diagnose));
-    body.insert("upstream".into(), serde_json::json!(state.upstream));
+    // 回显**该变体实际会用的** host（覆盖值优先），与真实出站同一个取值点。
+    body.insert(
+        "upstream".into(),
+        serde_json::json!(state.upstream_for(variant)),
+    );
     serde_json::Value::Object(body)
 }
 

@@ -799,8 +799,31 @@ fn round2(value: f64) -> f64 {
 pub async fn calc_remaining_credits(
     jwt_value: &str,
 ) -> Result<(f64, Option<i64>, f64, Vec<CreditPackage>), String> {
+    calc_remaining_credits_for(TraeVariant::default(), jwt_value).await
+}
+
+/// 按变体查剩余积分（[`calc_remaining_credits`] 的变体感知版本）。
+///
+/// ## ★ 为什么必须按变体（2026-10-29 真机缺陷）
+///
+/// 旧实现走 [`post_json_parsed`]（**默认变体 = 国内**）⇒ 国际版账号的积分查询
+/// 打到了 `api.trae.cn`。那边对国际 JWT 不报错，而是回一份**空的资源包清单**，
+/// 于是 [`calc_remaining_credits`] 算出 `0.0` 并落盘 —— 账号随即被判
+/// [`no_credits`](crate::modules::trae::credits) ⇒ 网关**永不选它**，
+/// 症状是 `503 no_healthy_account`（诊断文案「零积分」），而账号本身完全可用。
+///
+/// 变体感知后国际版会去 `grow-normal.trae.ai` 查；该端点在 2026-10-29 实测仍
+/// **404**（国际版的积分接口路径与国内不同，尚未取证），因此查询会**失败**而不是
+/// 给出错误的 0 —— 失败时调用方保持**上一次读到的值不动**（见
+/// [`refresh_all_remaining_for`] 的 `Err` 分支），积分因此停在「未知」，
+/// 而 `credits = None` 在选号口径里表示「不因此排除」。
+pub async fn calc_remaining_credits_for(
+    variant: TraeVariant,
+    jwt_value: &str,
+) -> Result<(f64, Option<i64>, f64, Vec<CreditPackage>), String> {
     let device = device_for_jwt(jwt_value)?;
-    let (_status, body) = post_json_parsed(TRAE_ENTITLEMENT_PATH, jwt_value, &device).await?;
+    let (_status, body) =
+        post_json_parsed_for(variant, TRAE_ENTITLEMENT_PATH, jwt_value, &device).await?;
 
     let packs = body
         .get("user_entitlement_pack_list")
@@ -938,7 +961,8 @@ pub async fn refresh_remaining_for_variant(
     user_id: &str,
 ) -> Result<f64, String> {
     let account = crate::modules::trae::account::find_for(variant, user_id).ok_or("账号不存在")?;
-    let (credits, expire_at, _purchased, packages) = calc_remaining_credits(&account.jwt).await?;
+    let (credits, expire_at, _purchased, packages) =
+        calc_remaining_credits_for(variant, &account.jwt).await?;
     let mut remaining = load_remaining_for(variant);
     remaining.credits.insert(user_id.to_string(), credits);
     if let Some(expire_at) = expire_at {
@@ -973,7 +997,7 @@ pub async fn refresh_all_remaining_for(variant: TraeVariant) -> usize {
     let mut purchased_today = 0.0_f64;
 
     for (uid, account) in &accounts {
-        match calc_remaining_credits(&account.jwt).await {
+        match calc_remaining_credits_for(variant, &account.jwt).await {
             Ok((credits, expire_at, purchased, packages)) => {
                 remaining.credits.insert(uid.clone(), credits);
                 if let Some(expire_at) = expire_at {

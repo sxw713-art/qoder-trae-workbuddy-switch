@@ -227,7 +227,7 @@ fn chat_request(key: Option<&str>, body: &str) -> Request<Body> {
 async fn gateway_for(behavior: Behavior) -> (TraeGatewayState, String) {
     let base = spawn_mock(behavior).await;
     let mut state = TraeGatewayState::new(TraeGatewayConfig::default());
-    state.upstream = base;
+    state.upstream = Some(base);
     let key = ensure_api_key(&state.key_store)
         .expect("隔离 home 无 Key，ensure_api_key 应生成一把并返回明文");
     (state, key)
@@ -644,7 +644,7 @@ async fn cn_only_accounts_with_cn_key_routes_to_the_cn_pool() {
     write_accounts_for(&home, TraeVariant::Trae, &[("uid-cn", "jwt-cn")]);
     let base = spawn_mock(Behavior::Normal).await;
     let mut state = TraeGatewayState::new(TraeGatewayConfig::default());
-    state.upstream = base;
+    state.upstream = Some(base);
     let key = create_key(&home, TraeVariant::Trae);
 
     let response = router(state)
@@ -684,7 +684,7 @@ async fn cn_only_accounts_with_global_key_reports_global_pool_empty() {
     write_accounts_for(&home, TraeVariant::TraeWork, &[("uid-cn", "jwt-cn")]);
     let base = spawn_mock(Behavior::Normal).await;
     let mut state = TraeGatewayState::new(TraeGatewayConfig::default());
-    state.upstream = base;
+    state.upstream = Some(base);
     let key = create_key(&home, TraeVariant::Global);
 
     let response = router(state)
@@ -733,7 +733,7 @@ async fn legacy_settings_key_routes_to_work_pool_unchanged() {
 
     let base = spawn_mock(Behavior::Normal).await;
     let mut state = TraeGatewayState::new(TraeGatewayConfig::default());
-    state.upstream = base;
+    state.upstream = Some(base);
 
     // legacy 合成记录的归属必须是**默认变体**（第二条零回归前提）。
     // ★ issue #28：默认变体已改为**合并版**（`TraeMerged`）—— 老默认 `TraeWork`
@@ -771,7 +771,7 @@ async fn request_log_carries_the_variant() {
     write_accounts_for(&home, TraeVariant::Trae, &[("uid-cn", "jwt-cn")]);
     let base = spawn_mock(Behavior::Normal).await;
     let mut state = TraeGatewayState::new(TraeGatewayConfig::default());
-    state.upstream = base;
+    state.upstream = Some(base);
     let key = create_key(&home, TraeVariant::Trae);
 
     let response = router(state)

@@ -163,7 +163,7 @@ async fn spawn_mock(behavior: Behavior) -> String {
 async fn state_with_mock(behavior: Behavior) -> TraeGatewayState {
     let base = spawn_mock(behavior).await;
     let mut state = TraeGatewayState::new(TraeGatewayConfig::default());
-    state.upstream = base;
+    state.upstream = Some(base);
     state
 }
 

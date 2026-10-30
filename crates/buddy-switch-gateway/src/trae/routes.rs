@@ -1285,7 +1285,7 @@ pub(crate) async fn chat_once_for_account(
     if let Some(capture) = capture {
         capture.request_pair(body, &converted);
     }
-    send_llm_chat(state, account, &converted, capture).await
+    send_llm_chat(state, account, variant, &converted, capture).await
 }
 
 /// 发一次 `llm_utils_chat`：拿到响应头即返回，不读 body。
@@ -1294,16 +1294,20 @@ pub(crate) async fn chat_once_for_account(
 /// 前缀只在 `Authorization` 场景使用）。`accept-encoding` 显式写 `identity`：
 /// 本 crate 的 reqwest 未开 gzip/br/zstd 特性，若上游压缩返回，读出来就是乱码。
 ///
+/// `variant` 决定**出站主机**（[`TraeGatewayState::upstream_for`]）—— 国际版账号
+/// 打到 CN 主机一律 401 `AuthRejected`，见 `agent_host_for` 的实测表。
+///
 /// `capture` 为 `Some` 时，非 2xx 的完整错误体额外落盘一份
 /// （`_upstream_http_error.txt`）—— 回传给客户端的只有 300 字预览，
 /// 排查时真正要看的是完整原文。
 async fn send_llm_chat(
     state: &TraeGatewayState,
     account: &PickedTraeAccount,
+    variant: TraeVariant,
     body: &[u8],
     capture: Option<&Capture>,
 ) -> Result<reqwest::Response, (u16, String)> {
-    let url = format!("{}{TRAE_LLM_CHAT_PATH}", state.upstream);
+    let url = format!("{}{TRAE_LLM_CHAT_PATH}", state.upstream_for(variant));
     let trace_id = trace_id();
 
     let response = state
@@ -2144,7 +2148,7 @@ mod tests {
             body["model_name"] = serde_json::json!(model_name);
             let encoded = serde_json::to_vec(&body).expect("序列化");
 
-            match send_llm_chat(&state, &picked, &encoded, None).await {
+            match send_llm_chat(&state, &picked, TraeVariant::TraeWork, &encoded, None).await {
                 Ok(mut response) => {
                     // 累积若干块，直到看见 `event:metadata`（上游认了）或 `event:error`（上游拒了）。
                     // ⚠️ 只看**首块**会把 `event:progress_notice`（排队中）误判成结论 —— 踩过。
@@ -2251,7 +2255,7 @@ mod tests {
             body["model_name"] = serde_json::json!(model_name);
             let encoded = serde_json::to_vec(&body).expect("序列化");
 
-            match send_llm_chat(&state, &picked, &encoded, None).await {
+            match send_llm_chat(&state, &picked, TraeVariant::TraeWork, &encoded, None).await {
                 Ok(mut response) => {
                     let mut buffer = String::new();
                     let mut verdict = "超时".to_string();
