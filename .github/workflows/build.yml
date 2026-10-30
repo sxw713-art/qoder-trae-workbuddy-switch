@@ -262,6 +262,22 @@ jobs:
       - name: Build server binary
         shell: bash
         run: |
+          # ★ Windows 上要把 **Strawberry Perl** 放到 PATH 前面。
+          #
+          #   为什么要：sqlcipher 的 `vendored-openssl` 会**从源码编译 OpenSSL**，
+          #   而它的构建脚本要跑 `perl ./Configure`。
+          #   Git Bash 自带的 perl（/usr/share/perl5）**缺 `Params/Check.pm`**
+          #   ⇒ Configure 直接失败（2026-10-29 现场：win-x64 job 挂在
+          #   `failed to run custom build command for openssl-sys`）。
+          #   runner 预装的 Strawberry Perl 是完整的。
+          #
+          #   ⚠️ 只在 Windows 上改 PATH：Linux / macOS 的 perl 是系统自带的，能用。
+          #   ⚠️ 用 POSIX 路径（/c/...）：这一步的 shell 是 bash，写 Windows 路径不生效。
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            export PATH="/c/strawberry/perl/bin:/c/strawberry/c/bin:$PATH"
+            echo "--- perl in use ---"
+            perl -v | head -3
+          fi
           cargo build -p buddy-switch-server --release --target ${{ matrix.target }}
           mkdir -p dist-bin
 

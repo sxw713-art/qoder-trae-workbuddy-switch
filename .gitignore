@@ -74,6 +74,10 @@ deliverables/
 # 一次性调查 / 探针产物（多 Agent 协作时落在仓库根的临时笔记与脚本）。
 # ⚠️ `git add -A` 会把它们一起提交 —— 用 `git add <具体文件>`，或在清理前先看这里。
 .tmp-*
+# 本地试验目录（构建产物、探针脚本、便携版工具链）。2026-10-28 加入：
+# 内置解密要编 vendored OpenSSL，本地缺 perl 时把 Strawberry 便携版解到这里（1.5GB 级）。
+# 无此条时它会以 `?? .tmp/` 出现在 git status 里，很容易被 `git add -A` 带进提交。
+.tmp/
 docs/images/.probe/
 _*.txt
 _*.py

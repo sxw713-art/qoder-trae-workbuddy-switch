@@ -252,14 +252,96 @@ for (const dir of sortedDirs('npm/platform')) {
 }
 // 四个 crate 都要同步：漏掉任何一个，`env!("CARGO_PKG_VERSION")` 都会让
 // 「API 服务」页显示成旧版本号（该值会被透出到网关 /status）。
+/**
+ * workspace 成员的 crate 名（**动态扫描**，不写死清单）。
+ *
+ * ## 为什么不能写死
+ * 写死的清单每加一个 crate 就会漏一次 —— 漏掉的后果不是「版本号不统一」，
+ * 而是 `Cargo.lock` 与 `Cargo.toml` 对不上，CI 的 `cargo check --locked` 直接红
+ * （2026-10-29 现场：新增 `buddy-switch-vault` 后没进清单 ⇒ lock 过期 ⇒ 门禁失败）。
+ */
+function workspaceCrateNames() {
+  const names = new Set();
+  const dirs = [];
+  const cratesDir = path.join(ROOT, 'crates');
+  if (fs.existsSync(cratesDir)) {
+    for (const entry of fs.readdirSync(cratesDir, { withFileTypes: true })) {
+      if (entry.isDirectory()) dirs.push(path.join('crates', entry.name, 'Cargo.toml'));
+    }
+  }
+  dirs.push(path.join('src-tauri', 'Cargo.toml'));
+  for (const rel of dirs) {
+    const abs = path.join(ROOT, rel);
+    if (!fs.existsSync(abs)) continue;
+    const raw = fs.readFileSync(abs, 'utf8');
+    const m = raw.match(/^name = "([^"]+)"/m);
+    if (m) names.add(m[1]);
+  }
+  return names;
+}
+
+const WORKSPACE_CRATES = workspaceCrateNames();
+
 for (const rel of [
   'src-tauri/Cargo.toml',
-  'crates/buddy-switch-core/Cargo.toml',
-  'crates/buddy-switch-server/Cargo.toml',
-  'crates/buddy-switch-gateway/Cargo.toml',
+  ...fs
+    .readdirSync(path.join(ROOT, 'crates'), { withFileTypes: true })
+    .filter((d) => d.isDirectory())
+    .map((d) => path.join('crates', d.name, 'Cargo.toml')),
 ]) {
   addCargoTarget(rel);
 }
+
+/**
+ * `Cargo.lock` 也要跟着走（**workspace 成员的版本**）。
+ *
+ * ## 为什么必须在这里
+ * CI 跑的是 `cargo check --workspace --all-targets --locked` —— `--locked` 禁止
+ * 自动改 lock。lock 里 workspace 成员的版本与各 `Cargo.toml` 不一致时，
+ * cargo 会直接报错退出（而不是「顺手修好」）⇒ 门禁红。
+ * （2026-10-29 现场：新增 `buddy-switch-vault` 没进载体清单 ⇒ lock 过期 ⇒ CI 红。）
+ *
+ * ## 为什么逐行处理而不是正则
+ * lock 的条目形如 `name = "x"` 紧跟 `version = "y"`，但**换行符可能是 CRLF**
+ * （Windows 上 checkout 出来的就是），正则里 `
+` 与 `
+` 的差异会让匹配静默失败 ——
+ * 而「静默没改」正是这里最坏的失败方式（看起来成功了，lock 其实还是旧的）。
+ * 逐行匹配对行尾不敏感。
+ */
+targets.push({
+  rel: 'Cargo.lock',
+  read() {
+    const abs = path.join(ROOT, 'Cargo.lock');
+    if (!fs.existsSync(abs)) return [];
+    const out = [];
+    const lines = fs.readFileSync(abs, 'utf8').split(/\r?\n/);
+    for (let i = 0; i < lines.length; i++) {
+      const m = lines[i].match(/^name = "(.+)"$/);
+      if (!m || !WORKSPACE_CRATES.has(m[1])) continue;
+      const vm = (lines[i + 1] || '').match(/^version = "(.+)"$/);
+      if (vm) out.push({ key: m[1], value: vm[1] });
+    }
+    return out;
+  },
+  write(v) {
+    const abs = path.join(ROOT, 'Cargo.lock');
+    if (!fs.existsSync(abs)) return false;
+    const lines = fs.readFileSync(abs, 'utf8').split(/\r?\n/);
+    let changed = false;
+    for (let i = 0; i < lines.length; i++) {
+      const m = lines[i].match(/^name = "(.+)"$/);
+      if (!m || !WORKSPACE_CRATES.has(m[1])) continue;
+      const vm = (lines[i + 1] || '').match(/^version = "(.+)"$/);
+      if (!vm || vm[1] === v) continue;
+      lines[i + 1] = `version = "${v}"`;
+      changed = true;
+    }
+    if (!changed) return false;
+    fs.writeFileSync(abs, lines.join('\n'));
+    return true;
+  },
+});
 
 function sortedDirs(rel) {
   const abs = path.join(ROOT, rel);

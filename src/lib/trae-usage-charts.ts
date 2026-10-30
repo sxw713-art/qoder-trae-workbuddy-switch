@@ -57,7 +57,17 @@ function bucketToGroup(key: string, bucket: Partial<TraeTokenBucket> | undefined
  *   （`session_id` 每请求新生成），故这两个维度在 Trae 侧**本就不存在**，
  *   由 `unsupported` 显式声明，**不画空壳**。
  */
-export function toTokenStatsSource(stats: TraeTokenStatistics): TokenStatsSource {
+export function toTokenStatsSource(
+  stats: TraeTokenStatistics,
+  /**
+   * 这本账的来源标识。
+   *
+   * Trae 有**两本账**：网关日志（`trae-gateway`）与客户端库导入（`trae-client`）。
+   * 两者形状完全一致，只有来源不同 —— 而来源在账本视图里**是颜色语义**
+   * （客户端青绿 / 网关靛蓝），所以不能像改造前那样写死成网关。
+   */
+  source: "trae-gateway" | "trae-client" = "trae-gateway",
+): TokenStatsSource {
   const daily = (stats.daily ?? []).map((point) => bucketToGroup(point.key ?? "", point));
   const hours = (stats.hours ?? []).map((point) => bucketToGroup(point.key ?? "", point));
   const models = (stats.models ?? []).map((point) => bucketToGroup(point.key ?? "", point));
@@ -69,7 +79,7 @@ export function toTokenStatsSource(stats: TraeTokenStatistics): TokenStatsSource
   }
 
   return {
-    source: "trae-gateway",
+    source,
     summary: bucketToGroup("summary", stats.summary),
     models,
     projects: [],

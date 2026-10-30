@@ -753,6 +753,10 @@ function demoGatewayStatus(): GatewayStatus {
   const cnD = { uid: "demo-cn-d", name: t("shared.demo.account.d") };
   const globalC = { uid: "demo-global-c", name: t("shared.demo.account.c") };
   const coolingUntil = Math.floor(Date.now() / 1000) + 5400;
+  /* 模型级冷却（演示）：**按上游声明的时刻**冷却（2026-10-29 口径）。
+     徽标显示「{time} 解冻」，这个时刻就是上游 `6004` 文案里写的那个 —— 演示数据必须
+     与之同形，否则截图会教人以为界面上永远是兜底值。 */
+  const modelUpstreamMs = Date.now() + 5 * 60 * 60_000;
   const accounts: GatewayPoolAccount[] = [
     {
       uid: cnA.uid,
@@ -764,6 +768,18 @@ function demoGatewayStatus(): GatewayStatus {
       cooldownUntil: null,
       cooldownReason: null,
       disabled: false,
+      // 账号可用、但**某个模型**在冷却（正交两维，演示这张卡最容易画错的地方）。
+      modelCoolings: { "deepseek-v4.1-flash": modelUpstreamMs },
+      modelCooldownDetails: {
+        "deepseek-v4.1-flash": {
+          untilMs: modelUpstreamMs,
+          resetAtMs: modelUpstreamMs,
+          upstreamResetAtMs: modelUpstreamMs,
+          fallback: false,
+          reason: "6004 model rate limit (probe)",
+          hits: 0,
+        },
+      },
     },
     {
       uid: cnD.uid,
@@ -822,6 +838,7 @@ function demoGatewayStatus(): GatewayStatus {
     pools: {
       // cn：3 个号 = 2 可用（其中一个在途已满）+ 1 冷却。
       // ★ `inFlightFull` 是**正交**计数，已含在 `available` 里 —— 与真实后端同形。
+      // ★ `modelCooling` 同样正交：cnA 可用但 `deepseek-v4.1-flash` 在冷却。
       cn: {
         total: 3,
         available: 2,
@@ -831,6 +848,7 @@ function demoGatewayStatus(): GatewayStatus {
         zeroCredits: 0,
         excluded: 0,
         inFlightFull: 1,
+        modelCooling: 1,
         totalCredits: 280.5,
       },
       global: { total: 1, available: 0, cooling: 0, disabled: 1, expired: 0, zeroCredits: 0, totalCredits: 8 },
@@ -1073,9 +1091,9 @@ function demoGatewayTokenTrend(): GatewayTokenTrend {
 }
 
 /**
- * 演示：网关三维度（模型 / 账号 / 端点）逐日历史。
+ * 演示：网关四维度（密钥 / 模型 / 账号 / 端点）逐日历史。
  *
- * 与 `demoGatewayTokenTrend` **同一批日键**，且三条维度的合计**等于**该日网关总量
+ * 与 `demoGatewayTokenTrend` **同一批日键**，且四条维度的合计**等于**该日网关总量
  * （按权重摊、末位吃余数）—— 演示数据也必须守住「按模型合计 = 网关卡」这条自洽约束，
  * 否则评审时会被当成真 bug。
  */
@@ -1087,6 +1105,11 @@ function demoGatewayUsageDim(): GatewayUsageDim {
   const accountWeights = [0.52, 0.34, 0.14];
   const endpoints = ["/v1/chat/completions", "/v1/messages", "/v1/responses"];
   const endpointWeights = [0.92, 0.05, 0.03];
+  /* 「按密钥」：演示站必须**有数**，否则该 Tab 全是「—」，看起来像没做。
+     桶键带 `wb:` 归属（与后端 `token_daily::key_bucket_of` 同格式），
+     `__none__` 留一小份「无 Key 调用」—— 那一行在真机上很常见。 */
+  const keyBuckets = ["wb:demo-key-1", "wb:demo-key-2", "wb:demo-key-3", "__none__"];
+  const keyWeights = [0.55, 0.32, 0.1, 0.03];
 
   const spread = (total: number, share: number[]) => {
     let acc = 0;
@@ -1102,6 +1125,7 @@ function demoGatewayUsageDim(): GatewayUsageDim {
     retentionDays: trend.retentionDays,
     days: trend.days.map((day, index) => {
       const modelTokens = spread(day.total, weights);
+      const keyTokens = spread(day.total, keyWeights);
       const accountTokens = spread(day.total, accountWeights);
       const endpointRequests = spread(Math.max(1, Math.round(day.total / 148000)), endpointWeights);
       const failed = index % 7 === 3 ? 5 : index % 5 === 0 ? 2 : 0;
@@ -1136,6 +1160,17 @@ function demoGatewayUsageDim(): GatewayUsageDim {
           failed: i === 0 ? failed : 0,
           credit: 0,
         })),
+        keys: keyTokens.map((total, i) => ({
+          key: keyBuckets[i],
+          input: Math.round(total * 0.9),
+          output: total - Math.round(total * 0.9),
+          total,
+          requests: Math.max(1, Math.round(total / 148000)),
+          failed: i === 0 ? failed : 0,
+          credit: Math.round((total / 34000) * 1000) / 1000,
+        })),
+        /* 首日只是下界（v4 之前没有 key 维度）—— 演示「覆盖披露」那一行。 */
+        keysPartial: index === 0,
       };
     }),
   };
@@ -3362,6 +3397,22 @@ export function screenshotDemoResponse(command: string, args?: Record<string, un
     case "get_gateway_token_trend": return demoGatewayTokenTrend();
     /* 账本视图（issue #63）：三维度历史 + 今日对账。演示数据守住「三维度合计 = 网关卡」。 */
     case "get_gateway_usage_dim": return demoGatewayUsageDim();
+    /* Trae / Qoder 的账本与 WB **返回体同形** ⇒ 演示站共用同一份构造：
+       演示只演「形状与自洽约束」，不追求与真实平台同模型名。 */
+    case "get_trae_gateway_usage_dim":
+    case "get_qoder_gateway_usage_dim": return demoGatewayUsageDim();
+    /* Trae 客户端账本（导入明文库）：演示站固定演「还没导入」这一态 ——
+       它正是这条链路最常见、也最需要讲清楚的状态（不是空图，是「你还没导出」）。 */
+    case "probe_trae_client_db":
+      return {
+        ok: false,
+        path: "",
+        error: { code: "missing", message: "还没有指定明文库" },
+        tables: [],
+      };
+    case "get_trae_client_db_config": return { path: null, exists: false };
+    case "get_trae_client_token_stats":
+      return { source: "trae-client", configured: false };
     case "get_usage_reconcile": return demoUsageReconcile();
     /* Skill 管理清单（只读）。演示数据覆盖启用 / 停用 / 不一致 / 无 frontmatter 四种形态。 */
     case "list_skills": return demoSkills(args?.region === "global" ? "global" : "cn");
@@ -3392,6 +3443,119 @@ export function screenshotDemoResponse(command: string, args?: Record<string, un
       /* 形状与真机同构（键 = **作用域**）。 */
       const scope = String((args as { scope?: unknown } | undefined)?.scope ?? "wb-cn");
       return { scope, ids: scope === "qoder-cn" ? ["Kimi-K3"] : [] };
+    }
+    /* 模型降级链（P13）：演示站给**真实形状**的链 —— 目标里留一个「闸门中」的，
+       这样状态点（黄）与诊断带都会出现。全绿的空壳截图看不出这功能在解决什么问题。
+       ⚠️ 模型名必须与 `demoCatalog` **同源**（GLM-5.3 / GLM-5.2 / DeepSeek-V4-Pro）：
+       两边不一致时抽屉里的下拉一个都匹配不上，链会显示成一串空占位符。 */
+    case "get_model_fallback": {
+      const scope = String((args as { scope?: unknown } | undefined)?.scope ?? "wb-cn");
+      const now = Date.now();
+      const chains =
+        scope === "wb-cn"
+          ? [
+              {
+                from: "GLM-5.3",
+                targets: [
+                  // 目录里 GLM-5.2 也不支持图片（见表格「图片输入」列）⇒ 与真实派生保持一致：
+                  // 一个目标可以同时「闸门中」+「不支持图片」，两条诊断都会出现。
+                  { model: "GLM-5.2", state: "gated", gated_for_secs: 42, caps_lost: ["image"] },
+                  // 这一条让「不支持图片输入」的诊断在演示站也能看见（真实数据来自目录声明）。
+                  { model: "DeepSeek-V4-Pro", state: "healthy", gated_for_secs: null, caps_lost: ["image"] },
+                ],
+                triggers: ["gate", "model_rate", "model_blocked", "server"],
+                enabled: true,
+              },
+              {
+                from: "GLM-5.2",
+                targets: [
+                  { model: "DeepSeek-V4-Pro", state: "healthy", gated_for_secs: null, caps_lost: [] },
+                ],
+                triggers: ["gate", "model_rate"],
+                enabled: true,
+              },
+            ]
+          : [];
+      return {
+        scope,
+        enabled: chains.length > 0,
+        chains,
+        max_targets: 2,
+        baseline: ["gate", "model_rate", "model_blocked"],
+        events:
+          scope === "wb-cn"
+            ? [
+                {
+                  scope: "wb-cn",
+                  at_ms: now - 6 * 60_000,
+                  from: "GLM-5.3",
+                  path: ["GLM-5.2", "DeepSeek-V4-Pro"],
+                  reason: "model_rate",
+                  account: "jackey",
+                  ms: 3800,
+                  result: "degraded",
+                },
+                {
+                  scope: "wb-cn",
+                  at_ms: now - 24 * 60_000,
+                  from: "GLM-5.3",
+                  path: ["GLM-5.2"],
+                  reason: "model_gate",
+                  account: "jackey",
+                  ms: 1200,
+                  result: "degraded",
+                },
+                {
+                  scope: "wb-cn",
+                  at_ms: now - 41 * 60_000,
+                  from: "GLM-5.3",
+                  path: [],
+                  reason: "",
+                  account: "jackey",
+                  ms: 300,
+                  result: "blocked",
+                },
+              ]
+            : [],
+      };
+    }
+    /* 降级链**预演**（P13）：后端是纯计算（零副作用），所以演示模式也照形状返回。
+       演示数据里 GLM-5.2 是「闸门中」的那个 —— 预演要如实跳过它，否则截图在撒谎。 */
+    case "get_fallback_stats": {
+      const scope = String((args as { scope?: unknown })?.scope ?? "wb-cn");
+      const days = 7;
+      const items = Array.from({ length: days }, (_, index) => {
+        const date = new Date(Date.now() - index * 86_400_000);
+        const iso = date.toISOString().slice(0, 10);
+        // 前三天给点真实感：降级确实发生过，不是「全 0」的空壳。
+        const degraded = index === 0 ? 3 : index === 1 ? 5 : index === 2 ? 2 : 0;
+        const failed = index === 0 ? 1 : 0;
+        return { date: iso, degraded, failed };
+      });
+      return {
+        scope,
+        days: items,
+        total: {
+          degraded: items.reduce((sum, item) => sum + item.degraded, 0),
+          failed: items.reduce((sum, item) => sum + item.failed, 0),
+        },
+      };
+    }
+    case "preview_model_fallback": {
+      const payload = (args ?? {}) as { from?: unknown; targets?: unknown };
+      const from = String(payload.from ?? "");
+      const targets = Array.isArray(payload.targets)
+        ? payload.targets.filter((item): item is string => typeof item === "string")
+        : [];
+      const steps = [
+        { model: from, role: "primary", action: "try", gated_for_secs: null as number | null },
+        ...targets.slice(0, 2).map((model) =>
+          model === "GLM-5.2"
+            ? { model, role: "target", action: "skip_gated", gated_for_secs: 42 }
+            : { model, role: "target", action: "try", gated_for_secs: null as number | null },
+        ),
+      ];
+      return { ok: true, scope: String((args as { scope?: unknown })?.scope ?? "wb-cn"), steps };
     }
     /* 图片能力覆盖（issue #101）：演示站给一条「手动指定」样例，让三态都能画出来
        （其余模型缺键 = 跟随上游）。写操作 `set_model_image_cap` 不进演示面。 */

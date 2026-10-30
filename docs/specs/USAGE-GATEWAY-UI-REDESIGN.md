@@ -259,3 +259,179 @@ C = 2.9M、G = 18.5M 这组数字，既可能是「完全重叠」（真值 18.5
    `credit` 没加进去时，`dailyByModel` 每一点都要过 `addGroup → addTotals`
    ⇒ 积分视图的「客户端账本」整块显示 0，而**单来源页面看起来完全正常**（极难发现）。
    已补上，并写了注释说明它为什么必须在白名单里。
+
+## 13. 平台补齐：Trae / Qoder 的账本（2026-10-28）
+
+第 12 节落地时账本只对 **WorkBuddy** 开放（`USAGE_PAGES[product].ledger` 另两个平台为 `false`），
+原因是「网关」在三个平台上不是同一个东西。本次补齐的判据仍然是**数据**，不是习惯：
+
+| 平台 | 客户端账 | 网关账 | 可选档 |
+|:--|:--|:--|:--|
+| WorkBuddy | `token_stats`（扫 jsonl，逐日/逐模型/credit） | `token_daily`（后台增量落库 90 天） | 全部 / 客户端 / 网关 |
+| **Trae** | **不可得**：对话历史在 IDE 私有存储（加密 + 二进制索引），没有可解析的用量落盘 | **本次新建** `gateway_ledger` | **只有「网关」** |
+| **Qoder** | `qoder_usage`（客户端会话 jsonl，按 credits） | **本次新建** `gateway_ledger`（日志里带 `credits`） | 全部 / 客户端 / 网关 |
+
+### 13.1 后端：`crates/buddy-switch-core/src/modules/gateway_ledger.rs`
+
+- **只读上游**：只读各自网关的请求日志（Trae = `trae/api_gateway_logs.json`，
+  Qoder = `qoder/logs/gateway_requests.jsonl`，两者内容都是 JSON 数组），**不改**网关写路径；
+- **水位线增量**：每轮只累加 `ts > watermark` 的新条目 —— 与 `token_daily::gateway_round`
+  同一套语义（环形日志滚掉一条已记账的请求时数字不许倒退）；水位线缺失时做一次整窗**取大**播种；
+- **三条维度同一水位线**：模型 / 账号 / 端点合计必须等于总量（单测 + 集成测试守）；
+- **归属轴**：Trae 看行内 `variant` → `TraeVariant::region()`；Qoder 看 `region`；
+  两者**缺失都落 `unlabeled` 单列一档**（并入 cn 会把国际流量记到国内账上）；
+- **credit 字段**：`credit`（WB 口径）与 `credits`（Qoder 网关口径）都认；Trae 日志没有该字段
+  ⇒ 账本 credit 恒 0（不知道，不是免费）；
+- **后台任务**：`(Trae|Qoder, GatewayUsageRecord)` 已登记进 `background::TASKS`，
+  两个宿主各起一个循环（每 2 分钟记**全部** scope —— 只记当前作用域会让切区域后的账本整段空）。
+
+### 13.2 前端
+
+- `USAGE_PAGES[product].ledger` 三平台均为 `true`；
+- `PLATFORM_LEDGER_VALUES`：Trae 只给 `["gateway"]`。**不给「客户端」**（选了只能显示 0，
+  那是把「没测到」说成「没用」），**也不给「全部」**（全部 = 客户端 ∪ 网关 = 网关，与「网关」
+  逐值相同，两档并存就是死控件）；
+- `LEDGER_VIEWS`：账本只出现在**消费来源拆分**的视图上（WB 四视图；Trae 趋势/模型；
+  Qoder 趋势/模型/会话）。积分页在 Trae/Qoder 上是余额快照（与回看窗口无关），不渲染该控件；
+- `CoverageStrip` 新增 `clientUnavailable`（客户端一项显示「不可得」而非 0）、
+  `unit`（Qoder 用 credits 格式）、`showOverlap`（Trae/Qoder 没有逐条对账 ⇒ 不显示「重叠 0 条」）；
+- `CreditLedgerTable.rows[].requests` 改为可选（客户端账的逐模型请求数不可得 ⇒ 渲染 `—`）；
+- Qoder 的**会话视图**在「网关」账本下换成 `GatewaySourceTables`（账号 / 端点）——
+  网关日志没有会话 id，摆空表比换维度更糟。
+
+### 13.3 已知边界（写进页面的「数据来源」条，不许省略）
+
+1. Trae 的**时段分布（7×24 热力图）**在账本口径下画不出来（账本只按日聚合）——
+   不画空图，用一行字说明；
+2. Trae 的账本在**首次落库前为空**：此时页面临时回落到日志窗口，并在说明条里写明
+   「当前显示的是日志窗口」；一旦有落库日，自动切到账本；
+3. Qoder 的「全部」= 两本账按日**相加**：同一笔调用若既在客户端记录里又经网关转发会被计两次
+   —— 说明条逐字写清，要看准确值请切单一账本。
+
+## 14. Trae 客户端账本：走「导入」而不是「内置解密」（2026-10-28）
+
+第 13 节把 Trae 的账本限定成「只有网关一本」，理由是它的对话库不可解析。本次补上客户端
+那一本，但**没有**内置解密 —— 决策依据是取证结果，不是口味。
+
+### 14.1 为什么不能内置
+
+实测（`%APPDATA%\<变体>\ModularData\ai-agent\database.db`，157 MB）：
+
+| 事实 | 证据 |
+|:--|:--|
+| 是 **SQLCipher 加密**的 SQLite | 前 16 字节是 PBKDF2 salt、全文件熵 8.00；`ai_agent.dll` 里 `sqlcipherCodecAttach` / `PRAGMA key = ` / `rusqlite` / `sqlx` |
+| 里面确有用量 | 二进制里有 `token_usage`(27) / `prompt_tokens` / `completion_tokens` / `credits`，以及 `fts_message_content` / `chat_session_goal` / `project` 等表名 |
+| **key 不在磁盘** | `ModularData` 下只有 db / -wal / -shm 三件套；`PRAGMA key = ` 是运行时拼接的裸格式串 |
+
+⇒ 要自动读，必须在产品里做两件事之一：**逆 key 派生**，或**读另一个进程的内存**。
+两者都会让本工具变成「内置解密第三方客户端」的软件，且客户端大版本一升级就可能失效。
+**这不是技术风险，是产品定位与合规风险。**
+
+### 14.2 落地方案（第一版）：读用户导出的**明文副本**
+
+> ⚠️ **2026-10-28 同日追加：这一节已被 15 节取代** —— 用户明确要求「内置解密」后，
+> 工具改为**内置 SQLCipher、口令由用户输入**。本节保留，因为 15 节的两个代价
+> （feature 并集、构建依赖）正是从这里的取舍推出来的。
+
+用户自己跑一次 sqlcipher 导出（命令见界面上的「怎么导出明文副本」折叠块），
+工具只读那份**明文** SQLite。好处：
+- 零新依赖（`rusqlite` 的 `bundled` 标准 SQLite 就能读明文，不必换 `bundled-sqlcipher`，
+  不用重编 OpenSSL，CI 矩阵不变）；
+- 失败模式干净：**没导入** ≠ **导入了但这段没用量**，两者在界面上分开；
+- 合规面干净：解密动作发生在用户手上，工具不持有 key。
+
+代价是多一步手动操作，且导出后库是静止快照（要看最新数据得重新导出一次）。
+
+### 14.3 接口
+
+| 命令 | 路由 | 用途 |
+|:--|:--|:--|
+| `probe_trae_client_db` | `GET /api/trae/client-import/probe?path=` | 校验能否读（不保存） |
+| `get_trae_client_db_config` | `GET /api/trae/client-import/config` | 已保存路径 + 文件是否还在 |
+| `save_trae_client_db_path` | `POST /api/trae/client-import/path` | 保存 / 清除（`path: null`） |
+| `get_trae_client_token_stats` | `GET /api/trae/client-usage?days=&scope=` | 聚合（与网关统计**同形**） |
+
+配置落 `~/.buddy-switch/trae/client_import.json`（`{ path, savedAt }`）。
+
+### 14.4 五种错误必须分开（`error.code`）
+
+`missing`（没指定 / 文件不存在）· `not_plaintext`（还是加密的，最常见误操作）·
+`unrecognized`（能打开但认不出会话结构）· `no_usage`（认出结构但没有用量字段）·
+`io`。混成一个「读取失败」会让用户无从下手 —— 尤其 `not_plaintext` 是**必然**会撞上的：
+多半是用户直接把加密的 `database.db` 指过来了。
+
+### 14.5 schema 自适应（因为我们没解开过）
+
+模块不写死表名：枚举 `sqlite_master` → `PRAGMA table_info` → 挑「含文本列且样本行里出现
+`usage`/`prompt_tokens`/`input_tokens`」的表当消息表 → 时间列按 `created_at`/`create_time`/
+`timestamp`/`ts` 等候选探测（值 > 1e11 视为毫秒）。认不出就返回 `unrecognized` **并回显
+实际表名** —— 那份表名列表是后续适配的唯一依据。
+
+### 14.6 「全部」档不合并统计卡
+
+客户端库与网关日志会**双计**同一笔调用（既在客户端记录、又经网关转发）。所以 `all` 档
+只用 `StackedDailyBar` 把两本账按日堆叠（看得出「谁占多少」），统计卡仍按网关口径，
+并在图注里标注来源；**不做**「客户端 + 网关」的求和卡片。
+
+## 15. 内置解密：SQLCipher 进仓（2026-10-28 同日追加）
+
+第 14 节的结论是「不内置解密」。用户明确要求内置后，改为下面的形态。
+
+### 15.1 做法
+
+新增独立 crate `crates/buddy-switch-vault`，把 SQLCipher 关在里面，对外只暴露一个动作：
+
+```rust
+verify(src, passphrase) -> VaultInfo            // 校验口令（不写文件）
+export_plaintext(src, passphrase, dst) -> VaultInfo   // ATTACH ... KEY '' + sqlcipher_export
+```
+
+命令 `unlock_trae_client_db(path, passphrase)`：
+口令对 ⇒ 导出到 `~/.buddy-switch/trae/client_plain/database.db` 并设为数据源；
+给的本来就是明文 ⇒ 直接用它（不做无谓的解密与复制）；
+否则按 `wrong_key` / `not_sqlite` / `missing` 分开报错。
+
+**口令仍然不由工具提取**：它只在内存里活到解锁那一刻，成功后立即清空，不落盘、不上传。
+`helpBody` 直说「口令要从客户端进程用调试器取」——这一步有门槛，别让用户以为点两下就好。
+
+### 15.2 两个必须知道的代价
+
+**① Cargo 的 feature 是并集，「独立 crate」隔离不了 SQLCipher 本身。**
+
+这一点我最初判断错了。`core` 用 `rusqlite` 的 `bundled`，`vault` 用
+`bundled-sqlcipher-vendored-openssl`，Cargo 会取**并集** ⇒ 整个 workspace 的
+`rusqlite` 都按 SQLCipher 编译，`session.rs` / `client_limits.rs` / `token_daily.rs`
+三个既有使用点也跟着变。
+
+- 功能上安全：不设 key 时 SQLCipher 与 SQLite 行为一致；
+- 代价是真的：二进制变大、**构建要编 OpenSSL**。本机实测 `cargo check` 首次 **18 分钟**
+  （vendored OpenSSL），之后有缓存就快。
+- 独立 crate 仍然有价值，但价值在**代码边界**（「解密只在这里发生」）与**测试闭环**，
+  不在构建隔离。别再用「独立 crate 所以没影响」这种说法。
+
+**② 编 OpenSSL 需要 perl；Windows 上这是硬门槛。**
+
+本机的两套 PortableGit 自带 `perl5.42.2.exe` 都跑不起来（`0xc0000135`，缺 DLL），
+`openssl-src` 直接失败。最后用 **Strawberry Perl 便携版**（`.tmp/perl/perl/bin` 加进 PATH）才编过。
+CI 上 GitHub 的 windows runner 自带 Strawberry Perl，通常无需额外步骤；**但本地环境要准备好**，
+否则「别人拉下来编不过」。
+
+### 15.3 验证（可闭环，不依赖真机库）
+
+真实 Trae 库需要口令，CI 上不可能有 ⇒ 用**同一份引擎**造夹具来闭环：
+
+| 测试 | 位置 | 断言 |
+|:--|:--|:--|
+| 加解密往返 | `crates/buddy-switch-vault/tests/vault_roundtrip.rs` | 加密库无明文头 → 导出 → 行数与正文逐字一致 |
+| 错口令 | 同上 | `WrongKey` |
+| 明文库不解密 | 同上 | `AlreadyPlaintext` |
+| **端到端** | `crates/buddy-switch-core/tests/trae_vault_end_to_end.rs` | 加密库先被 `client_import` 判 `not_plaintext` → 解密 → 统计出 `212/180/32/3 条/2 模型` |
+| 重复导出 | 同上 | 覆盖而非追加（总量不翻倍、体积一致） |
+
+最后一条是刻意加的：`sqlcipher_export` 是「建表 + 灌数据」，不先删目标就会把旧内容
+混进新副本 —— 这类错不会报错，只会让数字慢慢变大。
+
+### 15.4 仍然没做的事
+
+- **不自动取口令**（逆派生 / 读进程内存）。口令由用户提供，这是本功能与「内置逆向工具」的分界线。
+- **不做增量**：每次解锁都是全量导出（157 MB 级），解锁后看到的是**导出那一刻**的快照。

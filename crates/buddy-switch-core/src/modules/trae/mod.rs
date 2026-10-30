@@ -91,6 +91,8 @@
 
 pub mod account;
 pub mod checkin;
+/// 客户端账本：读**用户自己导出的明文库**（不内置解密，见模块头）。
+pub mod client_import;
 pub mod credits;
 pub mod device;
 pub mod export_import;

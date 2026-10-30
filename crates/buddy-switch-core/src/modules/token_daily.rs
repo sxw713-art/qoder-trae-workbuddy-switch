@@ -83,7 +83,23 @@ pub const TOKEN_DAILY_MAX_DAYS: usize = 400;
 /// （`gatewayModels` / `gatewayAccounts` / `gatewayEndpoints`）+ `gatewayModelsPartial`。
 /// 旧文件缺这些字段 ⇒ `serde(default)` 读成空，由 `gateway_round` 的**播种轮**补齐，
 /// **不需要**整库丢弃。
-pub const TOKEN_DAILY_VERSION: u32 = 3;
+///
+/// v4（2026-10-28，issue #76 补账）：新增第四个维度 `gatewayKeys` + `gatewayKeysPartial`
+/// —— 用量页「按密钥看用量」的**正确数据源**。
+///
+/// 为什么必须进账本（而不是继续扫请求日志）：网关请求日志是**环形裁剪**的
+/// （只留最近 `log_keep` 条，缺省 200 ⇒ 繁忙时段只覆盖十几分钟）。旧实现直接聚合
+/// 该窗口并当成「近 30 天」展示，于是本机出现「44.2M Token / 200 次 / 100%（其实是
+/// 17 分钟）」这种**量级正确、区间错误**的读数。账本按日累积，窗口才有意义；
+/// 代价是**升级前的日期没有 key 维度**（由 `gatewayKeysPartial` 与「无该维度」
+/// 两种情况分别披露，绝不补 0 冒充）。
+///
+/// v5（2026-10-29，模型降级链账本维度）：新增 `fallbackDays` —— **降级链**的逐日计数。
+///
+/// 为什么必须落盘：降级事件原本只存在网关**进程内的 50 条环形缓冲**里
+/// （见 `buddy_switch_gateway::model_fallback`）⇒ 重启即失、且只覆盖最近几十秒。
+/// 「近 7 天降级了多少次 / 成功率多少」这种**窗口统计**只能来自逐日落库的计数。
+pub const TOKEN_DAILY_VERSION: u32 = 5;
 
 /// 网关日志条数上限的缺省值（与 `GatewayConfig::default().log_keep` 同值）。
 const DEFAULT_GATEWAY_LOG_KEEP: usize = 200;
@@ -201,15 +217,62 @@ struct DayRecord {
     /// 网关按**端点**的维度桶（`/v1/chat/completions` 等）。
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     gateway_endpoints: BTreeMap<String, DimBucket>,
+    /// 网关按**调用方密钥**的维度桶（键口径见 [`key_bucket_of`]）。
+    ///
+    /// 与另外三个维度**同轮同水位线**产出 ⇒ 合计也等于当日网关 token 总量
+    /// （护栏 `gateway_dims_sum_to_the_gateway_bucket`）。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    gateway_keys: BTreeMap<String, DimBucket>,
     /// 该日维度桶是**升级播种**出来的（v2 → v3 过渡）⇒ 拆分不完整，UI 要披露。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     gateway_models_partial: bool,
+    /// 该日**密钥**维度是升级播种出来的（v3 → v4 过渡）⇒ 只是**下界**，UI 要披露。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    gateway_keys_partial: bool,
 }
 
 /// `model` 字段为空时的哨兵（渲染层翻成「未标注模型」）。
 ///
 /// 不丢弃这类行：它们**确实消耗了 token**，丢掉会让「按模型合计」小于网关卡。
 pub const UNKNOWN_MODEL: &str = "__unknown__";
+
+/// 「按密钥」维度里两个**非 Key** 桶的键（升级前条目 / 确实没有 Key 的调用）。
+///
+/// 与前端 `src/lib/key-usage.ts` 的 `LEGACY_BUCKET` / `NONE_BUCKET` 逐字相同 ——
+/// **两组语义不得合并**：把「升级前没记 key」并进「无 Key 调用」会让历史数据凭空
+/// 多出一批「匿名调用」，而那个数字一旦出现在排行里就会被当成真的。
+pub const KEY_DIM_LEGACY: &str = "__legacy__";
+/// 确实没有 Key 的调用（本地直连 / 管理面探测）。
+pub const KEY_DIM_NONE: &str = "__none__";
+
+/// 日志行 → 「按密钥」维度桶键。
+///
+/// 三种取值，**判据只看 JSON 里有没有 `keyId` 这个键**：
+/// - **键不存在** ⇒ [`KEY_DIM_LEGACY`]（本改动之前写入的老条目）；
+/// - **值为 `null` / 空串** ⇒ [`KEY_DIM_NONE`]（这次请求确实没带 Key）；
+/// - 其余 ⇒ `{keyScope}:{keyId}`，`keyScope` 缺失时退化成裸 id。
+///
+/// 为什么要带 `keyScope`：统一网关把请求转发给产品线中继时，产品线日志里记的是
+/// **网关那把 Key 的 id** —— 它与产品线自己的 Key id 混在同一个字段。带上归属，
+/// 同一串 id 在两套台账里才不会并成一行（前端 `aggregateByKeyDim` 同判据）。
+pub fn key_bucket_of(value: &Value) -> String {
+    let Some(raw) = value.get("keyId") else {
+        return KEY_DIM_LEGACY.to_string();
+    };
+    let id = raw.as_str().map(str::trim).unwrap_or_default();
+    if raw.is_null() || id.is_empty() {
+        return KEY_DIM_NONE.to_string();
+    }
+    match value
+        .get("keyScope")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|scope| !scope.is_empty())
+    {
+        Some(scope) => format!("{scope}:{id}"),
+        None => id.to_string(),
+    }
+}
 
 /// 落盘存储：`{ version, days: { "YYYY-MM-DD": DayRecord }, clientScannedAtMs }`。
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -225,6 +288,45 @@ struct Store {
     /// 当日值会被冻结在当天首次扫描那一刻（见 [`CLIENT_SCAN_TTL_MS`] 的实测现场）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     client_scanned_at_ms: Option<i64>,
+    /// **降级链**的逐日计数（键 = 本地日 `YYYY-MM-DD`）。
+    ///
+    /// ## 为什么这里是**累加**，而 `days` 是「折叠 + 取大」
+    ///
+    /// `days` 从**请求日志**聚合，而日志是环形缓冲 —— 同一次请求会被反复读到，
+    /// 所以必须「取大 / 纠偏」而不是累加（见 [`GatewayWrite::Correct`]）。
+    /// 降级事件相反：它是**一次性事件**（进程内 50 条环形缓冲、重启即失），
+    /// 读到第二次就可能已经丢了 ⇒ 折叠会漏、取大会错，只能**累加**。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub fallback_days: BTreeMap<String, FallbackDayCounts>,
+}
+
+/// 某个本地日的**降级计数**（两档）。
+///
+/// ## 为什么只有两档
+/// 「降级成功率」的分母只能是**真正发生过降级尝试**的事件：`degraded`（备选顶上了）
+/// + `failed`（备选也失败）。`blocked`（按规则压根没降级）不属于任何一档 ——
+/// 把它算进 `failed` 会把分母灌水（混进根本没降级的事故）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FallbackDayCounts {
+    /// 降级**成功**次数（备选顶上了，客户端拿到正常响应）。
+    #[serde(default)]
+    pub degraded: u32,
+    /// 降级**失败**次数（备选也失败，最终仍以失败告终）。
+    #[serde(default)]
+    pub failed: u32,
+}
+
+/// 一次降级事件的结果（落盘形状；与网关侧 `FallbackEvent.result` 逐字对应）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FallbackResult {
+    /// 降级成功。
+    Degraded,
+    /// 降级失败。
+    Failed,
+    /// 按规则没降级（**不计入**任何一档）。
+    Blocked,
 }
 
 fn default_version() -> u32 {
@@ -236,6 +338,7 @@ fn empty_store() -> Store {
         version: TOKEN_DAILY_VERSION,
         days: BTreeMap::new(),
         client_scanned_at_ms: None,
+        fallback_days: BTreeMap::new(),
     }
 }
 
@@ -299,6 +402,13 @@ fn prune_store(store: &mut Store, at_ms: i64) {
     };
     let cutoff = today - ChronoDuration::days(TOKEN_DAILY_RETENTION_DAYS - 1);
     store.days.retain(|day, _| {
+        NaiveDate::parse_from_str(day, "%Y-%m-%d")
+            .map(|date| date >= cutoff)
+            .unwrap_or(false)
+    });
+    // 降级计数与 `days` 同一个保留窗：不清理会让这个 map 无限增长
+    // （它按日累加，永远不会被"覆盖"）。
+    store.fallback_days.retain(|day, _| {
         NaiveDate::parse_from_str(day, "%Y-%m-%d")
             .map(|date| date >= cutoff)
             .unwrap_or(false)
@@ -402,6 +512,8 @@ struct GatewayRow {
     model: String,
     /// 端点（`/v1/chat/completions` 等）。
     endpoint: String,
+    /// 调用方密钥的维度桶键（见 [`key_bucket_of`]；无 Key / 老条目走哨兵）。
+    key: String,
     /// HTTP 状态码（`>= 400` 计入 `failed`）。
     status: u16,
     /// 上游积分（`usage.credit`；缺字段 = 0.0 = 不知道）。
@@ -450,6 +562,7 @@ fn parse_gateway_rows(entries: &[Value]) -> Vec<GatewayRow> {
                     .filter(|model| !model.is_empty())
                     .unwrap_or(UNKNOWN_MODEL)
                     .to_string(),
+                key: key_bucket_of(value),
                 endpoint: value
                     .get("endpoint")
                     .and_then(Value::as_str)
@@ -573,6 +686,7 @@ enum GatewayWrite {
 fn gateway_round(
     watermark: Option<i64>,
     dims_empty: bool,
+    keys_empty: bool,
     rows: &[GatewayRow],
     region: Region,
     day: &str,
@@ -622,26 +736,50 @@ fn gateway_round(
         (Some(current), None) => Some(current),
         (None, max) => max,
     };
+    /* ★ 密钥维度单独判「要不要播种」：它是 v4 才加的第四个维度，升级当天
+    「另外三个维度已经有数、只有它是空的」。沿用 `dims_empty` 会走了增量分支 ⇒
+    今天此前的请求全部漏记，而 UI 上看着像「这把 Key 只用了这么点」。
+    代价是播种轮只能拿当前日志窗口 —— 那天标 `keys_partial`（下界）。 */
+    let keys_since = match (watermark, keys_empty) {
+        (None, _) => None,
+        (Some(_), false) => watermark,
+        (Some(_), true) => None,
+    };
+    let keys_write = {
+        let map = bucket_dim(rows, region, day, keys_since, |row| row.key.clone());
+        match keys_since {
+            Some(_) => DimWrite::Add(map),
+            None => DimWrite::Correct(map),
+        }
+    };
     GatewayRound {
         accounts,
         models: dim(&|row| row.model.clone()),
         accounts_dim: by_account,
         endpoints: dim(&|row| row.endpoint.clone()),
+        keys: keys_write,
         next_watermark,
         dims_partial,
+        keys_partial: matches!((watermark, keys_empty), (Some(_), true)),
     }
 }
 
-/// 一轮网关聚合的完整结果：账号 token 桶 + 三条维度桶 + 新水位线。
+/// 一轮网关聚合的完整结果：账号 token 桶 + 四条维度桶 + 新水位线。
 #[derive(Debug)]
 struct GatewayRound {
     accounts: GatewayWrite,
     models: DimWrite,
     accounts_dim: DimWrite,
     endpoints: DimWrite,
+    /// 密钥维度（键见 [`key_bucket_of`]）。
+    keys: DimWrite,
     next_watermark: Option<i64>,
     /// 维度是升级播种出来的（该日原有账号桶非空时才真正标 partial）。
     dims_partial: bool,
+    /// 密钥维度是升级播种出来的（v3 → v4）—— 与 `dims_partial` **分开**：
+    /// 前者说「模型/账号/端点不完整」，后者只说「按密钥不完整」，混用会让
+    /// 模型视图平白背上一口锅。
+    keys_partial: bool,
 }
 
 /// 网关日志的 `account` 是**展示名**（`account_display_name` 的回落链：email → nickname →
@@ -1089,6 +1227,92 @@ fn bucket_client(
 ///
 /// 桶是**累加**的，不是「当前窗口快照」。每轮只把 `ts > 水位线` 的新条目加进桶，
 /// 水位线随轮次前移 ⇒ 滚动日志把老条目裁掉时，**已记的量不会跟着消失**（数字不倒退）。
+/// 近 `days` 天降级计数的**上限**（防止一次拉全量）。
+pub const MAX_FALLBACK_STATS_DAYS: u32 = 90;
+
+/// 把一次降级结果累加进内存 Store（**纯函数**，便于单测注入）。
+fn apply_fallback(store: &mut Store, result: FallbackResult, day: &str) -> FallbackDayCounts {
+    if matches!(result, FallbackResult::Blocked) {
+        // ★ 不创建桶：一条全 0 的日记录会让「这一天有降级」看起来成立，
+        //   而 `blocked` 的语义正是「压根没降级」。
+        return store.fallback_days.get(day).copied().unwrap_or_default();
+    }
+    let entry = store.fallback_days.entry(day.to_string()).or_default();
+    match result {
+        FallbackResult::Degraded => entry.degraded = entry.degraded.saturating_add(1),
+        FallbackResult::Failed => entry.failed = entry.failed.saturating_add(1),
+        FallbackResult::Blocked => {}
+    }
+    *entry
+}
+
+/// 从内存 Store 汇总近 `days` 天（**纯函数**，`today` 由调用方给，便于单测）。
+fn summarize_fallback(store: &Store, today: NaiveDate, days: u32) -> Value {
+    let days = days.clamp(1, MAX_FALLBACK_STATS_DAYS);
+    let mut items = Vec::new();
+    let mut total = FallbackDayCounts::default();
+    for offset in 0..days {
+        let day = today - ChronoDuration::days(i64::from(offset));
+        let key = day.format("%Y-%m-%d").to_string();
+        let counts = store.fallback_days.get(&key).copied().unwrap_or_default();
+        total.degraded = total.degraded.saturating_add(counts.degraded);
+        total.failed = total.failed.saturating_add(counts.failed);
+        items.push(serde_json::json!({
+            "date": key,
+            "degraded": counts.degraded,
+            "failed": counts.failed,
+        }));
+    }
+    serde_json::json!({
+        "days": items,
+        "total": { "degraded": total.degraded, "failed": total.failed },
+    })
+}
+
+/// 记一次降级结果（**累加**，见 [`Store::fallback_days`] 的文档）。
+///
+/// ## 为什么每次事件都读-改-写整个文件
+///
+/// 降级是**低频事件**（一天几十次量级），而 `save_store` 走 `atomic_write`（原子替换）。
+/// 反过来做「内存缓存 + 定期 flush」会引入两个新问题：进程被杀时丢最后一批、
+/// 以及「什么时候 flush」这个没人说得清的参数。低频场景下，简单比高效更重要。
+///
+/// 跨进程（桌面端 + 服务端同时写）不引入文件锁：丢一次计数的代价远小于
+/// 「每次降级一次 syscall」，而锁本身也会带来死锁面。
+pub fn record_fallback(region: Region, result: FallbackResult, now_ms: i64) -> FallbackDayCounts {
+    // `blocked` = 压根没降级，不进任何一档（见 [`FallbackDayCounts`] 的文档）。
+    if matches!(result, FallbackResult::Blocked) {
+        return FallbackDayCounts::default();
+    }
+    let guard = TOKEN_DAILY_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut store = load_store(region);
+    let Some(day) = local_date(now_ms) else {
+        return FallbackDayCounts::default();
+    };
+    let counts = apply_fallback(&mut store, result, &day.format("%Y-%m-%d").to_string());
+    save_store(region, &store);
+    drop(guard);
+    counts
+}
+
+/// 近 `days` 天的降级计数（新的在前 + 总计）。
+///
+/// `days` 被夹在 `1..=MAX_FALLBACK_STATS_DAYS`：不夹上限的话，
+/// 一次调用会把整本账全量序列化（账本按日累积，可以很大）。
+pub fn fallback_stats(region: Region, days: u32) -> Value {
+    let store = load_store(region);
+    match local_date(crate::modules::config::now_ms()) {
+        Some(today) => summarize_fallback(&store, today, days),
+        // 取不到本地日（极端时钟问题）⇒ 返回空统计，不 panic。
+        None => serde_json::json!({
+            "days": [],
+            "total": { "degraded": 0, "failed": 0 },
+        }),
+    }
+}
+
 pub fn record_gateway_today(region: Region) -> Value {
     let at = now_ms();
     let day = local_date_string(at).unwrap_or_default();
@@ -1115,6 +1339,7 @@ pub fn record_gateway_today(region: Region) -> Value {
         let round = gateway_round(
             record.gateway_watermark_ts,
             record.gateway_models.is_empty(),
+            record.gateway_keys.is_empty(),
             &rows,
             region,
             &day,
@@ -1138,10 +1363,11 @@ pub fn record_gateway_today(region: Region) -> Value {
                 }
             }
         }
-        /* 三条维度：与账号桶同轮同水位线。`Correct` = 逐键取大（不倒退、不双计）。 */
+        /* 四条维度：与账号桶同轮同水位线。`Correct` = 逐键取大（不倒退、不双计）。 */
         apply_dim_write(&mut record.gateway_models, round.models);
         apply_dim_write(&mut record.gateway_accounts, round.accounts_dim);
         apply_dim_write(&mut record.gateway_endpoints, round.endpoints);
+        apply_dim_write(&mut record.gateway_keys, round.keys);
         /* 升级播种：只有该日**原本就有**账号桶时才标「不完整」——
         新的一天整窗播种就是全量，不该挂污点。 */
         let had_prior = record
@@ -1150,6 +1376,9 @@ pub fn record_gateway_today(region: Region) -> Value {
             .any(|entry| entry.gateway.input > 0 || entry.gateway.output > 0);
         if round.dims_partial && had_prior {
             record.gateway_models_partial = true;
+        }
+        if round.keys_partial && had_prior {
+            record.gateway_keys_partial = true;
         }
         record.gateway_watermark_ts = round.next_watermark;
         record.gateway_truncated = truncated;
@@ -1356,16 +1585,20 @@ pub fn reconcile_today(region: Region) -> Value {
     value
 }
 
-/// 网关的**三维度**逐日历史（模型 / 账号 / 端点）—— 用量页「账本」视图的唯一数据源。
+/// 网关的**四维度**逐日历史（密钥 / 模型 / 账号 / 端点）—— 用量页「账本」视图的唯一数据源。
 ///
 /// 与 [`gateway_token_trend`] **同源同形状**（`days` 只含落库日 + `truncated`），
 /// 前端复用同一套覆盖率计算。只读：不扫盘、不触发记录。
 ///
-/// ## 为什么三个维度放一个命令
+/// ## 为什么四个维度放一个命令
 ///
 /// 它们由同一次聚合产出、共用同一个水位线，**必须一起读**才能保证
-/// 「按模型合计 = 按账号合计 = 按端点合计 = 网关卡」。分三条命令只会让前端
+/// 「按密钥合计 = 按模型合计 = 按账号合计 = 按端点合计 = 网关卡」。分四条命令只会让前端
 /// 各取一次、在两次读取之间数据已经变了。
+///
+/// ⚠️ `keys` 是 v4 才有的维度：升级前的日期里它是**空数组**（不是 0 用量）。
+/// 前端必须把「没有该维度」与「该维度暂无用量」分开表述（`keysPartial` 只描述
+/// 「这一天从中间开始记」，不描述「完全没有」）。
 pub fn gateway_usage_dim(region: Region) -> Value {
     let store = load_store(region);
     let days: Vec<Value> = store
@@ -1376,6 +1609,8 @@ pub fn gateway_usage_dim(region: Region) -> Value {
                 "key": day,
                 "truncated": record.gateway_truncated,
                 "partial": record.gateway_models_partial,
+                "keysPartial": record.gateway_keys_partial,
+                "keys": dim_groups(&record.gateway_keys, "key"),
                 "models": dim_groups(&record.gateway_models, "model"),
                 "accounts": dim_groups(&record.gateway_accounts, "account"),
                 "endpoints": dim_groups(&record.gateway_endpoints, "endpoint"),
@@ -1450,6 +1685,73 @@ mod tests {
     use super::*;
     use chrono::Datelike;
     use std::fs;
+
+    /// 降级计数是**累加**（不是取大）：同一天记两次成功 ⇒ 2。
+    ///
+    /// 变异验证：把 `apply_fallback` 的 `saturating_add` 改成 `= 1`（取大）⇒ 本用例红。
+    /// 这是本维度的**核心语义**：降级事件是一次性事件，折叠会漏。
+    #[test]
+    fn fallback_counts_accumulate_per_day() {
+        let mut store = empty_store();
+        apply_fallback(&mut store, FallbackResult::Degraded, "2026-10-29");
+        apply_fallback(&mut store, FallbackResult::Degraded, "2026-10-29");
+        apply_fallback(&mut store, FallbackResult::Failed, "2026-10-29");
+        let counts = store
+            .fallback_days
+            .get("2026-10-29")
+            .copied()
+            .expect("当天必须有计数");
+        assert_eq!(counts.degraded, 2, "同一天两次成功必须累加");
+        assert_eq!(counts.failed, 1);
+    }
+
+    /// `blocked`（按规则压根没降级）**不进任何一档**。
+    ///
+    /// 把它算进 `failed` 会让「降级成功率」的分母灌水 —— 分母里混进根本没降级的事故。
+    #[test]
+    fn blocked_is_not_counted() {
+        let mut store = empty_store();
+        let counts = apply_fallback(&mut store, FallbackResult::Blocked, "2026-10-29");
+        assert_eq!(counts, FallbackDayCounts::default());
+        assert!(
+            store.fallback_days.is_empty(),
+            "blocked 不该创建当天的桶（否则会凭空多出一条全 0 的日记录）"
+        );
+    }
+
+    /// 跨天分开计；汇总按**窗口**取，并给出总计。
+    #[test]
+    fn stats_summarize_window_and_total() {
+        let mut store = empty_store();
+        apply_fallback(&mut store, FallbackResult::Degraded, "2026-10-29");
+        apply_fallback(&mut store, FallbackResult::Degraded, "2026-10-28");
+        apply_fallback(&mut store, FallbackResult::Failed, "2026-10-27");
+        // 窗口外（第 9 天）不该被算进来 —— 这正是「近 7 天」与「全部」的区别。
+        apply_fallback(&mut store, FallbackResult::Degraded, "2026-10-20");
+
+        let today = NaiveDate::parse_from_str("2026-10-29", "%Y-%m-%d").expect("date");
+        let payload = summarize_fallback(&store, today, 7);
+        assert_eq!(
+            payload["days"].as_array().map(Vec::len),
+            Some(7),
+            "固定 7 行（没有事件的天也要占位，否则前端画不出时间轴）"
+        );
+        assert_eq!(payload["total"]["degraded"], 2, "窗口内两次成功");
+        assert_eq!(payload["total"]["failed"], 1);
+    }
+
+    /// `days` 超上限被夹住 —— 否则一次调用会把整本账全量序列化（账本按日累积）。
+    #[test]
+    fn stats_days_are_clamped() {
+        let store = empty_store();
+        let today = NaiveDate::parse_from_str("2026-10-29", "%Y-%m-%d").expect("date");
+        let payload = summarize_fallback(&store, today, 10_000);
+        assert_eq!(
+            payload["days"].as_array().map(Vec::len),
+            Some(MAX_FALLBACK_STATS_DAYS as usize),
+            "超过上限必须夹住"
+        );
+    }
 
     fn at_local_date(days_ago: i64, hour: u32) -> i64 {
         let today = Local::now().date_naive() - ChronoDuration::days(days_ago);
@@ -1749,9 +2051,11 @@ mod tests {
 
     fn gw_round_cn(watermark: Option<i64>, entries: &[Value]) -> (GatewayWrite, Option<i64>) {
         let day = local_date_string(at_local_date(0, 12)).expect("today");
-        /* `dims_empty = true`：这些用例只关心账号桶，维度走播种轮（不影响 accounts）。 */
+        /* `dims_empty = true` / `keys_empty = true`：这些用例只关心账号桶，
+        维度走播种轮（不影响 accounts）。 */
         let round = gateway_round(
             watermark,
+            true,
             true,
             &parse_gateway_rows(entries),
             Region::Cn,
@@ -1796,20 +2100,25 @@ mod tests {
         let entries = vec![
             json!({ "ts": base, "region": "cn", "account": "uid-a", "accountUid": "uid-a",
                     "endpoint": "/v1/chat/completions", "model": "m-1", "status": 200,
+                    "keyId": "k-1", "keyScope": "wb",
                     "promptTokens": 100, "completionTokens": 10, "credit": 1.25 }),
             json!({ "ts": base + 1, "region": "cn", "account": "uid-a", "accountUid": "uid-a",
                     "endpoint": "/v1/chat/completions", "model": "m-1", "status": 429,
+                    "keyId": "k-1", "keyScope": "wb",
                     "promptTokens": 0, "completionTokens": 0, "credit": 0.0 }),
             json!({ "ts": base + 2, "region": "cn", "account": "uid-b", "accountUid": "uid-b",
                     "endpoint": "/v1/messages", "model": "", "status": 200,
+                    "keyId": null,
                     "promptTokens": 40, "completionTokens": 2, "credit": 0.5 }),
             // 别的 region / 别的日：一律不得进任何桶
             json!({ "ts": base + 3, "region": "global", "account": "uid-g", "accountUid": "uid-g",
                     "endpoint": "/v1/messages", "model": "m-1", "status": 200,
+                    "keyId": "k-g", "keyScope": "wb",
                     "promptTokens": 999, "completionTokens": 9, "credit": 9.0 }),
         ];
         let round = gateway_round(
             None,
+            true,
             true,
             &parse_gateway_rows(&entries),
             Region::Cn,
@@ -1827,10 +2136,12 @@ mod tests {
         let models = dim_map(round.models);
         let accounts_dim = dim_map(round.accounts_dim);
         let endpoints = dim_map(round.endpoints);
+        let keys = dim_map(round.keys);
         for (label, map) in [
             ("模型", &models),
             ("账号", &accounts_dim),
             ("端点", &endpoints),
+            ("密钥", &keys),
         ] {
             let (input, output, requests, failed, credit) = dim_total(map);
             assert_eq!(
@@ -1854,6 +2165,80 @@ mod tests {
         );
         assert_eq!(endpoints.len(), 2, "两个端点各一桶");
         assert_eq!(accounts_dim.len(), 2, "两个账号各一桶");
+        assert!(
+            keys.contains_key("wb:k-1"),
+            "带 keyScope 的 Key 桶键必须是 `{{scope}}:{{id}}`（否则两套台账会并成一行）"
+        );
+        assert!(
+            keys.contains_key(KEY_DIM_NONE),
+            "keyId 为 null 必须落「无密钥调用」哨兵，不能丢量"
+        );
+        assert_eq!(keys.len(), 2, "一把 Key + 一次无 Key 调用");
+    }
+
+    /// 密钥维度的三种「没有 Key」判据（与前端 `key-usage.ts` 逐字对齐）。
+    ///
+    /// ⚠️ 老条目（**没有 `keyId` 键**）与无 Key 调用（`keyId: null`）**不得合并**：
+    /// 合并会让历史数据凭空多出一批「匿名调用」，而那个数字一旦出现在排行里
+    /// 就会被当成真的（issue #76 的原始判据）。
+    #[test]
+    fn key_bucket_separates_legacy_from_no_key() {
+        assert_eq!(
+            key_bucket_of(&json!({ "ts": 1, "promptTokens": 5 })),
+            KEY_DIM_LEGACY
+        );
+        assert_eq!(
+            key_bucket_of(&json!({ "ts": 1, "promptTokens": 5, "keyId": null })),
+            KEY_DIM_NONE
+        );
+        assert_eq!(
+            key_bucket_of(&json!({ "ts": 1, "keyId": "  ", "keyScope": "wb" })),
+            KEY_DIM_NONE,
+            "空串按「没有 Key」处理，不当成一把空 id 的 Key"
+        );
+        assert_eq!(
+            key_bucket_of(&json!({ "ts": 1, "keyId": "k-1", "keyScope": "unified" })),
+            "unified:k-1"
+        );
+        assert_eq!(
+            key_bucket_of(&json!({ "ts": 1, "keyId": "k-1" })),
+            "k-1",
+            "老日志没有 keyScope ⇒ 退化成裸 id，不编一个归属出来"
+        );
+    }
+
+    /// v3 → v4：`gateway_keys` 是空的、但当天已经有 token（另外三个维度已存在）
+    /// ⇒ 密钥维度必须**整窗播种**并标 `keys_partial`，否则升级当天此前的请求全部漏记。
+    #[test]
+    fn gateway_keys_seed_from_the_whole_window_when_dimension_is_new() {
+        let day = local_date_string(at_local_date(0, 12)).expect("today");
+        let base = at_local_date(0, 12);
+        let entries = vec![json!({
+            "ts": base, "region": "cn", "account": "uid-a", "accountUid": "uid-a",
+            "endpoint": "/v1/chat/completions", "model": "m-1", "status": 200,
+            "keyId": "k-1", "keyScope": "wb",
+            "promptTokens": 10, "completionTokens": 1, "credit": 0.1
+        })];
+        let round = gateway_round(
+            Some(base - 1), // 水位线存在（老记录）
+            false,          // 另外三个维度**不是**空的
+            true,           // 只有密钥维度是空的
+            &parse_gateway_rows(&entries),
+            Region::Cn,
+            &day,
+            &HashSet::new(),
+            &HashMap::new(),
+        );
+        assert!(
+            round.keys_partial,
+            "升级播种必须标 keys_partial（UI 要披露「这一天的 key 维度只是下界」）"
+        );
+        let keys = dim_map(round.keys);
+        assert_eq!(
+            dim_total(&keys).0,
+            10,
+            "播种轮取整窗读数，不是「只加水位线之后的新条目」"
+        );
     }
 
     /// 升级过渡（v2 → v3）：水位线存在但维度桶为空 ⇒ 维度单独播种一次，并标 partial。
@@ -1872,6 +2257,7 @@ mod tests {
         let round = gateway_round(
             Some(base - 1), // 水位线存在
             true,           // 但维度桶是空的
+            true,           // 密钥维度也是空的
             &parse_gateway_rows(&entries),
             Region::Cn,
             &day,
@@ -2459,5 +2845,107 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// ★★ **接线**回归：`record_gateway_today` → 落盘 → `gateway_usage_dim` 的 `keys`
+    /// 维度（用户报障的那条链路，2026-10-28）。
+    ///
+    /// 单测只测 `gateway_round` 是不够的：这里走**生产函数的完整路径**（真 store、
+    /// 真日志文件），断言三件事：
+    /// 1. 升级前形态的 store（有 `gatewayModels`、**没有** `gatewayKeys` / 水位线
+    ///    且当天已有 token）⇒ 密钥维度整窗播种，不掉数据；
+    /// 2. 三种「没有 / 有 Key」的行各自落桶（`wb:k-1` / `__none__` / `__legacy__`）；
+    /// 3. 输出里带 `keysPartial`，UI 才能披露「这一天只是下界」。
+    ///
+    /// 可证伪：把 `record_gateway_today` 里那行 `apply_dim_write(&mut record.gateway_keys, …)`
+    /// 删掉 ⇒ `days[].keys` 为空、本用例变红。
+    #[test]
+    fn record_gateway_today_reports_the_key_dimension() {
+        let dir = std::env::temp_dir().join(format!(
+            "buddy-switch-token-daily-keys-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).expect("create home dir");
+        let guard = crate::modules::config::HomeOverrideGuard::set(&dir);
+        let store = dir.join(".buddy-switch");
+        std::fs::create_dir_all(&store).expect("create store dir");
+
+        let t1 = now_ms() - 3_000;
+        let t2 = now_ms() - 2_000;
+        let t3 = now_ms() - 1_000;
+        let day = local_date_string(now_ms()).expect("today");
+
+        /* 升级前形态（v3）：有账号桶与模型维度，水位线已存在，**没有**密钥维度。 */
+        let prior = json!({
+            "version": 3,
+            "days": {
+                day.clone(): {
+                    "accounts": {
+                        "uid-a": { "client": {"input":0,"output":0}, "gateway": {"input":30,"output":3} }
+                    },
+                    "gatewayTruncated": false,
+                    "gatewayWatermarkTs": t1 - 1,
+                    "gatewayModels": {
+                        "m-1": { "input":30, "output":3, "requests":1, "failed":0, "credit":0.3 }
+                    }
+                }
+            }
+        });
+        std::fs::write(
+            store.join("token_daily.json"),
+            serde_json::to_string(&prior).unwrap(),
+        )
+        .expect("pre-write v3 store");
+
+        // 三条行：带 Key（有归属）/ `keyId: null`（确实无 Key）/ **没有** `keyId` 键（老条目）。
+        let log = json!([
+            { "ts": t1, "region": "cn", "account": "uid-a", "accountUid": "uid-a",
+              "promptTokens": 10, "completionTokens": 1, "keyId": "k-1", "keyScope": "wb" },
+            { "ts": t2, "region": "cn", "account": "uid-a", "accountUid": "uid-a",
+              "promptTokens": 5, "completionTokens": 0, "keyId": null },
+            { "ts": t3, "region": "cn", "account": "uid-a", "accountUid": "uid-a",
+              "promptTokens": 7, "completionTokens": 0 }
+        ]);
+        std::fs::write(
+            store.join("gateway_logs.json"),
+            serde_json::to_string(&log).unwrap(),
+        )
+        .expect("write log");
+
+        record_gateway_today(Region::Cn);
+        let dim = gateway_usage_dim(Region::Cn);
+        let today = dim["days"]
+            .as_array()
+            .expect("days")
+            .iter()
+            .find(|entry| entry["key"] == day.as_str())
+            .cloned()
+            .expect("今日必须落库");
+
+        let keys = today["keys"].as_array().expect("keys 维度必须存在");
+        let bucket =
+            |name: &str| -> Option<&Value> { keys.iter().find(|entry| entry["key"] == name) };
+        let keyed = bucket("wb:k-1").expect("带归属的 Key 必须落 `{scope}:{id}` 桶");
+        assert_eq!(keyed["total"].as_u64(), Some(11), "播种轮取整窗读数");
+        assert_eq!(keyed["requests"].as_u64(), Some(1));
+        assert_eq!(
+            bucket(KEY_DIM_NONE).and_then(|v| v["total"].as_u64()),
+            Some(5),
+            "`keyId: null` 落「无密钥调用」"
+        );
+        assert_eq!(
+            bucket(KEY_DIM_LEGACY).and_then(|v| v["total"].as_u64()),
+            Some(7),
+            "**没有** `keyId` 键的老条目落「升级前的历史条目」，不并进无密钥调用"
+        );
+        assert_eq!(keys.len(), 3, "三种来源三行，不合并");
+        assert_eq!(
+            today["keysPartial"].as_bool(),
+            Some(true),
+            "v3 → v4 那天只是下界，UI 要能披露"
+        );
+
+        drop(guard);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

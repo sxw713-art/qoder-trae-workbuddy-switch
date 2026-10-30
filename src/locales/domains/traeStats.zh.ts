@@ -28,10 +28,35 @@ export const zh = {
   // ---- 数据源边界提示 ----
   "trae.stats.token.sourceTitle": "数据来源",
   "trae.stats.token.sourceFallback": "只统计经过本机 Trae 网关的调用。",
+  // 账本口径（网关逐日落库，90 天）—— 与上面的「日志窗口」是两个观测点。
+  "trae.stats.token.ledgerTitle": "数据来源 · 网关账本",
+  "trae.stats.token.ledgerBody":
+    "网关账本由后台每 2 分钟把请求日志增量记进本地账本，保留 90 天 —— 这一本自动就有。客户端那一本账落在 IDE 私有存储（SQLCipher 加密 + 二进制索引），本工具读不了，得用 sqlcipher 导出明文副本后从「客户端」档导入。",
+  "trae.stats.token.heatmapLedgerUnavailable":
+    "账本按日聚合，没有「周 × 小时」的时段槽位 —— 时段分布这张图在账本口径下画不出来，不画空图。",
+  // 「按账本并排」专用：Trae 的 `all` 档是两本账并排，不是「按模型拆分」——
+  // WB 的 `wbStats.usage.trend.stackedTitle` / `stackedAria` / `ledgerCaption` 都不适用
+  // （后者结尾「见对账」在 Trae 上没有入口：无 `get_usage_reconcile`）。
+  // ⚠️ 两本账不是等价账，也不是子集关系：客户端副本**含全部对话**；网关只含**经本机转发**
+  //   的请求，其中还可能有第三方拿 API Key 直调网关、根本不在客户端库里 ⇒ **部分重叠**，
+  //   不能相加；重叠量也测不出来（无逐条对账）。
+  "trae.stats.token.ledgerStackedTitle": "每日 Token · 客户端 / 网关并排",
+  "trae.stats.token.ledgerStackedCaption":
+    "柱高是两本账各自的值，不合并、不扣减 —— 两本账会部分重叠（为什么、重叠多少见上方说明）。",
+  "trae.stats.token.ledgerStackedAria": "每日 Token 柱状图：客户端与网关两本账并排对比（不叠加）",
+  // 「全部」档顶部提示条专用。WB 的 `wbStats.usage.models.noMerge` / `noMergeBody` 说的是
+  // 「同一请求两本账各记一次」（双计），Trae 不是那个形状 —— 这里是部分重叠 + 不可测。
+  // ⚠️ 页面上它渲染为**加粗小标题**（一行），下一行才是 `noMergeBody` ⇒ 要短、像标签、不带句号。
+  "trae.stats.token.noMerge": "两本账，不合并",
+  "trae.stats.token.noMergeBody":
+    "Trae 上两本账会部分重叠：客户端副本含全部对话，网关只含经本机转发的请求（其中还可能有第三方直调网关、不在客户端库里）。重叠多少算不出来，所以这里既不合并也不扣减 —— 想看清某一本，请切成单一账本。",
 
   // ---- 空态 ----
   "trae.stats.token.emptyTitle": "当前窗口内没有任何网关调用",
   "trae.stats.token.emptyBody": "到「API 服务」页启用网关，再把客户端的 Base URL 指过来，调用就会记在这里。",
+  "trae.stats.token.ledgerEmptyTitle": "账本里还没有这段窗口的记录",
+  "trae.stats.token.ledgerEmptyBody":
+    "账本从启用后开始逐日累积（每 2 分钟记一轮）。如果网关一直没启用，这里会一直是空的 —— 未记录不等于当天没有用量。",
 
   // ---- 统计卡 ----
   // 标签走公共键；这里只有 aria 与 Trae 独有的第 4 枚（原型是「活跃账号」，
@@ -45,6 +70,49 @@ export const zh = {
 
   // ---- 日志解析失败（**诚实性提示**：数字不完整时必须说）----
   "trae.stats.token.parseErrors": "日志中有 {count} 条记录无法解析（缺少时间戳），已跳过。",
+
+  // ---- 客户端账本（导入）----
+  "trae.stats.token.client.title": "客户端账本（导入）",
+  "trae.stats.token.client.body":
+    "Trae 的对话库是 SQLCipher 加密的。填入口令解锁后，工具会在本机导出一份明文副本再读它 —— 原库不会被改动；不想让工具解密，也可以自己导出明文、直接把路径填在下面。",
+  "trae.stats.token.client.pathLabel": "明文库路径",
+  "trae.stats.token.client.pathPlaceholder": "例如 D:\\trae-plain\\database.db",
+  "trae.stats.token.client.pick": "选择文件",
+  "trae.stats.token.client.verify": "校验",
+  "trae.stats.token.client.save": "保存并读取",
+  "trae.stats.token.client.clear": "清除",
+  "trae.stats.token.client.helpTitle": "口令从哪来 / 想自己导出",
+  "trae.stats.token.client.helpBody":
+    "口令在 Trae 的进程里、磁盘上没有副本，本工具也不内置提取手段 —— 你需要自己从客户端进程取（调试器断在 sqlite3_key 上读参数），这是有门槛的一步。拿到口令后，上面填进去点「解锁并读取」即可，工具会调 SQLCipher 的 sqlcipher_export 在本机导出明文副本。若你更想自己导出：在 sqlcipher 里 PRAGMA key='<口令>'; 然后 ATTACH DATABASE 'plain.db' AS plain KEY '';  SELECT sqlcipher_export('plain');  DETACH DATABASE plain; 并把 database.db-wal 一起处理，否则最近一段会丢。",
+  "trae.stats.token.client.missing": "还没有指定明文库",
+  "trae.stats.token.client.missingHint": "客户端账本需要先解锁一次；没解锁时这里只有网关一本账。",
+  "trae.stats.token.client.notPlaintext": "这个文件不是明文 SQLite",
+  "trae.stats.token.client.notPlaintextHint": "直接把加密的 database.db 指过来读不了。在上面填口令、点「解锁并读取」，工具会自己导出明文副本。",
+  "trae.stats.token.client.unrecognized": "能打开，但认不出会话或用量结构",
+  "trae.stats.token.client.unrecognizedHint": "客户端版本可能改了表结构。下方列出了库里实际的表名，便于适配。",
+  "trae.stats.token.client.noUsage": "认出了会话结构，但没找到用量字段",
+  "trae.stats.token.client.noUsageHint": "这个版本的客户端可能不回写 token 用量，只能统计会话条数。",
+  "trae.stats.token.client.probeOk": "可读：{sessions} 个会话 · {messages} 条消息 · {withUsage} 条带用量",
+  "trae.stats.token.client.probeTables": "库里的表",
+  "trae.stats.token.client.importedAt": "上次读取：{time}",
+  "trae.stats.token.client.loadFailed": "客户端账本读取失败",
+  "trae.stats.token.client.retry": "重试",
+  // ---- 内置解密（口令由用户输入，工具内部导出明文副本）----
+  "trae.stats.token.client.passphraseLabel": "库口令",
+  "trae.stats.token.client.passphrasePlaceholder": "Trae 私有存储的口令",
+  "trae.stats.token.client.passphraseHint":
+    "口令在 Trae 的进程里，磁盘上没有副本 —— 本工具只拿它解密一次，用完即弃，不落盘、不上传。",
+  "trae.stats.token.client.unlock": "解锁并读取",
+  "trae.stats.token.client.unlocking": "正在解锁…",
+  "trae.stats.token.client.unlocked": "已解锁（兼容代 {compat}），明文副本已就绪",
+  "trae.stats.token.client.unlockedPlain": "这个文件本来就是明文，已直接使用",
+  "trae.stats.token.client.unlockHint":
+    "解密产物写在工具的私有目录（大小约等于源库），原库不会被改动。",
+  "trae.stats.token.client.wrongKey": "口令不对",
+  "trae.stats.token.client.wrongKeyHint": "确认这是当前客户端版本的库口令。连续失败不会锁库，重试即可。",
+  "trae.stats.token.client.alreadyPlaintext": "这个文件已经是明文库",
+  "trae.stats.token.client.alreadyPlaintextHint": "不需要口令。直接点「保存并读取」把它设为数据源即可。",
+  "trae.stats.token.client.notSqlite": "不是 SQLite 数据库",
 
   // =====================================================================
   // TraeCreditsPage.tsx —— 「用量 · 积分」视图（Trae 分区）

@@ -23,6 +23,7 @@ import {
   type GatewayType,
 } from "@/components/gateway/gateway-subnav";
 import { TraeApiKeyTable } from "@/components/gateway/trae-api-key-table";
+import { ModelFallbackCard } from "@/components/gateway/model-fallback-card";
 import { ModelProbeCard } from "@/components/gateway/model-probe-card";
 import { TraeIntegrationGuide } from "@/components/gateway/trae-integration-guide";
 import { TraeModelList } from "@/components/gateway/trae-model-list";
@@ -741,6 +742,14 @@ export default function TraeApiServicePage() {
                 accounts={probeAccounts}
                 models={probeModels}
                 adoptSupported={false}
+                className="mb-6"
+              />
+              {/* 降级链：与 WB 页同一组件，但作用域与模型清单由本页注入
+                  （Trae 的清单来自客户端 `vscdb`，不在 gateway store 里）。 */}
+              <ModelFallbackCard
+                region={traeRegionOf(variant)}
+                scope={scopeOf("trae", traeRegionOf(variant))}
+                modelOptions={probeModels.map((model) => model.name)}
                 className="mb-6"
               />
               <TraeModelList

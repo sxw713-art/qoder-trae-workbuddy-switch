@@ -246,6 +246,8 @@ impl GatewayError {
                 UpstreamErrorKind::SessionDead => 401,
                 UpstreamErrorKind::NotFound => 502,
                 UpstreamErrorKind::Server => 502,
+                // 504 = 网关等待上游超时（语义最准；5xx 对客户端是「可重试」）。
+                UpstreamErrorKind::Timeout => 504,
                 UpstreamErrorKind::Client => 400,
             },
             GatewayError::BadRequest(_) => 400,
@@ -295,6 +297,7 @@ impl GatewayError {
                 UpstreamErrorKind::SessionDead => "session_dead",
                 UpstreamErrorKind::NotFound => "not_found",
                 UpstreamErrorKind::Server => "server",
+                UpstreamErrorKind::Timeout => "timeout",
                 UpstreamErrorKind::Client => "client",
             },
             GatewayError::BadRequest(_) => "bad_request",
@@ -632,6 +635,9 @@ mod tests {
         assert_eq!(kind(UpstreamErrorKind::SessionDead).status(), 401);
         assert_eq!(kind(UpstreamErrorKind::NotFound).status(), 502);
         assert_eq!(kind(UpstreamErrorKind::Server).status(), 502);
+        // ★ 超时单列一档：对外 **504**（网关等待上游超时），5xx 对客户端是「可重试」。
+        //   混进 502 会让客户端把它和「上游 5xx」当成同一件事（重试节奏不同）。
+        assert_eq!(kind(UpstreamErrorKind::Timeout).status(), 504);
         assert_eq!(kind(UpstreamErrorKind::Client).status(), 400);
     }
 

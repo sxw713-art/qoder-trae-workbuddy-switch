@@ -80,6 +80,10 @@ import type {
   ExtDiffResponse,
   ExtSessionsResponse,
   ExtSyncResponse,
+  FallbackPreview,
+  FallbackStats,
+  ModelFallbackView,
+  ScopeFallbackConfig,
   SwitchConfig,
   SwitchResult,
   TrashList,
@@ -168,6 +172,11 @@ const DEMO_READ_COMMANDS = new Set([
   "credits",
   "checkin_status",
   "get_codebuddy_cli_status", "get_codebuddy_cn_ide_status", "get_checkin_status",
+  // 模型降级链（P13）：`get` 与 `preview` 都是**只读**语义（preview 零副作用），
+  // 演示模式需要对应快照。
+  "get_model_fallback",
+  "preview_model_fallback",
+  "get_fallback_stats",
   // 编辑器内 CodeBuddy 插件（VS Code / JetBrains）的**只读**状态。
   // ⚠️ switch / detect 是动作（detect 会读本机 secret），一律不进这里。
   "get_vscode_codebuddy_plugin_status", "get_jetbrains_codebuddy_plugin_status",
@@ -196,6 +205,10 @@ const DEMO_READ_COMMANDS = new Set([
   "get_gateway_token_trend",
   // 账本视图（issue #63）：两个只读命令，演示站同样要虚构数据。
   "get_gateway_usage_dim", "get_usage_reconcile",
+  // 账本视图的平台补齐（Trae / Qoder 的网关账本，返回体与 WB 同形）。
+  "get_trae_gateway_usage_dim", "get_qoder_gateway_usage_dim",
+  // Trae 客户端账本（读用户自己导出的明文库）—— 演示站虚构一份「未导入」状态。
+  "probe_trae_client_db", "get_trae_client_token_stats", "get_trae_client_db_config",
   // Trae 分区只读命令（演示站需返回虚构数据，否则 build:demo 报错）。
   // 只登记**只读**命令：写操作（签到 / 增删账号 / 切换 / 重置设备…）一律不进这里，
   // 由 `DemoAction` 包裹后在演示模式下统一提示不可操作。
@@ -337,6 +350,9 @@ const ROUTES: Record<string, Route> = {
   get_gateway_token_trend: { method: "GET", path: "/api/account/token-trend" },
   // 网关三维度（模型 / 账号 / 端点）逐日历史：账本视图的数据源（issue #63）。
   get_gateway_usage_dim: { method: "GET", path: "/api/account/usage-dim" },
+  // 同上，Trae / Qoder 各自的网关账本（`scope` 走 query）。
+  get_trae_gateway_usage_dim: { method: "GET", path: "/api/trae/gateway/usage-dim" },
+  get_qoder_gateway_usage_dim: { method: "GET", path: "/api/qoder/gateway/usage-dim" },
   // 今日客户端 ↔ 网关对账（只读、不落盘）：`region` 走 query。
   get_usage_reconcile: { method: "GET", path: "/api/account/usage-reconcile" },
   oauth_start: { method: "POST", path: "/api/oauth/start" },
@@ -486,6 +502,11 @@ const ROUTES: Record<string, Route> = {
   // 模型禁用偏好（P11）：GET 列表 / POST 置位·清位，同一路径两种方法（与 `/api/gateway/strategy` 同构）。
   get_disabled_models: { method: "GET", path: "/api/gateway/disabled-models" },
   set_model_disabled: { method: "POST", path: "/api/gateway/disabled-models" },
+  // 模型降级链（P13）：配置独立文件，保存即生效。
+  get_model_fallback: { method: "GET", path: "/api/gateway/model-fallback" },
+  save_model_fallback: { method: "POST", path: "/api/gateway/model-fallback" },
+  preview_model_fallback: { method: "POST", path: "/api/gateway/model-fallback/preview" },
+  get_fallback_stats: { method: "GET", path: "/api/gateway/fallback-stats" },
   // 图片能力声明 / 覆盖（issue #101）：与上面两条同构 —— 同一路径两种方法。
   get_model_image_caps: { method: "GET", path: "/api/gateway/model-image-caps" },
   set_model_image_cap: { method: "POST", path: "/api/gateway/model-image-caps" },
@@ -515,6 +536,13 @@ const ROUTES: Record<string, Route> = {
   get_trae_account_token_today: { method: "GET", path: "/api/trae/account/token-today" },
   get_trae_credits: { method: "GET", path: "/api/trae/credits" },
   get_trae_token_statistics: { method: "GET", path: "/api/trae/token-stats" },
+  // 客户端账本（导入明文库）：探测 / 配置 / 读用量 / 存路径。
+  probe_trae_client_db: { method: "GET", path: "/api/trae/client-import/probe" },
+  get_trae_client_db_config: { method: "GET", path: "/api/trae/client-import/config" },
+  save_trae_client_db_path: { method: "POST", path: "/api/trae/client-import/path" },
+  // 内置解密：口令由用户输入，工具内部导出明文副本（`buddy-switch-vault`）。
+  unlock_trae_client_db: { method: "POST", path: "/api/trae/client-import/unlock" },
+  get_trae_client_token_stats: { method: "GET", path: "/api/trae/client-usage" },
   get_trae_logs: { method: "GET", path: "/api/trae/logs" },
   get_trae_profiles: { method: "GET", path: "/api/trae/profiles" },
   get_trae_settings: { method: "GET", path: "/api/trae/settings" },
@@ -1353,6 +1381,29 @@ export function getGatewayUsageDim(region?: Region): Promise<GatewayUsageDim> {
   return call<GatewayUsageDim>(
     "get_gateway_usage_dim",
     Object.keys(args).length > 0 ? args : undefined,
+  );
+}
+
+/**
+ * Trae 的网关**逐日账本**（issue #63 的平台补齐）—— 返回体与 {@link getGatewayUsageDim} 同形。
+ *
+ * `scope` 是**区域档**（`cn` / `global` / `unlabeled` / `all`），`unlabeled` = 早于
+ * `variant` 字段的旧日志（单列一档，不并入任何区域）。
+ * ⚠️ `all` 的合并**在后端**做：Trae 有三档，前端逐档取再递归合并容易漏一档。
+ * ⚠️ 只读；`days` 只含落库日（缺日 = 未记录，不是 0）。
+ */
+export function getTraeGatewayUsageDim(scope?: string): Promise<GatewayUsageDim> {
+  return call<GatewayUsageDim>(
+    "get_trae_gateway_usage_dim",
+    scope ? { scope } : undefined,
+  );
+}
+
+/** Qoder 的网关逐日账本 —— 与 {@link getTraeGatewayUsageDim} 同一形状与口径。 */
+export function getQoderGatewayUsageDim(scope?: string): Promise<GatewayUsageDim> {
+  return call<GatewayUsageDim>(
+    "get_qoder_gateway_usage_dim",
+    scope ? { scope } : undefined,
   );
 }
 
@@ -2468,6 +2519,33 @@ export function setModelDisabled(
   return call("set_model_disabled", { scope, modelId, disabled });
 }
 
+/* ── 模型降级链（P13）──────────────────────────────────────────────
+   `preview` 是**纯计算**：后端只读闸门与禁用表，不写、不领探针票、不发上游请求。
+   前端用它做「模拟路径」，让用户不必先保存再等一次真实失败。 */
+
+export function getModelFallback(scope: Scope): Promise<ModelFallbackView> {
+  return call("get_model_fallback", { scope });
+}
+
+export function saveModelFallback(
+  scope: Scope,
+  config: ScopeFallbackConfig,
+): Promise<ModelFallbackView> {
+  return call("save_model_fallback", { scope, config });
+}
+
+export function getFallbackStats(scope: Scope, days = 7): Promise<FallbackStats> {
+  return call("get_fallback_stats", { scope, days });
+}
+
+export function previewModelFallback(
+  scope: Scope,
+  from: string,
+  targets: string[],
+): Promise<FallbackPreview> {
+  return call("preview_model_fallback", { scope, from, targets });
+}
+
 /**
  * 读取某**作用域**的图片能力覆盖（issue #101）。
  *
@@ -2866,6 +2944,136 @@ export function getTraeTokenStatistics(
   if (days !== undefined) args.days = days;
   if (scope !== undefined) args.scope = scope;
   return call("get_trae_token_statistics", Object.keys(args).length > 0 ? args : undefined);
+}
+
+/**
+ * 「客户端账本」= 读**用户自己导出的明文库**（Trae 的对话库是 SQLCipher 加密的，
+ * 本工具不内置解密 —— 见 `trae/client_import.rs` 的模块头）。
+ *
+ * 返回体是**判别式**的，前端必须按 `error.code` 分支，不能一律当「空数据」：
+ * - `{ configured: false }` —— 还没指定明文库（不是「这段没用量」）
+ * - `{ error: { code } }` —— 指定了但读不了（五种原因各自有文案）
+ * - `{ source: "trae-client", summary, ... }` —— 正常统计（与网关统计同形）
+ */
+export interface TraeClientImportError {
+  code: "missing" | "not_plaintext" | "unrecognized" | "no_usage" | "io";
+  message: string;
+}
+
+/** `probe_trae_client_db` 的返回：探测一个明文库能否读（不保存配置）。 */
+export interface TraeClientProbe {
+  ok: boolean;
+  path: string;
+  error?: TraeClientImportError;
+  /** 库里实际存在的表名 —— 认不出结构时**必须**回显，否则用户无法反馈适配。 */
+  tables: string[];
+  detected?: {
+    messagesTable: string;
+    textColumn: string;
+    timeColumn: string;
+    usageMode: string;
+    sessionColumn?: string | null;
+    modelColumn?: string | null;
+    sampleRows?: number;
+    usageHint?: boolean;
+    sessionsEstimated?: boolean;
+    truncated?: boolean;
+  };
+  /**
+   * 计数。⚠️ **可选**：`Unrecognized` / `NotPlaintext` 分支根本走不到统计，
+   * 后端不会给这一格 ⇒ 前端必须判空（写 `counts.sessions` 会在失败时炸）。
+   */
+  counts?: {
+    sessions: number;
+    messages: number;
+    withUsage: number;
+    credits: number;
+    /**
+     * 一行里含**多份 usage** 的行数。
+     *
+     * `> 0` ⇒ 这些行按累加计算，若那些 usage 属于同一段对话的历史轮次，统计值会偏大。
+     * 后端会在 `note` 里逐字披露；前端也该让用户看得见（不要当成正常数据静默显示）。
+     */
+    multiUsageRows?: number;
+  };
+}
+
+/** `get_trae_client_db_config` 的返回。`exists: false` = 路径还在但文件没了。 */
+export interface TraeClientConfig {
+  path: string | null;
+  exists: boolean;
+}
+
+/** 内置解密的错误分类（与 `buddy-switch-vault::VaultError` 一一对应）。 */
+export interface TraeVaultError {
+  code: "missing" | "already_plaintext" | "wrong_key" | "not_sqlite" | "io";
+  message: string;
+}
+
+/** `unlock_trae_client_db` 的返回。 */
+export interface TraeUnlockResult {
+  ok: boolean;
+  /** `decrypted` = 口令对且已导出明文副本；`plaintext` = 你给的本来就是明文，直接用它。 */
+  mode?: "decrypted" | "plaintext";
+  /** 生效的 `cipher_compatibility`（4 新库 / 3 老库）。 */
+  compatibility?: number;
+  tables?: string[];
+  /** 最终被设为数据源的路径（`decrypted` 时是固定落点，不是用户选的那个）。 */
+  path?: string;
+  /** 解锁后顺带跑的探测（与 {@link probeTraeClientDb} 同形）。 */
+  probe?: TraeClientProbe;
+  error?: TraeVaultError;
+}
+
+/**
+ * 用口令把**加密的** Trae 对话库导出成明文副本，并设为客户端账本的数据源。
+ *
+ * ⚠️ 口令必须由你自己提供：它由 Trae 的 native 进程持有、磁盘上没有副本，
+ * 本工具不内置任何提取手段（不解密「别人给你的密文」，只解「你自己的库」）。
+ *
+ * 若传入的本来就是明文库，后端**不会**做无谓的解密与复制，直接返回 `mode: "plaintext"`。
+ */
+export function unlockTraeClientDb(
+  path: string,
+  passphrase: string,
+): Promise<TraeUnlockResult> {
+  return call("unlock_trae_client_db", { path, passphrase });
+}
+
+/** 探测一个明文库（「校验」按钮）。 */
+export function probeTraeClientDb(path: string): Promise<TraeClientProbe> {
+  return call("probe_trae_client_db", { path });
+}
+
+/** 已保存的导入路径。 */
+export function getTraeClientDbConfig(): Promise<TraeClientConfig> {
+  return call("get_trae_client_db_config");
+}
+
+/** 保存 / 清除导入路径（`path = null` 即清除）。 */
+export function saveTraeClientDbPath(
+  path: string | null,
+): Promise<{ ok: boolean; path: string | null }> {
+  return call("save_trae_client_db_path", { path });
+}
+
+/**
+ * 客户端账本用量（读导入的明文库）。
+ *
+ * 与 {@link getTraeTokenStatistics} **同形**（`source` 为 `"trae-client"`），
+ * 因此前端两个源可以共用同一套图表适配；差别只在「读的是哪本账」。
+ */
+export function getTraeClientTokenStats(
+  days?: number,
+  scope?: TraeTokenScope,
+): Promise<TraeTokenStatistics & { configured?: boolean; error?: TraeClientImportError }> {
+  const args: Record<string, unknown> = {};
+  if (days !== undefined) args.days = days;
+  if (scope !== undefined) args.scope = scope;
+  return call(
+    "get_trae_client_token_stats",
+    Object.keys(args).length > 0 ? args : undefined,
+  );
 }
 
 /**

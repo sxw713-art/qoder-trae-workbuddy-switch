@@ -137,6 +137,13 @@ export const en = {
   "qoder.page.usage.totals.sessions": "Sessions",
   "qoder.page.usage.totals.models": "Models",
   "qoder.page.usage.totals.sessionsCustomHint": "Custom ranges cannot de-duplicate sessions",
+  "qoder.page.usage.totals.sessionsGatewayHint":
+    "The gateway ledger has no session ids — switch to the Sessions view for account / endpoint breakdown",
+  // ---- Ledger (issue #63 platform parity) ----
+  "qoder.page.usage.ledger.gatewayNote":
+    "You are reading the gateway book: only calls relayed through the local Qoder gateway are counted (recorded incrementally every 2 minutes, kept for 90 days). Chats made directly in the IDE without the gateway are not in this book.",
+  "qoder.page.usage.ledger.bothNote":
+    "\"All\" adds the two books day by day — a call that both appears in the client records and went through the gateway is counted twice; switch to a single book for exact figures.",
   "qoder.page.usage.models.count": "Models",
   "qoder.page.usage.models.top": "Top model",
   "qoder.page.usage.models.topShare": "Top share",

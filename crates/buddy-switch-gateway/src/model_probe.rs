@@ -179,15 +179,32 @@ pub fn probe_state_of(event: &UpstreamEvent) -> ProbeState {
         // 与「上游抖动」同档，看的人没法判断该去重新登录还是等一等。
         UpstreamEvent::AuthRejected => ProbeState::AuthDead,
         UpstreamEvent::NotFound => ProbeState::ModelUnavailable,
-        UpstreamEvent::Server | UpstreamEvent::Client => ProbeState::UpstreamError,
+        // 超时与 5xx 在**探测结论**里同档（都是「上游这次没给结果」），
+        // 但降级判据里分开（见 `UpstreamEvent::Timeout`）。
+        UpstreamEvent::Server | UpstreamEvent::Timeout | UpstreamEvent::Client => {
+            ProbeState::UpstreamError
+        }
     }
 }
 
 /// 单元格状态 → **池采纳**语义（回填用）。`Skipped` / 其它档一律 `Other`（**不动冷却**）。
-pub fn probe_outcome_of(state: ProbeState, reset_at_ms: Option<i64>) -> ProbeOutcome {
+///
+/// 两个时刻参数**分工不同**，不可互换：
+/// - `reset_at_ms`（结构化 JSON）→ 第一优先的冷却时长；
+/// - `upstream_reset_at_ms`（文案解析）→ 结构化缺失时**作为第二档**参与冷却，封顶
+///   `PoolConfig::declared_reset_max_ms`；同时进池的展示字段。
+///   取用顺序与护栏见 `Pool::adopt_probe_result`（2026-10-29 改口径）。
+pub fn probe_outcome_of(
+    state: ProbeState,
+    reset_at_ms: Option<i64>,
+    upstream_reset_at_ms: Option<i64>,
+) -> ProbeOutcome {
     match state {
         ProbeState::Ok => ProbeOutcome::Available,
-        ProbeState::RateLimitedModel => ProbeOutcome::ModelRateLimited { reset_at_ms },
+        ProbeState::RateLimitedModel => ProbeOutcome::ModelRateLimited {
+            reset_at_ms,
+            upstream_reset_at_ms,
+        },
         ProbeState::ModelBlocked => ProbeOutcome::ModelBlocked,
         ProbeState::RateLimitedAccount => ProbeOutcome::AccountRateLimited { reset_at_ms },
         _ => ProbeOutcome::Other,
@@ -208,16 +225,16 @@ pub enum ProbePhase {
     Cancelled,
 }
 
-/// **展示专用**的「上游声明的恢复时刻」——**唯一判定点**（WB / Qoder / Trae 三处探测都走它）。
+/// 「上游声明的恢复时刻」的**唯一判定点**（WB / Qoder / Trae 三处探测都走它）。
 ///
 /// ## 两道闸
 ///
 /// 1. **只在这两档上取**：`rate_limited_model` / `rate_limited_account`。
 ///    402（没额度）、`auth_dead`（凭据失效）、`model_blocked`（封禁）、`upstream_queued`（排队 30 秒）
 ///    都**没有「等到几点」的概念** —— 给它们编一个时刻会让用户去傻等。
-/// 2. **只从文本里读**，且结果**只进 `upstream_reset_at_ms`**：文案里的 `reset at` 是
-///    **配额窗口重置**、不是解锁时刻（实测 6/6 判错），绝不能进 `reset_at_ms`（那会进冷却，
-///    把号冻掉一天）。
+/// 2. **只从文本里读**，结果进 `upstream_reset_at_ms`（**不**覆盖结构化的 `reset_at_ms`）。
+///    两档是「同一个问题的两个来源」，取用顺序由池决定：结构化 > 本函数给的文案时刻 > 兜底
+///    （2026-10-29 改口径，此前文案时刻只用于展示 —— 见 `pool::parse_reset_at_ms` 的文档）。
 ///
 /// 三家的上游文案都带 `YYYY-MM-DD HH:MM:SS UTC+8` 形态（WB `6004` / Qoder 429 / Trae `4008`），
 /// 故共用 `pool::parse_reset_at_ms`（结构化优先、文案兜底）。
@@ -241,14 +258,14 @@ pub struct ProbeCell {
     pub model: String,
     pub state: ProbeState,
     pub http_status: u16,
-    /// 上游声明的重置时刻（**配额窗口**，不等于解锁时刻）。大量上游（WB 的 `6004`）不给 ⇒ `None`。
+    /// 结构化 JSON 里声明的重置时刻。大量上游（WB 的 `6004`）不给 ⇒ `None`。
     pub reset_at_ms: Option<i64>,
     /// **展示专用**：上游声明（结构化 JSON 里没有时从文案 `… reset at <T> UTC+8` 解析）的重置时刻。
     ///
-    /// ★★ **绝不参与回填**：`probe_outcome_of` 只读 [`Self::reset_at_ms`]。
-    /// 上游文案里的 `reset at` 是**配额窗口**重置（实测 6/6 判错），拿它当冷却时长会把号
-    /// 冷掉几小时甚至一天；而它作为「界面上的恢复时刻」正是用户要看到的那条信息。
-    /// 取值走 `pool::parse_reset_at_ms`（结构化优先、文案兜底），取舍见该函数的文档。
+    /// ★★ 2026-10-29 起它**也参与冷却**（作为 `reset_at_ms` 缺失时的第二档，封顶
+    /// `PoolConfig::declared_reset_max_ms`）。旧口径把它判成「配额窗口、不是解锁时刻」，
+    /// 结果是 WB `6004` 的每一条回填都走兜底：上游明说 16:26 恢复，网关 11:12 就去撞。
+    /// 取用顺序与护栏见 `Pool::adopt_probe_result` 的注释。
     #[serde(default)]
     pub upstream_reset_at_ms: Option<i64>,
     /// 这一格**实测的时刻**（落盘后仍保留）。
@@ -867,7 +884,7 @@ async fn adopt_wb(
         }
         // 墙钟缺失 / 过期时的**冷却下限**落在 `adopt_probe_result` 内部（回填的唯一入口）——
         // 这里原样透传，**不要**在调用方再补一遍（换个调用方就漏）。
-        let outcome = probe_outcome_of(cell.state, cell.reset_at_ms);
+        let outcome = probe_outcome_of(cell.state, cell.reset_at_ms, cell.upstream_reset_at_ms);
         if pool.adopt_probe_result(&cell.uid, Some(realm), &cell.model, &outcome, now) {
             let was_cleared = matches!(outcome, ProbeOutcome::Available);
             let until_ms = if was_cleared {
@@ -913,7 +930,9 @@ async fn adopt_qoder(
         if cell.state == ProbeState::Skipped {
             continue;
         }
-        let outcome = probe_outcome_of(cell.state, cell.reset_at_ms);
+        // Qoder 池没有「展示用上游时刻」这一维（`model_cooldowns` 只存 `until`），
+        // 故第三个参数传 `None`：多传会被静默丢掉，不如显式说明不适用。
+        let outcome = probe_outcome_of(cell.state, cell.reset_at_ms, None);
         if pool.adopt_probe_result(&cell.uid, &cell.model, &outcome, now) {
             let was_cleared = matches!(outcome, ProbeOutcome::Available);
             let until_ms = if was_cleared {
@@ -1822,21 +1841,30 @@ mod tests {
     #[test]
     fn only_limit_states_and_ok_touch_cooling() {
         assert_eq!(
-            probe_outcome_of(ProbeState::Ok, None),
+            probe_outcome_of(ProbeState::Ok, None, None),
             ProbeOutcome::Available
         );
         assert!(matches!(
-            probe_outcome_of(ProbeState::RateLimitedModel, Some(1)),
+            probe_outcome_of(ProbeState::RateLimitedModel, Some(1), None),
             ProbeOutcome::ModelRateLimited {
-                reset_at_ms: Some(1)
+                reset_at_ms: Some(1),
+                ..
+            }
+        ));
+        // ★ 两个时刻各走各的：结构化的进冷却，文案的只进展示字段。
+        assert!(matches!(
+            probe_outcome_of(ProbeState::RateLimitedModel, None, Some(9)),
+            ProbeOutcome::ModelRateLimited {
+                reset_at_ms: None,
+                upstream_reset_at_ms: Some(9),
             }
         ));
         assert_eq!(
-            probe_outcome_of(ProbeState::ModelBlocked, None),
+            probe_outcome_of(ProbeState::ModelBlocked, None, None),
             ProbeOutcome::ModelBlocked
         );
         assert!(matches!(
-            probe_outcome_of(ProbeState::RateLimitedAccount, None),
+            probe_outcome_of(ProbeState::RateLimitedAccount, None, None),
             ProbeOutcome::AccountRateLimited { reset_at_ms: None }
         ));
         for state in [
@@ -1849,7 +1877,7 @@ mod tests {
             ProbeState::UpstreamQueued,
         ] {
             assert_eq!(
-                probe_outcome_of(state, None),
+                probe_outcome_of(state, None, None),
                 ProbeOutcome::Other,
                 "{state:?} 不得动冷却 —— 402/登录失效/网络错误/排队都不是「限流」"
             );

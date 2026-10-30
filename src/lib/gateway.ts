@@ -214,6 +214,8 @@ function normalizeModelCooldownDetails(
     out[model] = {
       untilMs,
       resetAtMs: asNumber(item.resetAtMs) ?? 0,
+      // 上游文案里声明的时刻（展示用）；旧后端没有该键 ⇒ `0`（徽标回落兜底时刻）。
+      upstreamResetAtMs: asNumber(item.upstreamResetAtMs) ?? 0,
       // 后端直接给 `fallback`；缺失时**由 `resetAtMs === 0` 推出**（同一判据，不猜）。
       fallback: typeof item.fallback === "boolean" ? item.fallback : (asNumber(item.resetAtMs) ?? 0) === 0,
       reason: typeof item.reason === "string" ? item.reason : "",

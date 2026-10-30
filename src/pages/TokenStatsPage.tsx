@@ -112,16 +112,14 @@ import { usageWindowDays, type UsageWindow } from "@/lib/usage-window";
 /** 本页承载的视图（积分视图在 `CreditStatsPage`）。 */
 export type TokenUsageView = "trend" | "models" | "sessions" | "keys";
 
-/** 「按密钥」视图的取数（WB：网关日志 + 密钥名）。模块级 ⇒ 引用稳定。 */
-async function loadWbKeyUsage() {
-  const [logs, keys] = await Promise.all([
-    api.getGatewayLogs(),
-    api.listApiKeys().catch(() => ({ keys: [] as ApiKeyRecord[] })),
-  ]);
-  return {
-    entries: logs.logs ?? [],
-    keyNames: new Map((keys.keys ?? []).map((key) => [key.id, key.name] as const)),
-  };
+/**
+ * 「按密钥」视图**只取展示名**：用量来自网关账本（本页已取的 `dim`），
+ * 不再读请求日志 —— 那是环形缓冲，窗口对齐不了（见 `src/lib/key-usage.ts`）。
+ * 模块级函数 ⇒ 引用稳定（`KeysView` 的 `useEffect` 依赖它）。
+ */
+async function loadWbKeyNames() {
+  const keys = await api.listApiKeys().catch(() => ({ keys: [] as ApiKeyRecord[] }));
+  return new Map((keys.keys ?? []).map((key) => [key.id, key.name] as const));
 }
 
 /** 会话级缓存：切走再切回不重取（与 `CreditStatsPage` 同一约定）。 */
@@ -809,13 +807,10 @@ export default function TokenStatsPage({
         />
       ) : view === "keys" ? (
         <KeysView
+          dim={dim}
           window={viewWindow}
           selfScope="wb"
-          loader={loadWbKeyUsage}
-          title={t("wbStats.usage.keys.title")}
-          caption={t("wbStats.usage.keys.caption")}
-          emptyTitle={t("wbStats.usage.keys.empty")}
-          emptyHint={t("wbStats.usage.keys.emptyHint")}
+          loadNames={loadWbKeyNames}
         />
       ) : view === "sessions" ? (
         <SessionsView

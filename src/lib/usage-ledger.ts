@@ -67,8 +67,8 @@ export function dimTotals(
   const map = new Map<string, { key: string; tokens: number; requests: number; failed: number; credit: number }>();
   for (const day of dim.days) {
     if (!inWindow.has(day.key)) continue;
-    for (const entry of day.models.concat(day.accounts, day.endpoints)) {
-      // 三个数组共用形状，但每个数组只该被读一次：用 keyOf 的 undefined 过滤掉别的维度。
+    for (const entry of day.models.concat(day.accounts, day.endpoints, day.keys)) {
+      // 四个数组共用形状，但每个数组只该被读一次：用 keyOf 的 undefined 过滤掉别的维度。
       const key = keyOf(entry);
       if (key === undefined) continue;
       const current = map.get(key) ?? { key, tokens: 0, requests: 0, failed: 0, credit: 0 };
@@ -88,6 +88,8 @@ export const modelKey = (entry: GatewayDimEntry) => entry.model;
 export const accountKey = (entry: GatewayDimEntry) => entry.account;
 /** 端点维度（`endpoints[]` 的键）。 */
 export const endpointKey = (entry: GatewayDimEntry) => entry.endpoint;
+/** 密钥维度（`keys[]` 的键：`{scope}:{id}` / `__legacy__` / `__none__`）。 */
+export const keyBucket = (entry: GatewayDimEntry) => entry.key;
 
 /**
  * 网关维度的**覆盖率**（与 `gatewayCoverage` 同构，图注披露用）。
@@ -353,6 +355,8 @@ export function mergeDims(list: (GatewayUsageDim | null)[]): GatewayUsageDim | n
           models: day.models.map((entry) => ({ ...entry })),
           accounts: day.accounts.map((entry) => ({ ...entry })),
           endpoints: day.endpoints.map((entry) => ({ ...entry })),
+          keys: day.keys.map((entry) => ({ ...entry })),
+          keysPartial: day.keysPartial,
         });
         continue;
       }
@@ -361,6 +365,9 @@ export function mergeDims(list: (GatewayUsageDim | null)[]): GatewayUsageDim | n
       mergeEntries(current.models, day.models, modelKey);
       mergeEntries(current.accounts, day.accounts, accountKey);
       mergeEntries(current.endpoints, day.endpoints, endpointKey);
+      mergeEntries(current.keys, day.keys, keyBucket);
+      // 「至少一侧是从中间开始记的」⇒ 合并后仍是下界。
+      current.keysPartial = current.keysPartial || day.keysPartial;
     }
   }
 
@@ -445,4 +452,127 @@ export function clientCreditDaily(
   return new Map(
     source.daily.filter((day) => inWindow.has(day.key)).map((day) => [day.key, day.credit ?? 0]),
   );
+}
+
+/**
+ * **网关账本 → `TokenStatsSource`**（Trae / Qoder 的 token 视图数据源）。
+ *
+ * ## 为什么走映射而不是另写一套图表
+ *
+ * 拖两张图出来（逐日堆叠 + 模型环形/排行）需要 `daily` / `dailyByModel` / `models`
+ * 三件套。账本里全都有（逐日 × 逐模型），只是形状不同 —— 于是映射一次，
+ * `dailyModelSeries` / `modelSlices` **一行不改地复用**（与 `lib/trae-usage-charts.ts`
+ * 的 `toTokenStatsSource` 同一理由：图表契约只有一份实现）。
+ *
+ * ## 两处**故意留空**
+ *
+ * - `hours: []` —— 账本只按**日**聚合（日志里没有时段槽位），热力图因此为空。
+ *   7×24 图在账本口径下画不出来，**不编**；
+ * - `projects` / `sessions` —— 网关日志没有稳定的项目 / 会话标识（Trae 的
+ *   `session_id` 每请求新生成），这两个维度在该口径下**本就不存在**。
+ *
+ * `records` 取 `requests`（请求数），与 WB 客户端口径的「记录条数」同义。
+ */
+export function ledgerToTokenStatsSource(dim: GatewayUsageDim | null): TokenStatsSource | null {
+  if (!dim) return null;
+  const dailyByModel: Record<string, TokenStatsGroup[]> = {};
+  const modelTotals = new Map<string, TokenStatsGroup>();
+  const daily: TokenStatsGroup[] = [];
+
+  for (const day of dim.days) {
+    let total = 0;
+    let input = 0;
+    let output = 0;
+    let records = 0;
+    let credit = 0;
+    for (const row of day.models) {
+      /* `GatewayDimEntry` 的三个键都可选（同一个联合形状服务三条维度）——
+         这里读的是 `models[]`，缺 `model` 的行走哨兵而不是丢掉该行（丢量 = 图撒谎）。 */
+      const model = row.model?.trim() || UNKNOWN_MODEL;
+      total += row.total;
+      input += row.input;
+      output += row.output;
+      records += row.requests;
+      credit += row.credit;
+      const point = groupOf(day.key, row.total, row.input, row.output, row.requests, row.credit);
+      (dailyByModel[model] ??= []).push(point);
+      const aggregate = modelTotals.get(model);
+      if (aggregate) {
+        aggregate.total += row.total;
+        aggregate.input += row.input;
+        aggregate.output += row.output;
+        aggregate.records += row.requests;
+        aggregate.credit = (aggregate.credit ?? 0) + row.credit;
+      } else {
+        modelTotals.set(
+          model,
+          groupOf(model, row.total, row.input, row.output, row.requests, row.credit),
+        );
+      }
+    }
+    daily.push(groupOf(day.key, total, input, output, records, credit));
+  }
+
+  const models = [...modelTotals.values()].sort((left, right) => right.total - left.total);
+  const summary = daily.reduce(
+    (acc, day) => ({
+      ...acc,
+      total: acc.total + day.total,
+      input: acc.input + day.input,
+      output: acc.output + day.output,
+      records: acc.records + day.records,
+      credit: (acc.credit ?? 0) + (day.credit ?? 0),
+    }),
+    groupOf("summary", 0, 0, 0, 0, 0),
+  );
+
+  return {
+    source: "trae-gateway",
+    summary,
+    models,
+    projects: [],
+    sessions: [],
+    daily,
+    dailyByModel,
+    hours: [],
+    filesScanned: 0,
+    parseErrors: 0,
+    coverageStartAt: null,
+    coverageEndAt: null,
+  };
+}
+
+/** `TokenStatsGroup` 的最小构造（缓存三件套恒 0：账本没有这几个维度，不编造）。 */
+function groupOf(
+  key: string,
+  total: number,
+  input: number,
+  output: number,
+  records: number,
+  credit: number,
+): TokenStatsGroup {
+  return {
+    key,
+    total,
+    input,
+    output,
+    cacheRead: 0,
+    cacheWrite: 0,
+    uncachedInput: 0,
+    records,
+    cacheHitRate: null,
+    credit,
+  };
+}
+
+/** 账本里模型名缺失时的哨兵（与 Rust `gateway_ledger::UNKNOWN_MODEL` 同值）。 */
+export const UNKNOWN_MODEL = "__unknown__";
+
+/** 账本的**逐日总量**（`ledgerDailySeries` 的 `days` 入参：轴由账本自己的落库日给出）。 */
+export function dimDailyTotals(dim: GatewayUsageDim | null): { key: string; total: number }[] {
+  if (!dim) return [];
+  return dim.days.map((day) => ({
+    key: day.key,
+    total: day.models.reduce((sum, row) => sum + row.total, 0),
+  }));
 }

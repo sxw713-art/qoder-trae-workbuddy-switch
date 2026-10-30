@@ -148,6 +148,8 @@ function modelCoolingBadge(account: GatewayPoolAccount, t: ReturnType<typeof use
     model,
     until,
     fallback: details[model]?.fallback ?? false,
+    // 上游文案里声明的恢复时刻（`0` = 上游没说）。
+    declared: details[model]?.upstreamResetAtMs ?? 0,
   }));
   const now = Date.now();
   // 只展示仍有效的（后端已过滤，这里再兜一次防时钟漂移导致的负数）。
@@ -165,7 +167,12 @@ function modelCoolingBadge(account: GatewayPoolAccount, t: ReturnType<typeof use
       ? `${formatThawAt(earliest, now)} – ${formatThawAt(latest, now)}`
       : formatThawAt(earliest, now);
 
-  // tooltip 逐模型列出：名称 + 剩余时长 +（若是兜底值）标记。
+  // ★ 2026-10-29：冷却**已经按上游声明的时刻**走（`Pool::adopt_probe_result` 的第二档），
+  // 所以徽标直接给 `until` 就是上游说的那个时刻。只有 `fallback`（上游什么都没说、
+  // 走本仓 10 分钟兜底）才加「约」—— 那个时刻是猜的，不能当承诺展示。
+  const anyFallback = live.some((row) => row.fallback);
+
+  // tooltip 逐模型列出：名称 + 剩余时长 +（若是兜底值）标记 +（若与截止时刻不同）上游时刻。
   // 「兜底」必须显式标出来 —— 那是本仓猜的 10 分钟，不是上游说的，排查含义相反。
   const hint = live
     .map((row) =>
@@ -173,13 +180,25 @@ function modelCoolingBadge(account: GatewayPoolAccount, t: ReturnType<typeof use
         model: row.model,
         remaining: formatRemaining(row.until, now),
         fallback: row.fallback ? t("shared.gateway.pool.modelCoolingFallback") : "",
+        // 只在「上游说的」与「实际冷却截止」不一致时补一句（例如被 24h 截断）。
+        upstream:
+          row.declared > 0 && Math.abs(row.declared - row.until) > 60_000
+            ? t("shared.gateway.pool.modelCoolingRowUpstream", {
+                time: formatThawAt(row.declared, now),
+              })
+            : "",
       }),
     )
     .join("\n");
 
   return (
     <Badge variant="secondary" className="shrink-0 text-warning" title={hint}>
-      {t("shared.gateway.pool.modelCoolingBadge", { count: live.length, time: range })}
+      {anyFallback
+        ? t("shared.gateway.pool.modelCoolingBadgeApprox", {
+            count: live.length,
+            time: range,
+          })
+        : t("shared.gateway.pool.modelCoolingBadge", { count: live.length, time: range })}
     </Badge>
   );
 }

@@ -1,6 +1,6 @@
 [package]
 name = "buddy-switch-core"
-version = "2026.10.271903"
+version = "2026.10.291824"
 edition = "2021"
 description = "buddy-switch 核心逻辑（账号/切换/会话/签到/更新），不依赖 Tauri，可被桌面端与 HTTP server 复用"
 
@@ -57,4 +57,7 @@ windows = { version = "0.58", features = ["Win32_Foundation", "Win32_Security_Cr
 dirs = "5"
 # 测试夹具的隔离临时目录（RAII 清理）；正式产物零新增依赖。
 tempfile = "3"
+# 端到端验证「加密库 → 内置解密 → 统计」（`tests/trae_vault_end_to_end.rs`）。
+# 只在测试里用 —— core 的正式产物**不**依赖 SQLCipher，接口边界仍是「读明文」。
+buddy-switch-vault = { path = "../buddy-switch-vault" }
 

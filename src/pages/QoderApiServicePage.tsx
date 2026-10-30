@@ -27,6 +27,7 @@ import {
 import { QoderApiKeyTable } from "@/components/gateway/qoder-api-key-table";
 import { QoderModelList } from "@/components/gateway/qoder-model-list";
 import { QoderQuotaGuard } from "@/components/gateway/qoder-quota-guard";
+import { ModelFallbackCard } from "@/components/gateway/model-fallback-card";
 import { ModelProbeCard } from "@/components/gateway/model-probe-card";
 import { TraeIntegrationGuide } from "@/components/gateway/trae-integration-guide";
 import { TraeRequestLog } from "@/components/gateway/trae-request-log";
@@ -660,6 +661,13 @@ export default function QoderApiServicePage() {
                 region={region}
                 accounts={probeAccounts}
                 models={probeModels}
+                className="mb-6"
+              />
+              {/* 降级链：与 WB 页同一组件，作用域与模型清单由本页注入。 */}
+              <ModelFallbackCard
+                region={region}
+                scope={scopeOf("qoder", region)}
+                modelOptions={probeModels.map((model) => model.name)}
                 className="mb-6"
               />
               <QoderModelList

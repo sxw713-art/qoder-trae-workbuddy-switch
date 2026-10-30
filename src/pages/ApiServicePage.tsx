@@ -15,6 +15,7 @@ import {
 } from "@/components/gateway/account-pool-card";
 import { IntegrationGuide } from "@/components/gateway/integration-guide";
 import { ModelList } from "@/components/gateway/model-list";
+import { ModelFallbackCard } from "@/components/gateway/model-fallback-card";
 import { ModelProbeCard } from "@/components/gateway/model-probe-card";
 // P12 · 请求代理面板（**C 路：base URL 重定向**）—— 默认关，应用只记"用户已按引导设置"。
 // ⚠️ 只接 WB 侧：C 路本期不做 Trae（`proxy.rs` 的 `PROXY_GATEWAY_BASE` 只覆盖 WB 网关端口）。
@@ -512,9 +513,14 @@ export default function ApiServicePage() {
 
           {/* ---- 模型 ---- */}
           {/* 限流探测卡**在表之上**（方案 §5.1：卡片在模型分区里，不是弹层）。 */}
+          {/* 降级链卡在探测与表之间：探测说「模型 × 账号现在健不健康」，
+              降级链说「模型不健康时怎么办」—— 同一组东西，放一起才能对着配。
+              ⚠️ 只在 WorkBuddy 页渲染：Trae / Qoder 的中继是各自实现，尚未接降级，
+              渲染一张点了没效果的卡就是假开关（§3.4 规则 1）。 */}
           {section === "models" && (
             <>
               <ModelProbeCard region={region} className="mb-6" />
+              <ModelFallbackCard region={region} className="mb-6" />
               <ModelList region={region} />
             </>
           )}

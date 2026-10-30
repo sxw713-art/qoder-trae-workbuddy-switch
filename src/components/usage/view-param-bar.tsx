@@ -92,12 +92,24 @@ export interface ViewParamBarProps {
   /**
    * 账本（issue #63）：客户端 / 网关是两本独立记账的账，这个开关决定**看哪本**。
    *
-   * 只在 WorkBuddy 出现（`canSwitchLedger`，由 `USAGE_PAGES[product].ledger` 给出）：
-   * Trae / Qoder 的「网关」不是同一个东西 —— 摆一个语义不同的同名控件比不摆更糟。
+   * 由 `USAGE_PAGES[product].ledger` 决定是否出现，并再收一道**视图级**闸门
+   * （`LEDGER_VIEWS`）：账本是「数据源」选择，对没有来源拆分的视图（如 Qoder 的
+   * 实时余额、按密钥）渲染它只会换来「点了没反应」。
    */
   ledger?: UsageLedger;
   onLedgerChange?: (next: UsageLedger) => void;
   canSwitchLedger?: boolean;
+  /**
+   * 哪些账本档**在本平台可得**（缺省三档全给）。
+   *
+   * Trae 传 `["gateway"]`：它没有可解析的客户端用量落盘（IDE 私有加密存储），
+   * 「客户端」那一本账在**数据层就不存在**。于是：
+   * - 不给「客户端」档 —— 选了它只能显示 0，那是把「没测到」说成「没用」；
+   * - 也不给「全部」档 —— 全部 = 客户端 ∪ 网关 = 网关，与「网关」逐值相同，
+   *   两档并存就是一枚点了没反应的死控件。
+   * 理由文案由视图页在覆盖条/说明条里写（见 `TraeTokenStatsPage` 的账本说明）。
+   */
+  ledgerValues?: readonly UsageLedger[];
   className?: string;
 }
 
@@ -141,6 +153,7 @@ export function ViewParamBar({
   ledger = "all",
   onLedgerChange,
   canSwitchLedger = false,
+  ledgerValues = LEDGER_VALUES,
   className,
 }: ViewParamBarProps) {
   const t = useT();
@@ -281,7 +294,7 @@ export function ViewParamBar({
             value={ledger}
             onChange={onLedgerChange}
             ariaLabel={t("wbStats.usage.ledger.aria")}
-            options={LEDGER_VALUES.map((value) => ({ value, label: t(LEDGER_LABEL[value]) }))}
+            options={ledgerValues.map((value) => ({ value, label: t(LEDGER_LABEL[value]) }))}
           />
         </>
       ) : null}

@@ -49,6 +49,7 @@ import { ChartContainer, ChartTooltip, ChartTooltipContent, type ChartConfig } f
 import { useT } from "@/lib/i18n";
 import { GATEWAY_SEGMENT, TOTAL_SEGMENT, type DailyModelColumn } from "@/lib/usage-charts";
 import { LEDGER_CLIENT_SEGMENT, LEDGER_GATEWAY_SEGMENT } from "@/lib/usage-ledger";
+import { LEDGER_CLIENT_COLOR, LEDGER_GATEWAY_COLOR } from "./ledger-parts";
 
 import { compactTokens } from "./format";
 import { seriesColor } from "./palette";
@@ -187,7 +188,17 @@ export function StackedDailyBar({
     const series = names.map((name, index) => ({
       key: `m${index}`,
       name,
-      color: palette?.[index] ?? seriesColor(index),
+      /* ★ 账本段的颜色**不能**按出现顺序取（2026-10-28 修）。
+         `ledgerDailySeries` 只在「该段有量」时才产出段 ⇒ 某天只有网关有量、另一天只有
+         客户端有量时，`names` 的首次出现顺序会**反转**，于是两本账的颜色互换 ——
+         而颜色在账本视图里**就是语义**（客户端青绿 / 网关靛蓝，覆盖条与账本表同色）。
+         所以这两个哨兵名绑死颜色；其余名字（模型 id）才走调色板。 */
+      color:
+        name === LEDGER_CLIENT_SEGMENT
+          ? LEDGER_CLIENT_COLOR
+          : name === LEDGER_GATEWAY_SEGMENT
+            ? LEDGER_GATEWAY_COLOR
+            : (palette?.[index] ?? seriesColor(index)),
     }));
     const keyByName = new Map(series.map((item) => [item.name, item.key]));
 

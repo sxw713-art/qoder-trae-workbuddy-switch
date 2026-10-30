@@ -233,6 +233,8 @@ UpstreamChatResult::Ok(ok) => {
    但**冷却只用 `from_json`**）：
    - 结构化字段（`resetTime` 等）→ 可信，可用作冷却墙钟；
    - 文案兜底（`… UTC+8`）→ **只用于展示/诊断**，不进冷却（依据 `client_limits.rs` 的 6/6 实测）。
+   > ⚠️ **2026-10-29 已改**：文案时刻降为**第二档**冷却依据（结构化缺失时用，封顶 24h）。
+   > 见本文档 §5 表格后的「改口径」说明与 `Pool::adopt_probe_result` 的注释。
 3. `apply_upstream_error` 的模型级分支：
    ```rust
    let reset = reset_at.filter(|v| *v > now_ms + MIN_MODEL_COOLDOWN_MS)
@@ -445,6 +447,22 @@ POST /api/gateway/pool/exclusions
 | 10 | 「按实时积分择优」到底是啥（D6） | ① **提升为一等策略**：候选内按积分降序（仍受排除/冷却/在途约束），与指定互斥；② 维持只做兜底，把文案改成「拉模型清单时生效」 | **①**（否则它就是个假控件；改动很小：`select_account` 里多传一个 `prefer` 给 `pick`，按积分排序替代权重抽签） |
 | 11 | **随机档**是否进枚举（§9.3） | ① 加 `AccountStrategy::Random`（serde 标签 `"random"`，老配置不受影响）；② 不做，随机就是「自动择优」 | **①**（自动择优的加权抽签是**有偏**的；用户要的「平均分摊」只有均匀抽签能做到） |
 | 12 | 重试矩阵是否按失败类型收敛（§9.2） | ① 按矩阵：参数错不重试、404 只换 1 次、模型闸门立即停；② 维持「一律重试 `max_rotate` 次」 | **①**（现在 400 也会白撞 3 个号，白烧配额；且「模型整体限流」时 3 次重试全打在同一个模型上） |
+
+---
+
+> ### ⚠️ 2026-10-29 改口径（决策 2 被推翻，其余不变）
+>
+> 决策 2 的「① 不采信文案 `reset at`」在 WB `6004` 上被实测推翻：该响应体**一个结构化
+> 数值键都没有**，于是每一条回填都走兜底（探测 10 分钟）—— 上游明说 `16:26:36` 恢复，
+> 网关 11:12 就去撞、撞回来再冷 10 分钟，界面上显示的时刻也与上游说的无关（用户报障）。
+>
+> 现在的口径（`Pool::adopt_probe_result`）：**结构化墙钟 > 文案声明 > 兜底**，
+> 文案声明封顶 `PoolConfig::declared_reset_max_ms`（默认 24h，与封禁退避同一量级）。
+> 旧口径担心的过度冷却由三件事兜住：该模型下一次成功即清（`note_success`）、
+> 用户点「限流探测」探到可用即清、到期走「半开 + 单探针」（`verify_on_expiry`）。
+>
+> 单测：`adopt_probe_uses_upstream_declared_reset_as_cooldown` /
+> `adopt_probe_caps_absurd_upstream_declared_reset`。
 
 ---
 

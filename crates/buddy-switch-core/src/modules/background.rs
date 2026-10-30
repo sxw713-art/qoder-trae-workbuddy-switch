@@ -305,6 +305,23 @@ pub const TASKS: &[TaskSpec] = &[
         kind: TaskKind::ClientUsageRecord,
         interval: CLIENT_USAGE_RECORD_INTERVAL,
     },
+    // ★ 网关逐日账本（Trae / Qoder，2026-10-28 新增）。
+    //
+    // 与上面 WorkBuddy 那条**同一个 kind、不同产品**：三个平台的「网关账」都由
+    // 「把环形日志增量累加进 90 天落库」得来（WB 走 `token_daily`，另两个走
+    // `gateway_ledger`）。不登记的后果是可预见的：账本视图的窗口一超过
+    // `log_keep`（200 条）能覆盖的范围，图上就是一片空白 —— 而那**不是「没用量」**，
+    // 是「没记过」。
+    TaskSpec {
+        product: Product::Trae,
+        kind: TaskKind::GatewayUsageRecord,
+        interval: GATEWAY_USAGE_RECORD_INTERVAL,
+    },
+    TaskSpec {
+        product: Product::Qoder,
+        kind: TaskKind::GatewayUsageRecord,
+        interval: GATEWAY_USAGE_RECORD_INTERVAL,
+    },
     TaskSpec {
         product: Product::Workbuddy,
         kind: TaskKind::Scheduled(ScheduleTask::Checkin),

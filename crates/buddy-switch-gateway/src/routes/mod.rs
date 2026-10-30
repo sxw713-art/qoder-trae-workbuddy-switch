@@ -2,6 +2,9 @@
 
 pub mod biz;
 pub mod chat;
+pub mod cross;
+/// 模型降级链的 hop 循环骨架（Trae / Qoder 两条自有中复用；WB 走 `relay` 自己的）。
+pub mod fallback;
 pub mod health;
 pub mod messages;
 pub mod models;
@@ -93,6 +96,44 @@ pub(crate) fn openai_error(error: GatewayError) -> Response {
 /// Anthropic 端点错误响应。
 pub(crate) fn anthropic_error(error: GatewayError) -> Response {
     let body = error.anthropic_body();
+    error_response(&error, body)
+}
+
+/// 把降级轨迹挂到错误体**顶层**（`{"error":…, "fallback":…}`）。
+///
+/// ## 为什么不塞进 `GatewayError`
+///
+/// 那个类型每个变体的状态码与 `type` 都被契约测试钉着（客户端靠 `type` 决定
+/// 重试与否）。为一个**可选诊断字段**动它，风险远大于收益。
+/// 顶层多一个键是纯增量：老客户端忽略它，新客户端能编程判断。
+///
+/// ## 为什么不能只追加到 message 文本
+///
+/// 追加文本只对 `Upstream` 变体可行 —— 而「降级试过但最后一跳连账号都没选出来」
+/// 时，最终错误是 `NoCredential`（没有可变 message 字段）。那正是最需要轨迹的时候。
+fn attach_fallback(body: &mut Value, fallback: Option<Value>) {
+    let Some(info) = fallback else {
+        return;
+    };
+    if let Some(object) = body.as_object_mut() {
+        object.insert("fallback".to_string(), info);
+    }
+}
+
+/// OpenAI 端点错误响应 + 降级轨迹。
+pub(crate) fn openai_error_with_fallback(error: GatewayError, fallback: Option<Value>) -> Response {
+    let mut body = error.openai_body();
+    attach_fallback(&mut body, fallback);
+    error_response(&error, body)
+}
+
+/// Anthropic 端点错误响应 + 降级轨迹。
+pub(crate) fn anthropic_error_with_fallback(
+    error: GatewayError,
+    fallback: Option<Value>,
+) -> Response {
+    let mut body = error.anthropic_body();
+    attach_fallback(&mut body, fallback);
     error_response(&error, body)
 }
 

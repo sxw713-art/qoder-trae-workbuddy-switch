@@ -16,11 +16,14 @@ import type {
   CreateApiKeyResult,
   GatewayConfig,
   GatewayLogEntry,
+  FallbackStats,
   GatewayStatus,
+  ModelFallbackView,
   ModelProbeCell,
   ModelProbeJob,
   ModelProbeState,
   Region,
+  ScopeFallbackConfig,
 } from "@/lib/types";
 import { SCOPES, type Scope } from "@/lib/scope";
 import { mergeProbeCells, type ProbeCellIndex } from "@/lib/limit-link";
@@ -103,6 +106,10 @@ interface GatewayState {
    * ⚠️ 用 `Set` 是为了 O(1) 命中；更新时**必须换一个新 `Set`**（zustand 靠引用变化触发重渲染）。
    */
   disabled: Partial<Record<Scope, Set<string>>>;
+  /** 模型降级链（P13）：按作用域缓存视图。缺键 = 还没读过（**不是**「没有链」）。 */
+  fallback: Partial<Record<Scope, ModelFallbackView>>;
+  /** 近 7 天降级统计（**落盘账本**，与 `fallback.events` 的环形缓冲不同源）。 */
+  fallbackStats: Partial<Record<Scope, FallbackStats>>;
   /**
    * 每个**作用域**的图片能力**覆盖表**（issue #101）：`{ 模型 id: 是否支持图片 }`。
    *
@@ -179,6 +186,12 @@ interface GatewayState {
   setModelDisabled: (scope: Scope, modelId: string, disabled: boolean) => Promise<void>;
   /** 读取某**作用域**的图片能力覆盖表（issue #101）。 */
   loadImageCaps: (scope: Scope) => Promise<void>;
+  /** 读取某**作用域**的降级链（含备选的实时健康态）。 */
+  loadFallback: (scope: Scope) => Promise<void>;
+  /** 读取某**作用域**近 7 天的降级统计（落盘账本）。 */
+  loadFallbackStats: (scope: Scope) => Promise<void>;
+  /** 保存某**作用域**的降级链；后端返回最新视图，直接覆盖缓存（不再多发一次读）。 */
+  saveFallback: (scope: Scope, config: ScopeFallbackConfig) => Promise<void>;
   /**
    * 写图片能力覆盖：`true` / `false` = 手动指定，**`null` = 还原上游声明**（后端删键）。
    *
@@ -229,6 +242,9 @@ export const useGatewayStore = create<GatewayState>((set, get) => ({
   models: { cn: null, global: null },
   // 默认全开（D27）：各作用域的 `disabled` 懒加载，未拉取即视为空集，不替用户做决定。
   disabled: {},
+  /** 模型降级链（P13）：按作用域缓存视图。空 = 还没读过（不是「没有链」）。 */
+  fallback: {},
+  fallbackStats: {},
   // 图片能力覆盖懒加载：空表 = 全部跟随上游声明（**不是**「都不支持」，issue #101）。
   imageCaps: {},
   strategies: defaultStrategies(),
@@ -349,6 +365,31 @@ export const useGatewayStore = create<GatewayState>((set, get) => ({
       else next.delete(modelId);
       return { disabled: { ...s.disabled, [scope]: next } };
     });
+  },
+
+  async loadFallback(scope) {
+    try {
+      const view = await api.getModelFallback(scope);
+      set((s) => ({ fallback: { ...s.fallback, [scope]: view } }));
+    } catch (e) {
+      set({ error: api.asError(e) });
+    }
+  },
+
+  async loadFallbackStats(scope) {
+    try {
+      const stats = await api.getFallbackStats(scope);
+      set((s) => ({ fallbackStats: { ...s.fallbackStats, [scope]: stats } }));
+    } catch (e) {
+      set({ error: api.asError(e) });
+    }
+  },
+
+  async saveFallback(scope, config) {
+    // 后端返回**最新视图**（含实时健康态）⇒ 直接覆盖缓存，不再多发一次读。
+    // 状态点因此会立刻反映「刚配的目标现在是否在闸门里」。
+    const view = await api.saveModelFallback(scope, config);
+    set((s) => ({ fallback: { ...s.fallback, [scope]: view } }));
   },
 
   async loadImageCaps(scope) {

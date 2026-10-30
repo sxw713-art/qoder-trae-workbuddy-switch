@@ -145,6 +145,12 @@ export const zh = {
   "qoder.page.usage.totals.sessions": "会话数",
   "qoder.page.usage.totals.models": "模型数",
   "qoder.page.usage.totals.sessionsCustomHint": "自定义区间不支持会话去重计数",
+  "qoder.page.usage.totals.sessionsGatewayHint": "网关账本没有会话标识 —— 切到「会话」视图看账号 / 端点分布",
+  // ---- 账本（issue #63 平台补齐）----
+  "qoder.page.usage.ledger.gatewayNote":
+    "当前看的是网关账：只统计经本机 Qoder 网关转发的调用（后台每 2 分钟增量落库，保留 90 天）。直接在 IDE 里对话、不走网关的消耗不在这本账里。",
+  "qoder.page.usage.ledger.bothNote":
+    "「全部」把两本账按日相加 —— 同一笔调用若既在客户端记录里又经网关转发，会被两边各记一次；要看准确消耗请切到单一账本。",
   "qoder.page.usage.trend": "每日积分",
   "qoder.page.usage.byModel": "按模型拆分",
   "qoder.page.usage.empty.title": "这段时间没有用量记录",

@@ -42,6 +42,16 @@ pub enum UpstreamErrorKind {
     NotFound,
     /// 服务端错误 → 502。
     Server,
+    /// **传输层超时**（连接 / 读超时，`reqwest::Error::is_timeout()`）。
+    ///
+    /// 与 [`Self::Server`] 分开是因为**处置方式相反**：
+    /// - `Server`（5xx）是上游故障，同一个号重试通常也没用，该换号；
+    /// - `Timeout` 往往是**这个模型 / 这条链路慢**，换号未必有用，而换一个更快的
+    ///   模型（降级链）是有效的。
+    ///
+    /// 混在 `Server` 里会让「请求超时」这一档降级条件永远选不到 ——
+    /// 用户勾了它却不生效，是典型的假开关。
+    Timeout,
     /// 其他客户端错误 → 400。
     Client,
 }
@@ -55,6 +65,7 @@ impl UpstreamErrorKind {
             UpstreamErrorKind::SessionDead => "session_dead",
             UpstreamErrorKind::NotFound => "not_found",
             UpstreamErrorKind::Server => "server",
+            UpstreamErrorKind::Timeout => "timeout",
             UpstreamErrorKind::Client => "client",
         }
     }
@@ -436,13 +447,22 @@ impl UpstreamClient {
                     }
                 }
             }
-            Err(error) => UpstreamChatResult::Err {
-                status: 0,
-                kind: UpstreamErrorKind::Server,
-                // 走统一出口：只有顶层一行「error sending request for url (…)」
-                // 是没法排障的，网关日志需要看到具体原因（超时/拒绝/TLS）。
-                message: format!("transport error: {}", net::describe_transport_error(&error)),
-            },
+            Err(error) => {
+                // ★ 超时单独成档（见 `UpstreamErrorKind::Timeout` 的文档）：
+                //   它在降级链里是可勾选的一档，归到 `Server` 就永远选不到。
+                let kind = if error.is_timeout() {
+                    UpstreamErrorKind::Timeout
+                } else {
+                    UpstreamErrorKind::Server
+                };
+                UpstreamChatResult::Err {
+                    status: 0,
+                    kind,
+                    // 走统一出口：只有顶层一行「error sending request for url (…)」
+                    // 是没法排障的，网关日志需要看到具体原因（超时/拒绝/TLS）。
+                    message: format!("transport error: {}", net::describe_transport_error(&error)),
+                }
+            }
         }
     }
 

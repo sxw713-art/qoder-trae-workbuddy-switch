@@ -340,6 +340,11 @@ pub struct GatewayState {
     /// 进程内**唯一**实例（[`crate::disabled_models::shared`]）—— 与 Trae 网关、命令面
     /// 读的是同一个 `Arc`，否则「命令改了一份、网关读另一份」就是假开关。
     pub disabled: Arc<RwLock<DisabledModels>>,
+    /// 模型降级链（主模型失败 ⇒ 改用备选重发一次）。
+    ///
+    /// 与 `disabled` 同一套纪律：进程内**唯一**实例（[`crate::model_fallback::shared`]）、
+    /// 独立文件、**保存即生效**（不进 `Pool.config`，否则改完要重启网关）。
+    pub fallback: Arc<RwLock<crate::model_fallback::ModelFallback>>,
     pub upstream: Arc<UpstreamClient>,
     pub log: Arc<RequestLog>,
     /// ★ E1：代理 KPI 的热计数（今日代理请求 / 今日换号）。
@@ -420,6 +425,7 @@ impl GatewayState {
             catalogs,
             strategies,
             disabled: crate::disabled_models::shared(),
+            fallback: crate::model_fallback::shared(),
             upstream,
             log,
             // 进程启动即把上次落盘的台账**并进来**，避免重启后「今日」从零起算。

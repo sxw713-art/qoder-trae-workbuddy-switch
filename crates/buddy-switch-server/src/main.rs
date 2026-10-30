@@ -36,8 +36,8 @@ use serde_json::json;
 use buddy_switch_core::modules::background::{TaskKind, TaskSpec, TASKS};
 use buddy_switch_core::modules::product::Product;
 use buddy_switch_core::modules::{
-    account, auth_file, backup, config, process, region::Region, rotate, runtime_log, schedule,
-    scheduler, token_daily, trae, update,
+    account, auth_file, backup, config, gateway_ledger, process, region::Region, rotate,
+    runtime_log, schedule, scheduler, token_daily, trae, update,
 };
 
 fn default_port() -> u16 {
@@ -317,19 +317,49 @@ fn spawn_background_task(spec: TaskSpec) {
         //
         // 覆盖**两个 region**：`gateway_logs.json` 是单文件、行内带 `region`，
         // 只记一个 region 会让另一个的历史永远空着。
-        TaskKind::GatewayUsageRecord => {
-            tokio::spawn(async move {
-                loop {
-                    for region in Region::all() {
-                        let _ = token_daily::record_gateway_today(region);
+        TaskKind::GatewayUsageRecord => match spec.product {
+            // WorkBuddy：`token_daily` 的 gateway 桶（按 region 分文件）。
+            //
+            // 覆盖**两个 region**：`gateway_logs.json` 是单文件、行内带 `region`，
+            // 只记一个 region 会让另一个的历史永远空着。
+            Product::Workbuddy => {
+                tokio::spawn(async move {
+                    loop {
+                        for region in Region::all() {
+                            let _ = token_daily::record_gateway_today(region);
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            GATEWAY_USAGE_RECORD_INTERVAL_MS,
+                        ))
+                        .await;
                     }
-                    tokio::time::sleep(std::time::Duration::from_millis(
-                        GATEWAY_USAGE_RECORD_INTERVAL_MS,
-                    ))
-                    .await;
-                }
-            });
-        }
+                });
+            }
+            // Trae / Qoder：`gateway_ledger`（按 scope 分文件，含 unlabeled 一档）。
+            // 与桌面端同一分支语义；常驻进程更需要它（从不打开页面 ⇒ 没人触发记录）。
+            Product::Trae => {
+                tokio::spawn(async move {
+                    loop {
+                        gateway_ledger::record_all(gateway_ledger::LedgerProduct::Trae);
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            GATEWAY_USAGE_RECORD_INTERVAL_MS,
+                        ))
+                        .await;
+                    }
+                });
+            }
+            Product::Qoder => {
+                tokio::spawn(async move {
+                    loop {
+                        gateway_ledger::record_all(gateway_ledger::LedgerProduct::Qoder);
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            GATEWAY_USAGE_RECORD_INTERVAL_MS,
+                        ))
+                        .await;
+                    }
+                });
+            }
+        },
         // ★ 客户端（登录态）用量「今日」快照（2026-10-15 用户报障修复）：周期把客户端
         // 会话日志的**今日**用量聚合进 `token_daily` 的 client 桶并落盘。
         //

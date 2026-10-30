@@ -31,7 +31,28 @@ pub struct ModelCooldown {
     /// 解冻时刻（毫秒）。
     pub until_ms: i64,
     /// 上游声明的重置时刻（毫秒）；无声明为 0。
+    ///
+    /// ⚠️ 这个字段**不可信**：`cooldown_model` 在「上游没给墙钟」时会把**本仓算出来的**
+    /// 时刻（下限 / 兜底）也写进来（见 `from_upstream` 的文档），所以它回答不了
+    /// 「上游到底说几点恢复」。要那个答案读 [`Self::upstream_reset_at_ms`]。
     pub reset_at_ms: i64,
+    /// **展示专用**：上游**文案**里声明的重置时刻（毫秒，`0` = 未声明）。
+    ///
+    /// ## 为什么与 `reset_at_ms` 并存
+    ///
+    /// WB `6004` 的响应体里**没有任何结构化数值键**，时刻只写在 `msg` 文案里
+    /// （`… your usage will reset at 2026-10-29 16:26:36 UTC+8 …`）。探测台账早就把
+    /// 它解析出来放在 `ProbeCell::upstream_reset_at_ms` 给「探测详情」看，但**没有传给池**
+    /// ⇒ 池视图只能显示 `until_ms`（探测回填的 10 分钟兜底），用户看到的是
+    /// 「11:12 解冻」而上游明明写着 16:26 —— 2026-10-29 报障的根因。
+    ///
+    /// ## ★ 绝不参与冷却计算
+    ///
+    /// 文案里的时刻是**配额窗口重置**、不是解锁时刻（`parse_reset_at_ms` 的文档记着实测
+    /// 6/6 判错）。拿它当冷却时长会把号冻掉几小时，而它作为「界面上的一条信息」
+    /// 正是用户要的。因此本字段只写不算：`healthy_for_model` / 选号 / 退避全都不读它。
+    #[serde(default)]
+    pub upstream_reset_at_ms: i64,
     /// 原因标识。
     pub reason: String,
     /// 该模型被判「封禁」的累计次数（`11102` 专用，退避指数来源）。
@@ -54,6 +75,22 @@ pub struct ModelCooldown {
     /// 只是多一句提示，反过来会让「猜的」冒充「上游说的」。
     #[serde(default)]
     pub from_upstream: bool,
+    /// 该格「到期验证」**失败**的累计次数（退避指数；#88 4.2）。
+    ///
+    /// ## 为什么必须是独立的计数，而不是复用 `hits`（封禁）或「上一次冷却时长」
+    ///
+    /// 冷却到期后的验证失败，与「被上游封禁」是两种语义：
+    /// - `hits` 的基准是 **6 小时**（封禁要重罚，逼用户换号）；
+    /// - 验证失败的基准是 **60 秒**（多数限流十几秒就恢复，重罚会把可用的号按死）。
+    ///
+    /// 若拿「原冷却时长」翻倍（例如某次判了 5 小时 → 10 小时），越退越久，
+    /// 与「验证」的目的正好相反。所以单开一组基准（`verify_backoff_*`），
+    /// 这个字段就是它的指数。
+    ///
+    /// 何时归零：一次**不是**「到期待验证」状态下发生的限流（那是新一次事故），
+    /// 以及验证最终成功（条目被 `note_success` 整条删除）。
+    #[serde(default)]
+    pub verify_fails: u32,
 }
 
 /// 实测单位成本账本条目（每 1000 token 消耗的积分）。
@@ -320,30 +357,77 @@ impl PoolEntry {
         }
     }
 
-    /// 惰性清理已过期的模型级冷却；返回是否有条目被移除。
-    pub fn prune_model_cooldowns(&mut self, now_ms: i64) -> bool {
+    /// 该格此刻是否处于 **`VerifyPending`**（「冷却已到期、但还没验证通过」）。
+    ///
+    /// ## 为什么这两个条件就够（#88 4.2）
+    ///
+    /// 状态机只有三态，且**不需要额外字段**来表示「待验证」：
+    ///
+    /// ```text
+    /// Cooling(until_ms)  ──到期──▶  VerifyPending  ──验证成功──▶ 条目被删除（Available）
+    ///      ▲                            │
+    ///      └────────验证失败（新 until_ms）┘
+    /// ```
+    ///
+    /// - `until_ms == 0` ⇒ 没有冷却（从未冷却 / 已被成功清除）⇒ 不是待验证；
+    /// - `now < until_ms` ⇒ 仍在冷却 ⇒ 不是待验证；
+    /// - 剩下那个区间（`0 < until_ms <= now`）**就是**待验证。
+    ///
+    /// 这正是「到期 ≠ 已恢复」的落地：到期只意味着「可以有资格去试一次」。
+    pub fn model_awaits_verification(&self, now_ms: i64, model: &str) -> bool {
+        match self.model_cooldowns.get(model) {
+            Some(cooldown) => cooldown.until_ms > 0 && now_ms >= cooldown.until_ms,
+            None => false,
+        }
+    }
+
+    /// 该格「到期验证」已失败几次（退避指数）。
+    pub fn model_verify_fails(&self, model: &str) -> u32 {
+        self.model_cooldowns
+            .get(model)
+            .map(|cooldown| cooldown.verify_fails)
+            .unwrap_or(0)
+    }
+
+    /// 记录该格「到期验证」失败次数（由 `Pool::apply_upstream_error` 在退避前写入）。
+    pub fn set_model_verify_fails(&mut self, model: &str, fails: u32) {
+        if let Some(cooldown) = self.model_cooldowns.get_mut(model) {
+            cooldown.verify_fails = fails;
+        }
+    }
+
+    /// 记录「上游文案里声明的重置时刻」（**展示专用**，见 [`ModelCooldown::upstream_reset_at_ms`]）。
+    ///
+    /// 无该模型的冷却条目时**静默忽略**：探测回填是「先置冷却、再补展示字段」两步，
+    /// 第二步可能因为条目已被 `note_success` 清掉而不成立 —— 那不是错误。
+    pub fn set_model_upstream_reset(&mut self, model: &str, reset_at_ms: i64) {
+        if reset_at_ms <= 0 {
+            return;
+        }
+        if let Some(cooldown) = self.model_cooldowns.get_mut(model) {
+            cooldown.upstream_reset_at_ms = reset_at_ms;
+        }
+    }
+
+    /// 惰性清理**已结案**的模型级冷却条目；返回是否有条目被移除。
+    ///
+    /// ## 为什么「过期」不再等于「清理」（#88 4.2 改）
+    ///
+    /// 改造前这里对过期条目做的是「`hits == 0` 就删、否则把 `until_ms` 置 0」。
+    /// 一旦引入「到期必须先验证」，`until_ms` 就成了**验证票的锚点**：
+    /// 清了它，`model_awaits_verification` 立刻恒为 false ⇒ 状态机整体失效
+    /// （退化成「到期即放量」，正是要修的那个行为）。
+    ///
+    /// 所以现在只清**真正结案**的条目：`until_ms == 0`（已被成功清除）且没有封禁历史。
+    /// 待验证的条目一律保留 —— 它们的数量上限是「账号 × 模型」，
+    /// 与 `model_cooldowns` 本身同一个界，不存在无限增长。
+    pub fn prune_model_cooldowns(&mut self, _now_ms: i64) -> bool {
         let before = self.model_cooldowns.len();
-        // ★★ #88 缺口 4.3：到期**不能整条删** —— `hits` 是 `11102` 封禁的退避指数，
-        // 整条删掉等于「第 3 次封禁」退回「第 1 次」，下次又从 6 小时起步。
-        //
-        // 这与账号级 `prune_expired_cooling` 的纪律必须一致（那边到期清冷却域但
-        // **明确保留 `soft_streak`**，注释理由是「清掉会让反复被限流的账号每次都从
-        // 最短退避重来」）。此前两条路径的纪律正好相反。
-        //
-        // 到期后的处置：`until_ms` 置 0（`healthy_for_model` 用 `now >= until_ms` 判可用，
-        // 所以语义不变），条目**只在有封禁历史时**保留 —— 纯限流条目（`hits == 0`）
-        // 没有记忆价值，删掉免得每账号 × 每模型无限累积。
-        self.model_cooldowns.retain(|_, cooldown| {
-            if now_ms < cooldown.until_ms {
-                return true;
-            }
-            if cooldown.hits > 0 {
-                cooldown.until_ms = 0;
-                cooldown.reset_at_ms = 0;
-                return true;
-            }
-            false
-        });
+        // ★★ #88 缺口 4.3：封禁历史（`hits`）必须保留 —— 整条删掉等于「第 3 次封禁」
+        // 退回「第 1 次」，下次又从 6 小时起步。与账号级 `prune_expired_cooling`
+        // 保留 `soft_streak` 的纪律一致。
+        self.model_cooldowns
+            .retain(|_, cooldown| cooldown.until_ms != 0 || cooldown.hits > 0);
         before != self.model_cooldowns.len()
     }
 
@@ -575,9 +659,13 @@ impl PoolEntry {
             ModelCooldown {
                 until_ms: until,
                 reset_at_ms,
+                // 真实流量只有结构化墙钟（`reset_at_ms`）；文案里的时刻由探测回填单独写
+                // （`Pool::adopt_probe_result`），这里恒 0。
+                upstream_reset_at_ms: 0,
                 reason: reason.to_string(),
                 hits: 0,
                 from_upstream,
+                verify_fails: 0,
             },
         );
     }
@@ -659,10 +747,13 @@ impl PoolEntry {
             ModelCooldown {
                 until_ms: now_ms.saturating_add(ttl),
                 reset_at_ms: 0,
+                upstream_reset_at_ms: 0,
                 reason: reason.to_string(),
                 hits,
                 // 封禁的时长是「按次数退避」算出来的，不是上游给的时刻。
                 from_upstream: false,
+                // 封禁与「到期验证」是两套退避，各自计数，不共用。
+                verify_fails: 0,
             },
         );
         ttl
@@ -1070,8 +1161,16 @@ mod tests {
         assert!(item.healthy_for_model(1000 + DEFAULT_SOFT_RATE_MAX_MS, "glm-5.2"));
     }
 
+    /// ★★ #88 4.2 改了这里的**期望**：过期条目不再被清理，而是变成「待验证」。
+    ///
+    /// 改造前这条断言是「已过期应被清理」。那条纪律与「到期必须验证」直接冲突：
+    /// 一旦把 `until_ms` 清掉，`model_awaits_verification` 就恒为 false，
+    /// 状态机整体失效（退回「到期即放量」，正是 4.2 要修的行为）。
+    ///
+    /// 所以现在的期望是：**过期 → 仍是待验证（保留）、未过期 → 保留、已被成功清过
+    /// 且无封禁历史 → 清理**。
     #[test]
-    fn prune_model_cooldowns_removes_expired_only() {
+    fn pruning_no_longer_drops_expired_model_cooldowns() {
         let mut item = entry();
         // reset_at 未声明（0）时冷却退化为"瞬时"（now+1ms），并不按 max 计时——
         // 要让条目真正存活一段时间，必须给出**未来**的 reset_at 时刻。
@@ -1086,10 +1185,28 @@ mod tests {
             "未来墙钟 → 直接采用"
         );
 
-        assert!(item.prune_model_cooldowns(2000));
-        assert!(!item.model_cooldowns.contains_key("a"), "已过期应被清理");
+        // 1001 已过 ⇒ a 处于「到期待验证」。
+        assert!(
+            item.model_awaits_verification(2000, "a"),
+            "过期即进入待验证（4.2 的状态机入口）"
+        );
+        assert!(!item.model_awaits_verification(2000, "b"), "仍在冷却");
+
+        assert!(
+            !item.prune_model_cooldowns(2000),
+            "没有**结案**条目可清 ⇒ 返回 false（待验证条目不算结案）"
+        );
+        assert!(
+            item.model_cooldowns.contains_key("a"),
+            "待验证的条目必须保留 —— `until_ms` 是验证票的锚点"
+        );
         assert!(item.model_cooldowns.contains_key("b"), "未过期应保留");
-        assert!(!item.prune_model_cooldowns(2000), "无变化时返回 false");
+
+        // 验证通过（`note_success` 会整条删掉），或 4.3 里「已结案」的形态（`until_ms == 0`）
+        // 才会被清 —— 这里直接构造后者。
+        item.model_cooldowns.get_mut("a").unwrap().until_ms = 0;
+        assert!(item.prune_model_cooldowns(2000), "结案条目可清");
+        assert!(!item.model_cooldowns.contains_key("a"));
     }
 
     #[test]

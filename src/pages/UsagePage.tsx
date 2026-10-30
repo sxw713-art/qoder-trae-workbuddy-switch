@@ -48,7 +48,7 @@ import { scopeOf } from "@/lib/scope";
 import { useRefreshAction } from "@/lib/use-refresh-action";
 import { useScope } from "@/lib/use-scope";
 import { readPreferredCombineAll } from "@/lib/usage-params";
-import { parseLedger, type UsageLedger } from "@/lib/usage-ledger";
+import { LEDGER_VALUES, parseLedger, type UsageLedger } from "@/lib/usage-ledger";
 import { DEFAULT_USAGE_WINDOW, type UsageWindow } from "@/lib/usage-window";
 import type { TranslationKey } from "@/locales/zh";
 
@@ -116,8 +116,11 @@ const USAGE_PAGES: Record<
     /**
      * 该平台是否区分「客户端 / 网关」两本账（issue #63）。
      *
-     * 只有 WorkBuddy：它的客户端日志与本地网关日志是**两本独立记账的账**，
-     * 互相重叠且各有维度。Trae / Qoder 的「网关」不是同一个东西。
+     * - **WorkBuddy**：客户端日志与本地网关日志是**两本独立记账的账**，互相重叠且各有维度；
+     * - **Qoder**：同样两本 —— 客户端会话记录（`qoder_usage`）与网关账本
+     *   （`gateway_ledger`）都按 credits 计，且都逐日可加总；
+     * - **Trae**：只有**网关**一本。它的客户端对话落在 IDE 私有存储（加密 + 二进制索引），
+     *   没有任何可解析的用量落盘 ⇒ 见 [`PLATFORM_LEDGER_VALUES`]。
      */
     ledger: boolean;
   }
@@ -134,21 +137,53 @@ const USAGE_PAGES: Record<
     credits: TraeCreditsPage,
     tokenViews: true,
     mergeScopes: true,
-    ledger: false,
+    ledger: true,
   },
   /* Qoder：**单位是 credits，不是 Token**（客户端按 credits 计费、token 计数恒为 0，
      三处取证见 `QoderUsagePage` 文件头）。
      · tokens 页 = 趋势 / 模型 / 会话三视图（消费 `view`，故 `tokenViews: true`）；
      · credits 页 = **实时余额快照**（`qoder_credits`），与逐日用量是两个口径。
      ⚠️ `mergeScopes: false`（2026-10-18）：Qoder 用量来自**本机客户端会话记录**，
-        只扫当前区域的目录 ⇒ 合并两个区域没有可合并的数据，参数条那枚控件是死的。 */
+        只扫当前区域的目录 ⇒ 合并两个区域没有可合并的数据，参数条那枚控件是死的。
+     ⚠️ 账本（2026-10-28 补齐）：客户端 = `qoder_usage`（按 credits），网关 = 新落库的
+        `gateway_ledger`（同样带 credits）⇒ 三档都有真实数据。 */
   qoder: {
     tokens: QoderUsagePage,
     credits: QoderCreditsPage,
     tokenViews: true,
     mergeScopes: false,
-    ledger: false,
+    ledger: true,
   },
+};
+
+/**
+ * 各平台**可选的账本档**。
+ *
+ * Trae 曾经只给「网关」一档（客户端对话库是 SQLCipher 加密的，没有明文可解析落盘）。
+ * 2026-10-28 起客户端档**可选**：用户用 sqlcipher 导出明文副本后，本工具读那份明文
+ * ——详见 `trae/client_import.rs`。未导入时选中该档显示**导入引导**（不是空图，
+ * 也不是禁用：禁用会让用户连「怎么导入」的入口都看不到）。
+ */
+const PLATFORM_LEDGER_VALUES: Record<Product, readonly UsageLedger[]> = {
+  workbuddy: LEDGER_VALUES,
+  trae: LEDGER_VALUES,
+  qoder: LEDGER_VALUES,
+};
+
+/**
+ * 账本**有意义的视图**（切换器只在这些视图上出现）。
+ *
+ * 账本是「换一本账看数据」；对没有来源拆分的视图（Qoder 的实时余额、两平台的按密钥）
+ * 渲染它只会换来「点了没反应」。⚠️ 与 `mergeScopes` 同一条纪律：不渲染无效果控件。
+ *
+ * - WorkBuddy：四个视图都消费（会话在网关账本下换成账号/端点表，积分按来源拆 credit）；
+ * - Trae：趋势 / 模型（token 逐日）；积分页的数据是**余额快照差**，拆不出来源；
+ * - Qoder：趋势 / 模型 / 会话（credits 逐日）；积分页是余额，与窗口无关。
+ */
+const LEDGER_VIEWS: Record<Product, readonly UsageTab[]> = {
+  workbuddy: ["trend", "models", "sessions", "credits"],
+  trae: ["trend", "models"],
+  qoder: ["trend", "models", "sessions"],
 };
 
 export default function UsagePage({ defaultTab = "trend" }: { defaultTab?: UsageTab } = {}) {
@@ -165,7 +200,15 @@ export default function UsagePage({ defaultTab = "trend" }: { defaultTab?: Usage
      在「切 tab」与「离开页面」之间来回跳，那比没有深链更烦）。 */
   const [tab, setTab] = useState<UsageTab>(() => {
     const deep = new URLSearchParams(location.search).get("usage");
-    return deep === "trend" || deep === "models" || deep === "sessions" || deep === "credits"
+    /* 五个视图**逐个列出**（不用 `tabs.includes`）：`tabs` 是**当前平台**可用的视图，
+       用它校验深链会把「这个平台没有的视图」静默吞成首视图 —— 而深链恰恰常用于
+       对照评审（发一条链接给别人看某一页）。⚠️ `keys` 曾经漏在这里，
+       `?usage=keys` 会被悄悄回落到「趋势」。 */
+    return deep === "trend" ||
+      deep === "models" ||
+      deep === "sessions" ||
+      deep === "keys" ||
+      deep === "credits"
       ? deep
       : defaultTab;
   });
@@ -204,6 +247,11 @@ export default function UsagePage({ defaultTab = "trend" }: { defaultTab?: Usage
     mergeScopes,
     ledger: canSwitchLedger,
   } = USAGE_PAGES[product];
+  /** 本平台可选的账本档；当前值不在其中（如从 WB 切到 Trae）⇒ 回落到首档。 */
+  const ledgerValues = PLATFORM_LEDGER_VALUES[product];
+  const activeLedger: UsageLedger = ledgerValues.includes(ledger) ? ledger : ledgerValues[0];
+  /** 账本切换器**在该视图上**是否有意义（见 `LEDGER_VIEWS`）。 */
+  const ledgerVisible = canSwitchLedger && LEDGER_VIEWS[product].includes(active);
   /* 页头刷新：只重挂**当前视图**（`key` 变化 ⇒ 子页面重新取数）。
      ⚠️ 不做「全局刷新信号」：四个视图数据源不同，重挂当前视图是唯一不会
      让「另一个视图的空请求」也一起打的方案。 */
@@ -217,10 +265,11 @@ export default function UsagePage({ defaultTab = "trend" }: { defaultTab?: Usage
     viewWindow,
     combineAll,
     onViewWindowChange: setViewWindow,
-    /* 账本只对支持它的平台有意义；其余平台固定 `client`（页面也不声明这个 prop）。 */
-    ledger: canSwitchLedger ? ledger : ("client" as UsageLedger),
+    /* 账本只对支持它的平台 + 支持它的视图有意义；其余一律给「全部」
+       （子页面在这种情况下本来就不消费它，给一个语义中性的值最不容易被误读）。 */
+    ledger: ledgerVisible ? activeLedger : ("all" as UsageLedger),
     /* 视图内也能改账本（例：会话视图「按账号查看网关用量」跳转）。 */
-    onLedgerChange: canSwitchLedger ? setLedger : undefined,
+    onLedgerChange: ledgerVisible ? setLedger : undefined,
   };
 
   return (
@@ -269,9 +318,10 @@ export default function UsagePage({ defaultTab = "trend" }: { defaultTab?: Usage
         combineAll={combineAll}
         onCombineAllChange={setCombineAll}
         canMergeScopes={mergeScopes}
-        ledger={ledger}
+        ledger={activeLedger}
         onLedgerChange={setLedger}
-        canSwitchLedger={canSwitchLedger}
+        canSwitchLedger={ledgerVisible}
+        ledgerValues={ledgerValues}
       />
 
       {/* ⚠️ 不在这里加 `overflow-auto`：子页面**各自有滚动容器**，再套一层会出双滚动条。 */}

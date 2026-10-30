@@ -311,9 +311,11 @@ pub async fn chat_for_region(
     // ★ issue #76：调用方的 Key（`None` = 无 Key 的调用 ⇒ 不判配额、不过白名单、不记账）。
     key: Option<std::sync::Arc<crate::apikey::KeyActor>>,
 ) -> Response {
-    let started = Instant::now();
-    // ★ issue #76：配额判定（选号前）—— 超限直接 429，一步都不发。
-    //   与 WB / Trae 同位置、同文案（复用 `GatewayError::KeyQuotaExceeded`）。
+    // 整轮请求的起点（降级事件用它算耗时；`_once` 内部另算它自己那一跳的）。
+    let request_started = Instant::now();
+    // ★ issue #76：配额判定（选号前）—— **必须放在降级循环之外**。
+    //   它在 `chat_for_region_once` 里时，一次降级请求会消耗 2–3 份配额
+    //   （每跳各判一次）—— 配额是**按请求**计的，与「试了几个模型」无关。
     if let Some(actor) = key.as_deref() {
         // 判定 + 请求数记账都在 `KeyActor` 里（四条产品线同一份实现）。
         if let Some(message) =
@@ -327,6 +329,144 @@ pub async fn chat_for_region(
             );
         }
     }
+
+    // ★ 降级链（P13）：主模型失败且命中触发条件时，改用备选模型重发。
+    //
+    //   hop 循环放在**这里**（而不是 `chat_for_region_once` 内部）：三个协议入口
+    //   （OpenAI / Anthropic / Responses）都走这一个函数 ⇒ 三者行为天然一致。
+    //
+    // ★ 模型名在**外层**先解析一次（hop 序列要按主模型算），而且必须与
+    //   `chat_for_region_once` 内的解析**完全一致**（含「空 ⇒ 清单第一条」兜底）——
+    //   不一致的话，外层算出的 hop 序列会与内层实际用的模型对不上，
+    //   那个模型就永远不降级。
+    let scope = scope_of_qoder_region(region);
+    let origin_model = qoder_model_of(&state, region, &body, protocol).await;
+    if origin_model.is_empty() {
+        // 模型还没定（清单为空）⇒ 交给 `_once` 走它自己的「未指定模型」错误路径。
+        return chat_for_region_once(state, region, body, protocol, key).await;
+    }
+    let fallback = crate::routes::fallback::FallbackLoop::plan(scope, &origin_model).await;
+    // 没有可用链 ⇒ 走原路径（绝大多数用户是这一条）。
+    if fallback.len() <= 1 {
+        return chat_for_region_once(state, region, body, protocol, key).await;
+    }
+    let raw_body = String::from_utf8_lossy(&body).to_string();
+    let mut hop = 0usize;
+    // 上一跳的失败响应（越界时返回它）与触发原因（写进降级头）。
+    let mut last: Option<Response> = None;
+    let mut last_trigger: Option<crate::model_fallback::Trigger> = None;
+    loop {
+        // ★ 越界在这里挡：`model_at` 越界返回 `None`（**不回落主模型**）——
+        //   回落会让「备选全被禁用」变成「把主模型原样重发一次」。
+        let Some(hop_model) = fallback.model_at(hop) else {
+            return last.expect("第 0 跳必然执行过");
+        };
+        // 被用户禁用的目标直接跳过：一次请求都不发。
+        if fallback.should_skip(hop, &state.disabled).await {
+            hop += 1;
+            continue;
+        }
+        // body 里没有 `model` 字段 ⇒ 改写不了 ⇒ 不降级
+        // （否则每跳实际发同一个模型，却告诉客户端「降到了备选」= 对客户端撒谎）。
+        let Some(hop_body) = fallback.body_for(hop, &raw_body) else {
+            return last.expect("第 0 跳必然执行过");
+        };
+        let hop_model = hop_model.to_string();
+        let hop_body = Bytes::from(hop_body);
+        // 同平台跨区域：换 region（协议一致，只是账号池与域名不同）。
+        let hop_region = fallback
+            .scope_at(hop)
+            .map(crate::routes::cross::qoder_region_of)
+            .unwrap_or(region);
+        // ★ 跨平台目标：交给 `cross::relay_on_scope`（同进程内调目标产品线入口）。
+        let response = if fallback
+            .scope_at(hop)
+            .is_some_and(|target_scope| target_scope.product() != scope.product())
+        {
+            Box::pin(crate::routes::cross::relay_on_scope(
+                fallback.scope_at(hop).expect("上面已判过 Some"),
+                axum::http::HeaderMap::new(),
+                hop_body.clone(),
+                None,
+            ))
+            .await
+        } else {
+            chat_for_region_once(state.clone(), hop_region, hop_body, protocol, key.clone()).await
+        };
+        if response.status().is_success() {
+            let mut response = response;
+            if hop > 0 {
+                if let Some(trigger) = last_trigger {
+                    fallback.apply_headers(hop, &mut response, trigger);
+                    // 记一笔降级成功（Qoder 拿不到完整轨迹，path 只记最终用的那个）。
+                    crate::model_fallback::record_success(
+                        scope,
+                        fallback.origin(),
+                        &hop_model,
+                        trigger,
+                        request_started.elapsed().as_millis() as i64,
+                    );
+                }
+            }
+            return response;
+        }
+        // 能不能继续降级：**状态码能映射到触发条件** 且 **该条件在用户配的白名单里**。
+        match fallback.can_fallback(&response) {
+            Some(trigger) => last_trigger = Some(trigger),
+            None => return response,
+        }
+        last = Some(response);
+        hop += 1;
+    }
+}
+
+/// Qoder 的模型名解析（**外层与内层必须用同一个**）。
+///
+/// 顺序：显式 `model` → 配置默认模型 → 清单第一条。
+/// 少了「清单第一条」那一档，外层算出的 hop 序列会与内层实际用的模型对不上。
+async fn qoder_model_of(
+    state: &QoderGatewayState,
+    region: QoderRegion,
+    body: &Bytes,
+    protocol: Protocol,
+) -> String {
+    let config = state.config_snapshot().await;
+    let parsed: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+    let openai_payload = match protocol {
+        Protocol::OpenAi => parsed,
+        Protocol::Anthropic => crate::protocol::anthropic::to_upstream_request_with_images(&parsed),
+        Protocol::Responses => payload::responses_to_chat(&parsed),
+    };
+    let mut model = payload::model_of(&openai_payload, &config.default_model);
+    if model.is_empty() {
+        let catalog = state.catalog_for(region).await;
+        if let Some(first) = catalog.models.first() {
+            model = first
+                .get("id")
+                .or_else(|| first.get("key"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+        }
+    }
+    model
+}
+
+/// Qoder 的一趟中继（**不含**降级循环；降级由 [`chat_for_region`] 在外层做）。
+///
+/// 单独拆出来的原因：内层有十几处 `return`（成功 / 各种失败），把它们改成
+/// 「产出 Response」才能让外层看到「这一跳彻底失败了，可以换下一个模型」。
+pub async fn chat_for_region_once(
+    state: QoderGatewayState,
+    region: QoderRegion,
+    body: Bytes,
+    protocol: Protocol,
+    // ★ issue #76：调用方的 Key（`None` = 无 Key 的调用 ⇒ 不判配额、不过白名单、不记账）。
+    key: Option<std::sync::Arc<crate::apikey::KeyActor>>,
+) -> Response {
+    let started = Instant::now();
+    // ★ issue #76：配额判定已**上移到 `chat_for_region`**（降级循环之外）——
+    //   留在这里会每跳判一次，一次降级请求消耗 2–3 份配额。
     let parsed: Value = match serde_json::from_slice(&body) {
         Ok(value) => value,
         Err(error) => {
@@ -1071,6 +1211,7 @@ async fn aggregate_relay(
                 input_tokens: prompt_tokens,
                 output_tokens: completion_tokens,
                 custom: &responses_custom,
+                raw_usage: usage.as_ref(),
             },
             model,
         ))

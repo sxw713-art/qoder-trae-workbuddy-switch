@@ -788,12 +788,12 @@ const GATEWAY = {
     /* available = 上游事实（能不能调）；disabled = 用户偏好（主动拿掉）。
        两者**正交**，四种组合都合法 —— UI 必须能区分「已禁用」与「上游不可用」。 */
     models: [
-      { name: "claude-sonnet-4.5", provider: "anthropic", scope: "国内版", available: true, context: 200000, maxWindow: 200000, efforts: ["low", "medium", "high", "xhigh", "max"], defaultEffort: "high", credits: 1.33 },
-      { name: "claude-opus-4.1", provider: "anthropic", scope: "国内版", available: true, disabled: true, context: 200000, maxWindow: 200000, efforts: ["low", "medium", "high"], defaultEffort: "high", credits: 3.31 },
-      { name: "gpt-5-codex", provider: "openai", scope: "国内版", available: true, context: 400000, maxWindow: 1000000, efforts: ["low", "medium", "high", "xhigh", "max"], defaultEffort: "high", credits: 0.79 },
-      { name: "gemini-2.5-pro", provider: "openai", scope: "国内版", available: true, context: 300000, maxWindow: 1000000, efforts: ["low", "medium", "high"], defaultEffort: "medium", credits: 0.34 },
-      { name: "claude-sonnet-4.5", provider: "anthropic", scope: "国际版", available: true, context: 200000, maxWindow: 200000, efforts: ["low", "medium", "high", "xhigh", "max"], defaultEffort: "high", credits: 1.33 },
-      { name: "gpt-5-codex", provider: "openai", scope: "国际版", available: false, disabled: true, context: 400000, maxWindow: 1000000, efforts: ["low", "medium", "high", "xhigh", "max"], defaultEffort: "high", credits: 0.79 },
+      { name: "claude-sonnet-4.5", provider: "anthropic", scope: "国内版", available: true, context: 200000, maxWindow: 200000, efforts: ["low", "medium", "high", "xhigh", "max"], defaultEffort: "high", credits: 1.33, caps: ["tools", "vision"] },
+      { name: "claude-opus-4.1", provider: "anthropic", scope: "国内版", available: true, disabled: true, context: 200000, maxWindow: 200000, efforts: ["low", "medium", "high"], defaultEffort: "high", credits: 3.31, caps: ["tools", "vision"] },
+      { name: "gpt-5-codex", provider: "openai", scope: "国内版", available: true, context: 400000, maxWindow: 1000000, efforts: ["low", "medium", "high", "xhigh", "max"], defaultEffort: "high", credits: 0.79, caps: ["tools", "vision"] },
+      { name: "gemini-2.5-pro", provider: "openai", scope: "国内版", available: true, context: 300000, maxWindow: 1000000, efforts: ["low", "medium", "high"], defaultEffort: "medium", credits: 0.34, caps: ["vision"] },
+      { name: "claude-sonnet-4.5", provider: "anthropic", scope: "国际版", available: true, context: 200000, maxWindow: 200000, efforts: ["low", "medium", "high", "xhigh", "max"], defaultEffort: "high", credits: 1.33, caps: ["tools", "vision"] },
+      { name: "gpt-5-codex", provider: "openai", scope: "国际版", available: false, disabled: true, context: 400000, maxWindow: 1000000, efforts: ["low", "medium", "high", "xhigh", "max"], defaultEffort: "high", credits: 0.79, caps: ["tools", "vision"] },
     ],
     /* 模型清单的来源（§3.17）：实时 / 已保存 / 内置 —— 三级都必须显式标注，
        不许把「内置」伪装成「实时」（用户照着清单调用会扑空）。 */
@@ -815,6 +815,44 @@ const GATEWAY = {
     /* 模型级暂停：同一模型在 ≥2 个账号上先后被限流 ⇒ 该模型整体暂停，
        到期后只放**一个**请求做半开试探 —— 否则每个请求都要把每个账号各撞一遍。 */
     modelGate: { model: "gpt-5-codex", accounts: 2, remain: 42, phase: "paused" },
+    /* ══════════ 模型降级链（用户偏好，不是运行配置）══════════
+       主模型在上游**明确失败**时，按序改用备选模型重发一次。
+
+       ## `triggers` 是白名单，不是「失败就降级」
+       参数错 4xx / 内容审核拒绝 / 402 余额不足 / Key 配额用尽 **固定不在表里**：
+       前三者换模型救不了（只会把同一个错误翻译成更陌生的模型名），后者是账号或密钥
+       层面的额度问题。**内容审核尤其不能降级** —— 换模型等于换一套审核尺度，
+       效果上就是帮调用方绕过审核，还会造成「同一段内容今天被拒、明天通过」。
+
+       ## 备选只在本作用域内选
+       跨作用域 = 换账号池 + 换 wire 协议 + 换计费，那是统一网关命名空间的职责，
+       不是降级链的职责。
+
+       ## 每次请求都从主模型开始（不做粘性降级）
+       闸门已提供免费回切：主模型失败后处于暂停期，期间请求在闸门判定处直接短路、
+       一次上游请求都不发。粘性只会让「以为在用 A 其实一直在用 B」变成长期静默态。 */
+    fallback: {
+      enabled: true,
+      chains: [
+        /* 主演示链：第 1 跳在闸门中（见上面的 `modelGate`）、第 2 跳缺 tools 能力 ——
+           两种诊断同时出现在一条链上，正好验证「诊断带可以有多个」。 */
+        { from: "claude-sonnet-4.5", targets: ["gpt-5-codex", "gemini-2.5-pro"], triggers: ["gate", "rate", "blocked", "server"], enabled: true },
+        { from: "gemini-2.5-pro", targets: ["gpt-5-codex"], triggers: ["gate", "rate"], enabled: true },
+        /* 已停用：配置保留但不触发。停用态必须可见，否则用户以为链被删了。 */
+        { from: "claude-opus-4.1", targets: ["claude-sonnet-4.5"], triggers: ["gate"], enabled: false },
+      ],
+      /* 最近降级（请求日志里的降级标记）。
+         ★ **只显示最近 N 条，不参与任何统计口径** —— 请求日志是环形缓冲（默认 200 条），
+         繁忙时只覆盖十几分钟。任何按窗口聚合的数字都必须来自账本，不能从这张表算。 */
+      events: [
+        { time: "14:22:07", from: "claude-sonnet-4.5", path: ["gpt-5-codex"], reason: "gate", reasonText: "闸门暂停 42s", account: "主号 A", ms: 1200, result: "degraded" },
+        { time: "14:19:44", from: "claude-sonnet-4.5", path: ["gpt-5-codex", "gemini-2.5-pro"], reason: "rate", reasonText: "6004 模型限流", account: "主号 A / B", ms: 3800, result: "degraded" },
+        { time: "14:02:11", from: "gemini-2.5-pro", path: ["gpt-5-codex"], reason: "blocked", reasonText: "11102 模型封禁", account: "主号 C", ms: 900, result: "degraded" },
+        /* 不可降级的那一档：必须在流水里可见，且写清「按规则不降级」而不是「失败」。 */
+        { time: "13:58:02", from: "claude-sonnet-4.5", path: [], reason: "credit", reasonText: "402 余额不足", account: "主号 A", ms: 300, result: "blocked" },
+        { time: "13:41:20", from: "claude-sonnet-4.5", path: ["gpt-5-codex", "gemini-2.5-pro"], reason: "server", reasonText: "5xx", account: "主号 B", ms: 2100, result: "failed" },
+      ],
+    },
     logs: [
       { time: "10:38:12", model: "claude-sonnet-4.5", account: "jackey", status: 200, ms: 842, tokens: 1284 },
       { time: "10:37:44", model: "gpt-5-codex", account: "team-shared", status: 200, ms: 610, tokens: 402 },

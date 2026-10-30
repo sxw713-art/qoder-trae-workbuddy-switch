@@ -228,6 +228,9 @@ pub fn failure_reason(failure: &UpstreamFailure) -> String {
         UpstreamErrorKind::SessionDead => "鉴权失败（登录态已失效）".to_string(),
         UpstreamErrorKind::NotFound => "上游接口未找到（接口可能已变更）".to_string(),
         UpstreamErrorKind::Server => "上游服务端错误".to_string(),
+        // 超时单独给一句：和 5xx 的处置不同（换模型可能有效，换号多半没用），
+        // 探测结论里混成「服务端错误」会把人引向错误的方向。
+        UpstreamErrorKind::Timeout => "上游请求超时（模型或链路太慢）".to_string(),
         UpstreamErrorKind::Client => "上游拒绝了请求".to_string(),
     }
 }
@@ -1293,7 +1296,7 @@ mod tests {
             );
         }
 
-        // 六种分类的原因必须**互不相同** —— 笼统一句话回答不了「为什么不是实时」。
+        // 七种分类的原因必须**互不相同** —— 笼统一句话回答不了「为什么不是实时」。
         let mut unique = std::collections::HashSet::new();
         for kind in [
             UpstreamErrorKind::HardCredit,
@@ -1301,6 +1304,9 @@ mod tests {
             UpstreamErrorKind::SessionDead,
             UpstreamErrorKind::NotFound,
             UpstreamErrorKind::Server,
+            // ★ 超时也要单列：它与 5xx 的处置不同（换模型可能有效，换号多半没用），
+            //   笼统说成「服务端错误」会把人引向错误的方向。
+            UpstreamErrorKind::Timeout,
             UpstreamErrorKind::Client,
         ] {
             assert!(

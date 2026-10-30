@@ -143,6 +143,13 @@ export interface GatewayDimEntry {
   account?: string;
   /** `endpoints[]` 的键（空串 = 未记录端点）。 */
   endpoint?: string;
+  /**
+   * `keys[]` 的键 —— `{keyScope}:{keyId}` / `__legacy__` / `__none__`。
+   *
+   * 判据与后端 `token_daily::key_bucket_of` 逐字相同；解析与命名只在
+   * `src/lib/key-usage.ts` 一处做（别在视图里再拆一次冒号）。
+   */
+  key?: string;
   input: number;
   output: number;
   total: number;
@@ -164,14 +171,27 @@ export interface GatewayUsageDimDay {
   models: GatewayDimEntry[];
   accounts: GatewayDimEntry[];
   endpoints: GatewayDimEntry[];
+  /**
+   * 按**调用方密钥**的维度（v4 才有的第四维）。
+   *
+   * ⚠️ 升级前的日期里是**空数组**（= 那时候还没这个维度），不是「用量为 0」。
+   * 两者在 UI 上必须分开表述 —— 空数组画成 0 会让用户以为那些天没人用过。
+   */
+  keys: GatewayDimEntry[];
+  /**
+   * 该日的**密钥**维度是从中间开始记的（v3 → v4 播种）⇒ 只是**下界**。
+   *
+   * 与 `partial` 分开：`partial` 说的是模型/账号/端点。
+   */
+  keysPartial: boolean;
 }
 
 /**
- * `get_gateway_usage_dim` 的返回 —— 网关三维度逐日历史。
+ * `get_gateway_usage_dim` 的返回 —— 网关四维度逐日历史。
  *
  * ⚠️ 与 `get_gateway_token_trend` **同源同形状**：`days` 只含落库日
  * ⇒ **缺日 = 未记录，不是 0**；join 窗口后必须算覆盖率并披露。
- * ⚠️ 三条维度的合计**都等于**当日的网关 token 总量（同一次聚合、同一水位线）。
+ * ⚠️ 四条维度的合计**都等于**当日的网关 token 总量（同一次聚合、同一水位线）。
  */
 export interface GatewayUsageDim {
   date: string;
@@ -1345,7 +1365,7 @@ export interface TokenStatsTotals { total: number; input: number; output: number
  * 而不是 0（0 = 真的没消耗，`—` = 不知道，两者不能混）。
  */ credit?: number | null; }
 export interface TokenStatsGroup extends TokenStatsTotals { key: string; title?: string | null; project?: string; sessionId?: string; /** ★ 仅 `sessions[]` 携带：会话**逐日拆分**（窗口切片的素材，键 `YYYY-MM-DD`）。旧后端缺省 ⇒ 前端按全时口径回落（见 `sessionPoints`）。 */ daily?: TokenStatsGroup[]; }
-export interface TokenStatsSource { source: "workbuddy" | "codebuddy-cli" | "codebuddy-ide" | "workbuddy-ai" | "trae-gateway"; summary: TokenStatsTotals; models: TokenStatsGroup[]; projects: TokenStatsGroup[]; sessions: TokenStatsGroup[]; daily: TokenStatsGroup[]; /** Optional model-specific daily series for trend filtering. */ dailyByModel?: Record<string, TokenStatsGroup[]>; hours: TokenStatsGroup[]; filesScanned: number; parseErrors: number; coverageStartAt?: number | null; coverageEndAt?: number | null; }
+export interface TokenStatsSource { source: "workbuddy" | "codebuddy-cli" | "codebuddy-ide" | "workbuddy-ai" | "trae-gateway" | "trae-client"; summary: TokenStatsTotals; models: TokenStatsGroup[]; projects: TokenStatsGroup[]; sessions: TokenStatsGroup[]; daily: TokenStatsGroup[]; /** Optional model-specific daily series for trend filtering. */ dailyByModel?: Record<string, TokenStatsGroup[]>; hours: TokenStatsGroup[]; filesScanned: number; parseErrors: number; coverageStartAt?: number | null; coverageEndAt?: number | null; }
 export interface TokenStatistics { /** 查询范围（后端返回：cn / global / all）；缺省兼容旧后端。 */ region?: RegionFilter; generatedAt: number; rangeDays?: number | null; sources: TokenStatsSource[]; }
 
 export interface CodeBuddyCliStatus {
@@ -1620,6 +1640,127 @@ export interface GatewayConfig {
   max_context: boolean;
 }
 
+/* ─────────── 模型降级链（P13）───────────
+   与后端 `crates/buddy-switch-gateway/src/model_fallback.rs` 逐字对应。
+   ★ 备选的**健康态由后端派生**（`TargetView.state`），前端不自己算 ——
+     否则卡片上的点和账号池里的点会在两个时刻各自计算，出现「这边绿那边黄」。 */
+
+/** 可触发降级的上游事件（**白名单**）。 */
+export type FallbackTrigger =
+  | "gate"
+  | "model_rate"
+  | "model_blocked"
+  | "server"
+  | "timeout"
+  | "not_found";
+
+/** 备选模型的实时健康态。 */
+export type FallbackTargetState = "healthy" | "gated" | "disabled" | "unknown";
+
+export interface FallbackTargetView {
+  model: string;
+  /** 该目标所在的作用域（`wb-cn` / `wb-global` / `trae-cn` …）。 */
+  scope: string;
+  state: FallbackTargetState;
+  /** 闸门剩余秒数（仅 `state === "gated"` 时有值）。 */
+  gated_for_secs: number | null;
+  /**
+   * 目标相对主模型**缺**的能力（目前只有 `"image"`）。
+   * 只表达「主模型明确支持、目标明确不支持」，任一侧未知就不写。
+   */
+  caps_lost: string[];
+}
+
+export interface FallbackChainView {
+  from: string;
+  targets: FallbackTargetView[];
+  triggers: FallbackTrigger[];
+  enabled: boolean;
+}
+
+/** 一条降级事件（进程内环形缓冲，**不落盘、不参与统计**）。 */
+export interface FallbackEvent {
+  /** 作用域（`wb-cn` / `trae-cn` …）：流水按作用域分，不混三个平台。 */
+  scope: string;
+  at_ms: number;
+  from: string;
+  path: string[];
+  /** 触发原因的稳定标识（`model_gate` / `model_rate` / …）。 */
+  reason: string;
+  account: string;
+  ms: number;
+  result: "degraded" | "failed" | "blocked";
+}
+
+/** `get_model_fallback` / `save_model_fallback` 的返回。 */
+export interface ModelFallbackView {
+  scope: string;
+  enabled: boolean;
+  chains: FallbackChainView[];
+  /** 生效上限（含主模型共 `max_targets + 1` 跳）。 */
+  max_targets: number;
+  /** 基线触发条件：卡片上**只标注超出这部分**的增量。 */
+  baseline: FallbackTrigger[];
+  /** 最近的降级事件（新的在前）。只有最近 N 条，**不是统计口径**。 */
+  events: FallbackEvent[];
+}
+
+/** 保存时的提交形状（与后端 `ScopeFallback` 一致）。 */
+/**
+ * 一个备选目标：**哪个作用域**的**哪个模型**。
+ *
+ * `scope` 省略 / `null` = 与入口同作用域（绝大多数情况）。
+ * 显式指定时可以跨区域（`wb-cn` → `wb-global`）—— 同平台跨区域在 WB 中继里
+ * 靠「换 region」实现，协议一致；跨平台（`wb-cn` → `trae-cn`）暂不支持执行，
+ * 卡片会按 `scope` 标注。
+ */
+export interface FallbackTargetInput {
+  scope?: string | null;
+  model: string;
+}
+
+export interface ScopeFallbackConfig {
+  enabled: boolean;
+  chains: Record<
+    string,
+    { targets: FallbackTargetInput[]; triggers: FallbackTrigger[]; enabled: boolean }
+  >;
+}
+
+/** 某个本地日的降级计数。 */
+export interface FallbackDayCount {
+  date: string;
+  degraded: number;
+  failed: number;
+}
+
+/**
+ * 近 N 天的降级统计（来自**落盘账本**，不是环形缓冲）。
+ *
+ * `total` 只统计 `degraded` + `failed` —— `blocked`（按规则没降级）不进分母，
+ * 否则「成功率」会把压根没降级的事故算进去。
+ */
+export interface FallbackStats {
+  scope: string;
+  days: FallbackDayCount[];
+  total: { degraded: number; failed: number };
+}
+
+/** 预演的一步。 */
+export interface FallbackPreviewStep {
+  model: string;
+  role: "primary" | "target";
+  action: "try" | "skip_disabled" | "skip_gated";
+  gated_for_secs: number | null;
+}
+
+/** `preview_model_fallback` 的返回（纯计算，零副作用）。 */
+export interface FallbackPreview {
+  ok: boolean;
+  scope: string;
+  steps: FallbackPreviewStep[];
+}
+
 /**
  * 网关运行状态（gateway_status 返回，规范形状）。
  * 后端原始字段（GatewayStatusView，snake_case）经 `normalizeGatewayStatus` 归一化后填充：
@@ -1748,6 +1889,15 @@ export interface GatewayPoolAccount {
       untilMs: number;
       /** 上游声明的重置时刻（ms）；`0` = 上游没给。 */
       resetAtMs: number;
+      /**
+       * 上游**文案**里声明的重置时刻（ms）；`0` = 未声明。
+       *
+       * 与 `resetAtMs` 的区别：后者在「上游没给结构化墙钟」时会被本仓算出的兜底值
+       * 覆盖（`fallback === true` 就是那种情况），所以它回答不了「上游说几点恢复」。
+       * 本字段只来自文案解析，**不参与冷却计算** —— 徽标优先显示它
+       * （「上游称 16:26 重置」），否则显示兜底时刻（「约 11:12 重试」）。
+       */
+      upstreamResetAtMs: number;
       /** 由 `resetAtMs === 0` 推出：`true` = 本仓兜底时长，不是上游说的。 */
       fallback: boolean;
       reason: string;

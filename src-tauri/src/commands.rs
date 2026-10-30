@@ -10,9 +10,9 @@ use std::sync::Mutex;
 use buddy_switch_core::modules::{
     account, app_prefs, auth_file, backup, cache, capability, checkin, client_limits,
     client_settings, codebuddy_cli, config, credit_usage, credits, diagnostics, export_import,
-    migrate, oauth, process, programs, qoder, refresh, region::Region, region::RegionFilter,
-    rotate, runtime_log, session, skill, switch, token_daily, token_stats, trae, travel, update,
-    vscode_session,
+    gateway_ledger, migrate, oauth, process, programs, qoder, refresh, region::Region,
+    region::RegionFilter, rotate, runtime_log, session, skill, switch, token_daily, token_stats,
+    trae, travel, update, vscode_session,
 };
 use tauri::{Emitter, Manager};
 // P5 §2.5 第 (2) 条：capability **默认拒绝**。表数据只在 core（`product_spec`），本文件只查表。
@@ -1990,7 +1990,7 @@ pub async fn get_gateway_token_trend(region: Option<String>) -> Result<Value, St
         .map_err(|error| format!("读取网关用量趋势失败: {error}"))
 }
 
-/// 网关**三维度**逐日历史（模型 / 账号 / 端点）—— 用量页「账本」视图的数据源。
+/// 网关**四维度**逐日历史（密钥 / 模型 / 账号 / 端点）—— 用量页「账本」视图的数据源。
 ///
 /// 三条维度由同一次聚合产出、共用同一水位线 ⇒「按模型合计 = 按账号合计 = 按端点合计 = 网关卡」。
 /// ⚠️ 只读：不扫盘、不触发记录；`days` 只含落库日（缺日 = 未记录，不是 0）。
@@ -2000,6 +2000,38 @@ pub async fn get_gateway_usage_dim(region: Option<String>) -> Result<Value, Stri
     tauri::async_runtime::spawn_blocking(move || token_daily::gateway_usage_dim(region))
         .await
         .map_err(|error| format!("读取网关维度用量失败: {error}"))
+}
+
+/// 网关**四维度**逐日历史（Trae / Qoder）—— 用量页「账本」视图的数据源。
+///
+/// 与上面 WB 的 [`get_gateway_usage_dim`] **返回体逐字段同形**（`days[].keys /
+/// models / accounts / endpoints`），前端因此复用同一个 `GatewayUsageDim` 类型与拆分函数。
+/// 数据来自 [`gateway_ledger`]（90 天落库，后台周期增量记录）。
+///
+/// `scope` 取 `cn` / `global` / `unlabeled` / `all`（缺省 `all`）：
+/// **合并放在后端**做 —— Trae 有三档（未标注的旧日志单列一档），前端逐档取三次
+/// 再递归合并容易漏一档。
+///
+/// ⚠️ 只读：不扫盘、不触发记录；`days` 只含落库日（缺日 = 未记录，不是 0）。
+#[tauri::command]
+pub async fn get_trae_gateway_usage_dim(scope: Option<String>) -> Result<Value, String> {
+    let scope = scope.unwrap_or_else(|| "all".to_string());
+    tauri::async_runtime::spawn_blocking(move || {
+        gateway_ledger::usage_dim(gateway_ledger::LedgerProduct::Trae, &scope)
+    })
+    .await
+    .map_err(|error| format!("读取 Trae 网关账本失败: {error}"))
+}
+
+/// 网关**四维度**逐日历史（Qoder）。语义与 [`get_trae_gateway_usage_dim`] 完全一致。
+#[tauri::command]
+pub async fn get_qoder_gateway_usage_dim(scope: Option<String>) -> Result<Value, String> {
+    let scope = scope.unwrap_or_else(|| "all".to_string());
+    tauri::async_runtime::spawn_blocking(move || {
+        gateway_ledger::usage_dim(gateway_ledger::LedgerProduct::Qoder, &scope)
+    })
+    .await
+    .map_err(|error| format!("读取 Qoder 网关账本失败: {error}"))
 }
 
 /// 今日**客户端 ↔ 网关对账**（只读；匹配算法在 `modules::reconcile`）。
@@ -3124,6 +3156,119 @@ pub async fn set_model_disabled(
     }))
 }
 
+/* ══════════════════════ 模型降级链（P13）══════════════════════
+三个命令的分工：`get` 读视图、`save` 写配置、`preview` **纯计算**。
+
+★ `preview` 必须**零副作用**：它读闸门与禁用表，但绝不写、绝不领探针票。
+  「点一下预览就把闸门弄乱了」是灾难 —— 用户只是想看看会发生什么。
+★ 配置存**独立文件**（`gateway_model_fallback.json`），不进 `GatewayConfig`、
+  更不进 `Pool.config` —— 后者的 `config` 在 `GatewayState::new` 时固化，
+  改完必须重启网关才生效，而用户完全看不出来（假开关）。
+  ⇒ 保存后**立即生效**，无需重启。 */
+
+/// 构造某作用域的降级链视图（含备选的**实时**健康态）。
+///
+/// 状态点读的是闸门与禁用表**当下**的值（与账号池同源），不是配置快照 ——
+/// 否则卡片上的点会在闸门暂停时仍然亮着，比不显示更糟。
+async fn fallback_view(scope: buddy_switch_core::modules::product::Scope) -> Result<Value, String> {
+    let state = gateway::shared_state();
+    let fb = state.fallback.read().await.clone();
+    let disabled = state.disabled.read().await.clone();
+    let gates: Vec<(String, i64)> = {
+        let pool = state.pool.read().await;
+        pool.model_gates()
+            .iter()
+            .map(|gate| (gate.model.clone(), gate.until_ms))
+            .collect()
+    };
+    let refs: Vec<(&str, i64)> = gates
+        .iter()
+        .map(|(model, until)| (model.as_str(), *until))
+        .collect();
+    let view = buddy_switch_gateway::model_fallback::build_view(
+        &fb,
+        &disabled,
+        scope,
+        &state.catalogs,
+        &refs,
+        buddy_switch_gateway::timeutil::now_ms(),
+    );
+    serde_json::to_value(view).map_err(|error| error.to_string())
+}
+
+/// GET /api/gateway/model-fallback —— 某作用域的降级链。
+#[tauri::command]
+pub async fn get_model_fallback(scope: String) -> Result<Value, String> {
+    let scope = resolve_scope_param(Some(&scope))?;
+    fallback_view(scope).await
+}
+
+/// POST /api/gateway/model-fallback —— 保存某作用域的降级链（**立即生效**）。
+#[tauri::command]
+pub async fn save_model_fallback(scope: String, config: Value) -> Result<Value, String> {
+    require_capability(Product::Workbuddy, capability::Capability::Gateway)?;
+    let scope = resolve_scope_param(Some(&scope))?;
+    let parsed: buddy_switch_gateway::model_fallback::ScopeFallback =
+        serde_json::from_value(config).map_err(|error| format!("降级链格式错误: {error}"))?;
+
+    // 规范化：**在写盘之前**把脏值挡掉（丢掉空 from、剔除与主模型同名的 target、
+    // 去重后截断到上限）。逻辑在 gateway crate 里，与 WebUI 那条路**共用同一份**。
+    let normalized = buddy_switch_gateway::model_fallback::normalize(parsed);
+
+    let store = buddy_switch_gateway::model_fallback::shared();
+    {
+        let mut guard = store.write().await;
+        guard.set_scope(scope, normalized);
+        // 写失败必须回传：否则用户以为保存了，重启后配置又变回去。
+        guard.save()?;
+    }
+    fallback_view(scope).await
+}
+
+/// GET /api/gateway/fallback-stats —— 某作用域近 `days` 天的降级统计。
+///
+/// 读的是**落盘账本**（`token_daily::fallback_days`），不是进程内环形缓冲 ——
+/// 「近 7 天降级了多少次」只能来自逐日计数（环形缓冲只覆盖最近几十秒）。
+#[tauri::command]
+pub async fn get_fallback_stats(scope: String, days: u32) -> Result<Value, String> {
+    let scope = resolve_scope_param(Some(&scope))?;
+    Ok(buddy_switch_gateway::model_fallback::stats_payload(
+        scope, days,
+    ))
+}
+
+/// POST /api/gateway/model-fallback/preview —— 保存前**预演**一次降级路径。
+///
+/// **纯计算，零副作用**：只读闸门 / 禁用表，不写、不领探针票、不发上游请求。
+/// 前端用它做「模拟路径」，让用户不必先保存再等一次真实失败。
+#[tauri::command]
+pub async fn preview_model_fallback(
+    scope: String,
+    from: String,
+    targets: Vec<String>,
+) -> Result<Value, String> {
+    let scope = resolve_scope_param(Some(&scope))?;
+    let state = gateway::shared_state();
+    let now = buddy_switch_gateway::timeutil::now_ms();
+    let disabled = state.disabled.read().await.clone();
+    let gates: Vec<(String, i64)> = {
+        let pool = state.pool.read().await;
+        pool.model_gates()
+            .iter()
+            .map(|gate| (gate.model.clone(), gate.until_ms))
+            .collect()
+    };
+    let refs: Vec<(&str, i64)> = gates
+        .iter()
+        .map(|(model, until)| (model.as_str(), *until))
+        .collect();
+    // 预演逻辑收在 gateway crate：与 WebUI 那条路**共用同一份** ——
+    // 两处各写一份时，两个管理面迟早给出不同的模拟结果。
+    Ok(buddy_switch_gateway::model_fallback::preview_payload(
+        scope, &from, &targets, &disabled, &refs, now,
+    ))
+}
+
 /// GET /api/gateway/model-image-caps —— 某**作用域**被用户手动指定的图片能力覆盖（issue #101）。
 ///
 /// 形状 `{ scope, caps: { "<模型 id>": true|false } }`：**缺失的键 = 跟随上游**（不是「不支持」）。
@@ -3434,6 +3579,150 @@ pub async fn get_trae_token_statistics(days: Option<i64>, scope: Option<String>)
         Ok(value) => value,
         Err(error) => json!({ "error": format!("统计 Token 用量失败: {error}") }),
     }
+}
+
+/// POST /api/trae/client-import/unlock —— 用口令把**加密库**导出成明文副本。
+///
+/// 这是「内置解密」的唯一入口：口令由用户输入，本工具不内置任何提取手段
+/// （口令在 Trae 的 native 进程里，磁盘上没有副本 —— 见 `buddy-switch-vault` 的模块头）。
+///
+/// 三种结果必须分开：
+/// - `mode: "decrypted"` —— 口令对，已导出到固定落点并设为当前数据源；
+/// - `mode: "plaintext"` —— 用户给的本来就是明文库（**不**做无谓的解密与复制）；
+/// - `error` —— 口令错 / 不是 SQLite / 文件不存在，各自带稳定 `code`。
+#[tauri::command]
+pub async fn unlock_trae_client_db(path: String, passphrase: String) -> Value {
+    tauri::async_runtime::spawn_blocking(move || {
+        let source = std::path::PathBuf::from(path.trim());
+        let plain = trae::client_import::plaintext_path();
+        let target = plain.to_string_lossy().to_string();
+
+        match buddy_switch_vault::verify(&source, &passphrase) {
+            Ok(info) => {
+                if let Err(error) =
+                    buddy_switch_vault::export_plaintext(&source, &passphrase, &plain)
+                {
+                    return json!({
+                        "ok": false,
+                        "error": { "code": error.code(), "message": error.message() },
+                    });
+                }
+                let saved = trae::client_import::save_config(&target);
+                json!({
+                    "ok": saved,
+                    "mode": "decrypted",
+                    "compatibility": info.compatibility,
+                    "tables": info.tables,
+                    "path": target,
+                    "probe": trae::client_import::probe(&target),
+                })
+            }
+            // 已经是明文：直接用它，不复制、不覆盖。
+            Err(buddy_switch_vault::VaultError::AlreadyPlaintext) => {
+                let source_text = source.to_string_lossy().to_string();
+                let saved = trae::client_import::save_config(&source_text);
+                json!({
+                    "ok": saved,
+                    "mode": "plaintext",
+                    "path": source_text,
+                    "probe": trae::client_import::probe(&source_text),
+                })
+            }
+            Err(error) => json!({
+                "ok": false,
+                "error": { "code": error.code(), "message": error.message() },
+            }),
+        }
+    })
+    .await
+    .unwrap_or_else(|error| {
+        json!({
+            "ok": false,
+            "error": { "code": "io", "message": format!("解锁失败: {error}") },
+        })
+    })
+}
+
+/// GET /api/trae/client-import/probe —— 探测一个**用户自己导出的明文库**能否读。
+///
+/// 只探测、不保存配置（前端「校验」按钮用）。返回体里的 `error.code` 决定界面文案：
+/// 五种错误必须分开显示 —— 「还没指定」「文件是加密的」「认不出结构」「没有用量字段」
+/// 「IO 失败」是五件不同的事，混成一个「读取失败」会让用户无从下手。
+#[tauri::command]
+pub async fn probe_trae_client_db(path: String) -> Value {
+    match tauri::async_runtime::spawn_blocking(move || trae::client_import::probe(&path)).await {
+        Ok(value) => value,
+        Err(error) => json!({
+            "ok": false,
+            "path": "",
+            "error": { "code": "io", "message": format!("探测失败: {error}") },
+            "tables": [],
+        }),
+    }
+}
+
+/// GET /api/trae/client-usage —— 客户端账本（读导入的明文库）。
+///
+/// `path` 缺省时用已保存的路径；两者都没有 ⇒ `{ configured: false }`（**不是空统计**：
+/// 「没导入」与「导入了但这段没用量」必须能分开）。
+#[tauri::command]
+pub async fn get_trae_client_token_stats(
+    path: Option<String>,
+    days: Option<i64>,
+    scope: Option<String>,
+) -> Value {
+    match tauri::async_runtime::spawn_blocking(move || {
+        let scope = scope
+            .as_deref()
+            .map(trae::token_stats::TraeTokenScope::parse)
+            .unwrap_or_default();
+        let target = path
+            .or_else(trae::client_import::configured_path)
+            .unwrap_or_default();
+        if target.trim().is_empty() {
+            return json!({ "source": "trae-client", "configured": false });
+        }
+        trae::client_import::summarize(&target, days, scope)
+    })
+    .await
+    {
+        Ok(value) => value,
+        Err(error) => json!({
+            "source": "trae-client",
+            "error": { "code": "io", "message": format!("读取客户端账本失败: {error}") },
+        }),
+    }
+}
+
+/// GET /api/trae/client-import/config —— 已保存的导入路径与「文件还在不在」。
+#[tauri::command]
+pub async fn get_trae_client_db_config() -> Value {
+    tauri::async_runtime::spawn_blocking(|| {
+        let path = trae::client_import::configured_path();
+        let exists = path
+            .as_deref()
+            .map(|target| std::path::Path::new(target).is_file())
+            .unwrap_or(false);
+        json!({ "path": path, "exists": exists })
+    })
+    .await
+    .unwrap_or_else(|error| json!({ "path": null, "exists": false, "error": error.to_string() }))
+}
+
+/// POST /api/trae/client-import/path —— 保存 / 清除导入路径（`path = null` 即清除）。
+#[tauri::command]
+pub async fn save_trae_client_db_path(path: Option<String>) -> Value {
+    tauri::async_runtime::spawn_blocking(move || {
+        let saved = match path.as_deref().map(str::trim) {
+            Some(target) if !target.is_empty() => {
+                json!({ "ok": trae::client_import::save_config(target), "path": target })
+            }
+            _ => json!({ "ok": trae::client_import::clear_config(), "path": Value::Null }),
+        };
+        saved
+    })
+    .await
+    .unwrap_or_else(|error| json!({ "ok": false, "path": null, "error": error.to_string() }))
 }
 
 /// GET /api/trae/logs —— 运行日志（系统日志页的「运行日志」标签页）。

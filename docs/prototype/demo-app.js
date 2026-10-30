@@ -56,6 +56,12 @@ const state = {
   gwSub: "overview",
   gwApi: "openai",      // 快速接入的协议 Tab：openai / anthropic
   gwScanning: false,    // 模型清单「识别中」（§3.17）
+  /* 模型降级链（P13）：`fbDraft` = 抽屉里正在编辑的草稿；`fbEvents` = 流水是否展开。
+     ★ 草稿与已存配置**分开**：抽屉里改了没保存就关掉，不能污染配置。
+     ★ 重开抽屉时必须**保留**已有草稿（切触发条件 / 换备选都要重开刷新），
+       从配置重建会把用户刚做的改动冲掉 —— 见 `openFbDrawer` 的 `same` 判断。 */
+  fbDraft: null,
+  fbEvents: false,
   /* Trae 上下文策略（Max Mode）：always = 支持表内模型始终注入 is_max_mode；off = 回到上游默认窗口。
      Max Mode 是**请求级开关**，不是模型 —— 所以清单里一个模型只有一条记录，没有 `-max` 影子 id。 */
   maxMode: "always",
@@ -2193,6 +2199,322 @@ function contextCell(model) {
   return `<span class="badge">${fmtWindow(max)}</span> <span class="tiny muted">已是上限</span>`;
 }
 
+/* ══════════════════════ 模型降级链（P13）══════════════════════
+   主模型在上游**明确失败**时，按序改用备选模型重发一次。
+
+   ## 为什么它是「模型」分区里的一张卡，而不是第 7 个分区
+   新增分区要同时改 `GW_SECTIONS`、三个网关页的接线、以及
+   `scripts/check-scope-registry.cjs` 的断言 —— 四处联动、漏一处 build 就红。
+   而「降级链」与「模型清单」本来就是同一组东西：清单说有哪些模型，
+   降级链说它们挂了怎么办。放一起，用户能看着清单直接配。
+
+   ## 状态点为什么是**派生**的，不是写死的
+   `fbStateOf` 从 `modelGate` / `pool[].modelCool` / `disabled` / `available` 现算，
+   与账号池那张表读同一份数据。写死的绿点会在闸门暂停时仍然亮着 ——
+   那比不显示更糟：用户以为有保护，实际降级到一个同样不可用的模型。
+   这也遵守原型的一条老纪律：**卡片里不手写任何数字或状态**。
+
+   ## 三条不能破的边界
+   ① `triggers` 是**白名单**：参数错 / 内容审核 / 402 / Key 配额 永不在表里；
+   ② 已开始向客户端输出的流**不回退**（物理限制，不是策略）；
+   ③ 备选只在本作用域内选 —— 跨作用域是统一网关命名空间的职责。 */
+
+/** 可勾选的触发条件（顺序即展示顺序：先「默认开」后「需谨慎」）。 */
+const FB_TRIGGERS = [
+  ["gate", "模型闸门暂停", "该模型近期在多个账号上失败、已被网关整体暂停。零成本直接跳下一跳。"],
+  ["rate", "模型级限流（6004）", "上游明确表示是这个模型被限，换号无用。"],
+  ["blocked", "模型被封禁（11102）", "上游对该模型返回封禁；短时间不会恢复。"],
+  ["server", "上游 5xx", "服务端故障。开启后故障期间流量会涌向备选，可能把备选也打挂。"],
+  ["timeout", "请求超时", "超过 600s 未响应。开启后长任务可能被重复计费。"],
+];
+
+/** **固定不降级**的四类。放在抽屉里显式列出 —— 让用户看见「什么不会降级」比让他猜更重要。 */
+const FB_NEVER = [
+  ["参数错误 4xx", "换模型救不了，只会把同一个错误翻译成更陌生的模型名"],
+  ["内容审核拒绝", "换模型等于换一套审核尺度 —— 效果上就是帮调用方绕过审核"],
+  ["402 余额不足", "账号额度问题，换模型同样 402"],
+  ["Key 配额用尽", "按 Key 计量，与模型无关"],
+];
+
+const FB_TRIGGER_LABEL = { gate: "闸门", rate: "6004", blocked: "11102", server: "5xx", timeout: "超时" };
+
+/** 基线触发条件（默认全开）。卡片上**只标注超出基线的部分** ——
+    把这三项也画成 tag，每行右侧会堆满同样的三个词，反而看不出「这条链额外开了 5xx」。 */
+const FB_BASELINE = ["gate", "rate", "blocked"];
+
+/** 模型在某作用域内的**实时**状态（派生，不存）。 */
+function fbStateOf(g, name) {
+  const m = (g.models || []).find((x) => x.name === name);
+  if (!m) return { kind: "unknown", label: "不在清单里" };
+  if (m.disabled) return { kind: "disabled", label: "已禁用" };
+  if (!m.available) return { kind: "unavailable", label: "上游不可用" };
+  const gate = g.modelGate;
+  if (gate && gate.model === name && gate.phase === "paused")
+    return { kind: "gated", label: `闸门暂停 · 剩 ${gate.remain}s`, remain: gate.remain, accounts: gate.accounts };
+  const cool = (g.pool || []).flatMap((a) => a.modelCool || []).find((c) => c.model === name);
+  if (cool) return { kind: "cooling", label: `账号冷却 · 剩 ${cool.remain}s` };
+  return { kind: "ok", label: "可用" };
+}
+
+/** 状态 → 圆点档位。`gated`/`cooling` 是**黄**（暂时不可用），`disabled`/`unavailable` 是**灰**。 */
+function fbDotCls(kind) {
+  if (kind === "ok") return "ok";
+  if (kind === "gated" || kind === "cooling") return "warn";
+  return "off";
+}
+
+/** 目标模型**接不住**主模型请求的哪一项能力。返回 `null` = 无冲突。 */
+function fbCapWarn(g, from, target) {
+  const a = (g.models || []).find((x) => x.name === from);
+  const b = (g.models || []).find((x) => x.name === target);
+  if (!a || !b) return null;
+  const CN = { tools: "工具调用", vision: "图片输入", json: "结构化输出" };
+  const lost = (a.caps || []).filter((c) => !(b.caps || []).includes(c));
+  return lost.length ? lost.map((c) => CN[c] || c).join(" / ") : null;
+}
+
+/** 一条链的诊断（可以有**多条**：闸门中 + 能力不匹配同时成立是常见情形）。 */
+function fbDiags(g, chain) {
+  const out = [];
+  chain.targets.forEach((t, i) => {
+    const st = fbStateOf(g, t);
+    if (st.kind === "gated")
+      /* 不写 `（${st.label}）`：label 本身已含「闸门暂停」，会变成「正在闸门暂停中（闸门暂停 · 剩 42s）」。 */
+      out.push(["warn", `第 ${i + 1} 跳 <b>${esc(t)}</b> 正在闸门暂停中（${st.accounts} 个账号先后失败，剩 ${st.remain}s）。期间该链会直接跳到下一跳；若都不行，返回原始错误，不会无限等待。`]);
+    else if (st.kind === "cooling")
+      out.push(["warn", `第 ${i + 1} 跳 <b>${esc(t)}</b> 有账号在冷却（${st.label}），仍可能命中其它健康账号。`]);
+    else if (st.kind === "disabled" || st.kind === "unavailable")
+      out.push(["warn", `第 ${i + 1} 跳 <b>${esc(t)}</b> ${st.kind === "disabled" ? "已被禁用" : "上游不可用"}，该跳会被跳过。`]);
+    const cap = fbCapWarn(g, chain.from, t);
+    if (cap)
+      out.push(["warn", `<b>${esc(t)}</b> 不支持${cap}，而主模型支持。带这类内容的请求<b>不会</b>降级到它 —— 网关会跳过这一跳继续下一个，而不是发出一个必然失败的请求。`]);
+  });
+  return out;
+}
+
+/** 降级链卡片（模型分区，位于上下文策略卡与清单来源条之间）。 */
+function fallbackCard(g) {
+  const fb = g.fallback || { enabled: false, chains: [], events: [] };
+  const on = fb.enabled && fb.chains.some((c) => c.enabled);
+  const active = fb.chains.filter((c) => c.enabled).length;
+
+  const badge = !fb.chains.length ? `<span class="badge">未配置</span>`
+    : fb.enabled ? `<span class="badge ok">已启用 · ${active} 条</span>`
+    : `<span class="badge">已关闭</span>`;
+
+  const head = `<div class="card-head">
+    <h3>模型降级链</h3>${badge}
+    <div class="grow"></div>
+    <span class="tiny muted">同作用域 · 最多 2 跳</span>
+    <button class="btn sm ghost" data-act="fb-events">${state.fbEvents ? "收起流水" : "降级流水"}</button>
+  </div>`;
+
+  /* 恒定明示：这两句必须一直在，不能塞进 tooltip ——
+     「会不会偷偷换模型」是这个功能最需要被回答的疑问。 */
+  const notice = `<div style="padding:12px 16px 0">
+    <p class="tiny muted" style="margin:0;line-height:1.7">
+      仅在上游<b>明确失败</b>时触发。已开始向客户端输出的流<b>不会回退</b>，也不会把失败改写成成功 ——
+      客户端可通过响应头 <span class="mono">X-Buddy-Fallback-To</span> 得知实际使用的模型。
+    </p>
+  </div>`;
+
+  const bar = `<div class="row" style="gap:10px;padding:12px 16px;border-bottom:1px dashed var(--border)">
+    <button class="switch${fb.enabled ? " on" : ""}" data-act="fb-toggle" aria-label="启用降级"></button>
+    <div class="lab" style="flex:1;min-width:0">
+      <b style="display:block;font-size:12.5px;font-weight:550">启用降级</b>
+      <span class="tiny muted">关掉后配置保留，但一次都不触发</span>
+    </div>
+    <button class="btn sm" data-act="fb-new">${ICON.plus}新建降级链</button>
+  </div>`;
+
+  const rows = fb.chains.map((c) => {
+    const src = fbStateOf(g, c.from);
+    const targets = c.targets.map((t, i) => {
+      const st = fbStateOf(g, t);
+      return `${i ? `<span class="fb-sep">›</span>` : ""}
+        <span class="fb-model" title="${esc(st.label)}"><i class="fb-dot ${fbDotCls(st.kind)}"></i><span class="nm">${esc(t)}</span></span>`;
+    }).join("");
+    const extra = c.triggers.filter((k) => !FB_BASELINE.includes(k));
+    const tags = extra.map((k) => `<span class="fb-tag">+${FB_TRIGGER_LABEL[k] || esc(k)}</span>`).join("");
+    const tagTitle = `触发条件：${c.triggers.map((k) => FB_TRIGGER_LABEL[k] || k).join(" / ")}`;
+    const diags = fbDiags(g, c).map(([cls, text]) =>
+      `<div class="fb-diag ${cls}">${ICON.warn}<span>${text}</span></div>`).join("");
+    return `<div class="fb-chain${c.enabled ? "" : " is-off"}">
+      <span class="fb-model src" title="${esc(src.label)}"><i class="fb-dot ${fbDotCls(src.kind)}"></i><span class="nm">${esc(c.from)}</span></span>
+      <span class="fb-arrow">→</span>
+      <div class="fb-targets">${targets}${c.targets.length < 2
+        ? `<button class="fb-add" data-act="fb-edit|${esc(c.from)}">+ 备选</button>` : ""}</div>
+      <div class="fb-side">
+        ${c.enabled ? `<div class="fb-tags" title="${esc(tagTitle)}">${tags}</div>` : `<span class="badge">已停用</span>`}
+        <button class="btn ghost xs" data-act="fb-chain-toggle|${esc(c.from)}" title="${c.enabled ? "停用这条链" : "启用这条链"}">
+          ${c.enabled ? "停用" : "启用"}</button>
+        <button class="btn ghost xs" data-act="fb-edit|${esc(c.from)}" title="编辑">${ICON.more}</button>
+      </div>
+      ${diags}
+    </div>`;
+  }).join("");
+
+  const empty = `<div class="empty" style="padding:34px 20px 36px">
+    <div class="ico">${ICON.arrowRight}</div>
+    <b>还没有降级链</b>
+    <p>当某个模型在上游明确失败（整体限流、被封禁、5xx）时，网关可以自动改用你指定的备用模型重发一次，
+       而不是把错误直接抛给客户端。默认关闭，配置后才生效。</p>
+    <button class="btn primary" data-act="fb-new">${ICON.plus}新建降级链</button>
+  </div>`;
+
+  const events = state.fbEvents ? fbEventsHtml(fb) : "";
+
+  return `<section class="card" style="margin-bottom:16px">
+    ${head}${notice}${bar}
+    ${fb.chains.length ? `<div class="fb-list">${rows}</div>
+      <p class="tiny muted" style="margin:0;padding:10px 16px 12px;line-height:1.7">
+        状态点读的是<b>实时</b>闸门与冷却（与账号池同源），不是配置快照。降级成功后主模型的闸门<b>不解除</b> ——
+        它确实失败了；闸门到期后请求自然回到主模型，无需「回切」开关。
+      </p>` : empty}
+    ${events}
+  </section>`;
+}
+
+/** 降级流水（最近 N 条）。**不做任何比率** —— 请求日志是环形缓冲，按窗口聚合必错。 */
+function fbEventsHtml(fb) {
+  const rows = (fb.events || []).map((e) => {
+    const path = e.path.length
+      ? `<span class="muted">${esc(e.from)}</span> → <b>${e.path.map(esc).join("</b> → <b>")}</b>`
+      : `<span class="muted">${esc(e.from)}</span> <span class="muted">→ —</span>`;
+    const res = e.result === "degraded" ? `<span class="badge ok">已降级</span>`
+      : e.result === "failed" ? `<span class="badge bad">备选也失败</span>`
+      : `<span class="badge">按规则不降级</span>`;
+    return `<tr>
+      <td class="mono muted nowrap">${esc(e.time)}</td>
+      <td class="mono">${path}</td>
+      <td><span class="badge ${e.result === "blocked" ? "" : "warn"}">${esc(e.reasonText)}</span></td>
+      <td class="tiny muted">${esc(e.account)}</td>
+      <td class="num">${(e.ms / 1000).toFixed(1)}s</td>
+      <td>${res}</td>
+    </tr>`;
+  }).join("");
+  return `<div style="border-top:1px solid var(--border)">
+    <div class="tbl-wrap"><table class="tbl">
+      <thead><tr><th>时间</th><th>实际路径</th><th>触发原因</th><th>账号</th><th>耗时</th><th>结果</th></tr></thead>
+      <tbody>${rows}</tbody></table></div>
+    <p class="tiny muted" style="margin:0;padding:10px 16px 12px;line-height:1.7">
+      只有最近 <b>${(fb.events || []).length}</b> 条，且<b>不参与任何统计口径</b>：请求日志是环形缓冲（默认 200 条），
+      繁忙时只覆盖十几分钟。需要「近 7 天降级率」时必须从账本另开一个维度，不能拿这张表算。
+    </p>
+  </div>`;
+}
+
+/* ── 编辑抽屉 ──
+   用抽屉而不是弹窗：原型里「改一份带多组的配置」一律走右侧抽屉（Key 权限、CLI 接入同款），
+   弹窗只留给「确认一个动作」。这里要选模型、排顺序、勾条件、看预演，属前者。 */
+function fbDrawerHtml(g) {
+  const d = state.fbDraft;
+  /* 按名字去重：同一模型在清单里可能有「国内版 / 国际版」两条记录（跨区目录），
+     下拉里出现两个一模一样的选项会让人以为是两回事。 */
+  const pool = [...new Map((g.models || [])
+    .filter((m) => !m.disabled && m.available)
+    .map((m) => [m.name, m])).values()];
+  const opt = (sel, withEmpty) => `${withEmpty ? `<option value="">选择模型…</option>` : ""}${pool
+    .map((m) => `<option value="${esc(m.name)}"${m.name === sel ? " selected" : ""}>${esc(m.name)}</option>`).join("")}`;
+
+  const fromPart = `<div class="dsec">
+    <h4>主模型</h4>
+    ${d.isNew
+      ? `<div class="fb-slot"><select class="inp" data-fb-from>${opt(d.from, true)}</select></div>
+         <p class="tiny muted" style="margin:0">一条链只对应一个主模型；同一主模型不允许配置两条链。</p>`
+      : `<div class="fb-slot"><select class="inp" disabled><option>${esc(d.from)}</option></select></div>
+         <p class="tiny muted" style="margin:0">主模型不可改。要换主模型请删掉这条链重配 —— 改 from 等于换了一条链。</p>`}
+  </div>`;
+
+  const targetPart = `<div class="dsec">
+    <h4>备选模型（按顺序尝试）</h4>
+    ${[0, 1].map((i) => `<div class="fb-slot">
+      <span class="i">${i + 1}</span>
+      <select class="inp" data-fb-slot="${i}">${opt(d.targets[i] || "", true)}</select>
+      <button class="btn xs" data-act="fb-move|${i}|up"${i === 0 ? " disabled" : ""} title="上移">↑</button>
+      <button class="btn xs" data-act="fb-move|${i}|down"${i === 1 ? " disabled" : ""} title="下移">↓</button>
+    </div>`).join("")}
+    <p class="tiny muted" style="margin:0">最多 2 个（含主模型共 3 跳）。已禁用 / 上游不可用的模型不会出现在这里。</p>
+  </div>`;
+
+  const triggerPart = `<div class="dsec">
+    <h4>触发条件</h4>
+    ${FB_TRIGGERS.map(([k, title, desc]) => {
+      const on = d.triggers.includes(k);
+      return `<button class="opt${on ? " on" : ""}" data-act="fb-trigger|${k}">
+        <span class="ico">${ICON.check}</span>
+        <span class="t"><b>${title}</b><span>${desc}</span></span>
+        <span class="badge ${on ? "ok" : ""}">${on ? "开" : "关"}</span>
+      </button>`;
+    }).join("")}
+    <div class="opt is-off" style="cursor:default">
+      <span class="ico">${ICON.shield}</span>
+      <span class="t"><b>固定不降级</b><span>${FB_NEVER
+        /* 用 <span> 而不是 <b>：`.opt .t b` 是 `display:block`，四项加粗会各占一行、竖排成列表。 */
+        .map(([t, why]) => `<span style="color:var(--foreground)">${t}</span>：${why}`).join("；")}。</span></span>
+    </div>
+  </div>`;
+
+  return fromPart + targetPart + triggerPart + fbSimHtml(g);
+}
+
+/** 模拟路径：**纵向时序**。560px 抽屉里横向箭头链必然折行，折完就看不出顺序了。 */
+function fbSimHtml(g) {
+  const d = state.fbDraft;
+  if (!d.from) return `<div class="fb-sim"><div class="h">模拟路径</div>
+    <p class="tiny muted" style="margin:6px 0 0">先选主模型。</p></div>`;
+  const steps = [[d.from, "主模型", fbStateOf(g, d.from)]];
+  d.targets.filter(Boolean).forEach((t, i) => steps.push([t, `备选 ${i + 1}`, fbStateOf(g, t)]));
+
+  const html = steps.map(([name, role, st], i) => {
+    /* 每一跳会怎么走：主模型本身不看状态（它总是先试），备选看状态决定「跳过 / 会用」。 */
+    let cls = "", txt = "可用 → 会用";
+    if (i > 0) {
+      if (st.kind === "gated") { cls = "warn"; txt = "仍在暂停 → 跳过，不发请求"; }
+      else if (st.kind === "cooling") { cls = "warn"; txt = "部分账号冷却 → 仍会试"; }
+      else if (st.kind === "disabled" || st.kind === "unavailable") { cls = "warn"; txt = "不可用 → 跳过"; }
+      else { cls = "ok"; txt = "可用 → 本次会用它"; }
+    } else {
+      cls = "warn"; txt = st.kind === "ok" ? "先试它" : `${st.label}`;
+    }
+    return `<div class="fb-step"><span class="n">${i + 1}</span><span class="m">${esc(name)}</span>
+      <span class="r">${role}</span><span class="s ${cls}">${esc(txt)}</span></div>`;
+  }).join("");
+
+  const capWarn = d.targets.filter(Boolean)
+    .map((t) => [t, fbCapWarn(g, d.from, t)]).filter(([, w]) => w);
+  return `<div class="fb-sim">
+    <div class="h">模拟路径 · 按当前闸门与冷却预演</div>
+    ${html}
+    <p class="tiny muted" style="margin:6px 0 0;line-height:1.6">
+      ${capWarn.length
+        ? `${capWarn.map(([t, w]) => `<b>${esc(t)}</b> 缺${w}`).join("、")}：带这类内容的请求会跳过该跳。`
+        : "若所有跳都不可用，返回的是<b>原始错误</b>，不会无限等待，也不会把失败改写成成功。"}
+    </p>
+  </div>`;
+}
+
+/** 打开编辑抽屉。`from` 为空 = 新建。 */
+function openFbDrawer(from) {
+  const g = GATEWAY[state.scope];
+  const fb = g.fallback || (g.fallback = { enabled: true, chains: [], events: [] });
+  const exist = from ? fb.chains.find((c) => c.from === from) : null;
+  /* ★ 已有草稿且编辑的是同一条链 ⇒ **保留草稿**。切触发条件 / 换备选都要重开抽屉来刷新
+     画面（保存按钮可用态、模拟路径都由 draft 派生），若每次都从配置重建，
+     用户刚勾上的条件会被立刻冲掉 —— 这是「点了没反应」的经典成因。 */
+  const same = state.fbDraft && (state.fbDraft.isNew ? !from : state.fbDraft.from === from);
+  if (!same) {
+    state.fbDraft = exist
+      ? { from: exist.from, targets: [...exist.targets], triggers: [...exist.triggers], isNew: false }
+      : { from: "", targets: [], triggers: ["gate", "rate", "blocked"], isNew: true };
+  }
+  state.drawer = { kind: "fallback", from: from || null };
+  const canSave = Boolean(state.fbDraft.from);
+  openDrawer(fbDrawerHtml(g), exist ? `编辑降级链 · ${exist.from}` : "新建降级链",
+    `<button class="btn ghost grow0" data-act="drawer-cancel">取消</button>
+     <button class="btn primary grow0" data-act="fb-save"${canSave ? "" : " disabled"}>保存</button>`);
+}
+
 /* WorkBuddy / Qoder 的只读说明：没有请求级 Max Mode，清单直接按目录声明上限。 */
 function contextFixedCard() {
   const on = state.maxContext;
@@ -3610,7 +3932,10 @@ function viewGateway() {
   } else if (sub === "models") {
     const served = g.models.filter((m) => m.available && !m.disabled).length;
     const trae = curScope().platform === "trae";
-    main = `${trae ? maxModePolicyCard() : contextFixedCard()}${catalogBar(g.catalog)}
+    /* 降级链卡在「上下文策略」与「清单来源条」之间：
+       前两者都是**策略**（怎么用这批模型），来源条必须紧贴表格（它说的是「这份清单从哪来」）。
+       卡片默认展开 —— 它比下面的长表更需要被看见，用户不必滚到底才想起有这功能。 */
+    main = `${trae ? maxModePolicyCard() : contextFixedCard()}${fallbackCard(g)}${catalogBar(g.catalog)}
     <div class="tbl-wrap"><table class="tbl">
       <thead><tr><th>模型</th><th>协议</th><th>归属</th><th>上下文</th><th>思考档位</th><th>积分倍率</th><th>上游状态</th><th style="width:124px">网关暴露</th></tr></thead>
       <tbody>${g.models.map((m) => `<tr${m.disabled ? ' class="row-off"' : ""}>
@@ -6300,6 +6625,73 @@ document.addEventListener("click", (e) => {
       renderContent(); break;
     }
     case "gw-sub": stop(); state.gwSub = a1; renderContent(); break;
+    /* ── 模型降级链（P13）────────────────────────────────────────────
+       全部动作都作用在 `GATEWAY[state.scope].fallback` 上 —— 与账号池、模型清单同源，
+       不在别处存第二份。`fbDraft` 只是抽屉里的临时态，关掉即丢。 */
+    case "fb-toggle": {
+      stop();
+      const fb = GATEWAY[state.scope].fallback;
+      if (!fb) break;
+      fb.enabled = !fb.enabled;
+      renderContent();
+      toast(fb.enabled ? "ok" : "info", fb.enabled ? "已启用降级" : "已关闭降级",
+        fb.enabled ? "主模型明确失败时会按链改用备选" : "配置保留，但一次都不会触发");
+      break;
+    }
+    case "fb-events": stop(); state.fbEvents = !state.fbEvents; renderContent(); break;
+    case "fb-new": stop(); openFbDrawer(null); break;
+    case "fb-edit": stop(); openFbDrawer(a1); break;
+    case "fb-chain-toggle": {
+      stop();
+      const c = (GATEWAY[state.scope].fallback?.chains || []).find((x) => x.from === a1);
+      if (!c) break;
+      c.enabled = !c.enabled;
+      renderContent();
+      break;
+    }
+    case "fb-trigger": {
+      stop();
+      const t = state.fbDraft.triggers;
+      const i = t.indexOf(a1);
+      if (i >= 0) t.splice(i, 1); else t.push(a1);
+      /* 重开抽屉只刷新画面，草稿由 `openFbDrawer` 的 `same` 判断保住。 */
+      openFbDrawer(state.fbDraft.isNew ? null : state.fbDraft.from);
+      break;
+    }
+    case "fb-move": {
+      stop();
+      const i = Number(a1);
+      const t = state.fbDraft.targets;
+      const j = a2 === "up" ? i - 1 : i + 1;
+      if (j >= 0 && j < t.length) [t[i], t[j]] = [t[j], t[i]];
+      openFbDrawer(state.fbDraft.isNew ? null : state.fbDraft.from);
+      break;
+    }
+    case "fb-save": {
+      stop();
+      const g = GATEWAY[state.scope];
+      const fb = g.fallback || (g.fallback = { enabled: true, chains: [], events: [] });
+      const d = state.fbDraft;
+      if (!d || !d.from) break;
+      const targets = d.targets.filter(Boolean).slice(0, 2);
+      const exist = fb.chains.find((c) => c.from === d.from);
+      if (exist) {
+        exist.targets = targets;
+        exist.triggers = [...d.triggers];
+      } else {
+        fb.chains.push({ from: d.from, targets, triggers: [...d.triggers], enabled: true });
+      }
+      /* 没有任何跳的链等于没配 —— 直接拦下，不写进配置（否则卡片上会出现一条空链）。 */
+      if (!targets.length) {
+        toast("err", "至少选一个备选模型", "只配主模型不构成降级链");
+        break;
+      }
+      state.fbDraft = null;
+      closeDrawer();
+      renderContent();
+      toast("ok", "降级链已保存", "立即生效，无需重启网关");
+      break;
+    }
     case "uni-toggle": {
       stop();
       UNI.enabled = !UNI.enabled;
@@ -7414,6 +7806,22 @@ document.addEventListener("change", (e) => {
   if (!row) return;
   row.value = el.value;
   renderContent();
+});
+
+/* 降级链抽屉里的下拉：主模型与备选都走 change（`select` 不发 click）。
+   改完重开抽屉以刷新「保存」按钮可用态与模拟路径 —— 两处都由 draft 派生。 */
+document.addEventListener("change", (e) => {
+  const el = e.target;
+  if (!el || !el.dataset || !state.fbDraft) return;
+  if (el.dataset.fbFrom !== undefined) {
+    state.fbDraft.from = el.value;
+    openFbDrawer(null);
+  } else if (el.dataset.fbSlot !== undefined) {
+    const i = Number(el.dataset.fbSlot);
+    while (state.fbDraft.targets.length <= i) state.fbDraft.targets.push("");
+    state.fbDraft.targets[i] = el.value;
+    openFbDrawer(state.fbDraft.isNew ? null : state.fbDraft.from);
+  }
 });
 
 /* 确认 Dialog：按钮走 data-act 委托；遮罩点击沿用现有 overlay 模式 */

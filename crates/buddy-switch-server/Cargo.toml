@@ -1,6 +1,6 @@
 [package]
 name = "buddy-switch-server"
-version = "2026.10.271903"
+version = "2026.10.291824"
 edition = "2021"
 description = "buddy-switch HTTP server + CLI（npm 安装形态：buddy-switch 命令启动本地 webui）"
 
@@ -11,6 +11,8 @@ path = "src/main.rs"
 [dependencies]
 buddy-switch-core = { path = "../buddy-switch-core" }
 buddy-switch-gateway = { path = "../buddy-switch-gateway" }
+# SQLCipher 通道（与桌面端同一份实现；feature 并集，见 src-tauri/Cargo.toml 的说明）。
+buddy-switch-vault = { path = "../buddy-switch-vault" }
 axum = "0.7"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 serde_json = "1"

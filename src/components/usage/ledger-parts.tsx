@@ -76,6 +76,15 @@ export function CoverageStrip({
   overlapRows,
   overlapTokens,
   onReconcile,
+  /**
+   * 客户端账本**在本平台不存在**（Trae：没有可解析的客户端用量落盘）。
+   *
+   * 与「客户端是 0」**必须分开**：0 是「测到了、确实没用」，这里是「测不到」。
+   * 传 `true` 时该项显示「不可得」并省掉请求数 —— 写 0 等于把未知说成已知。
+   */
+  clientUnavailable = false,
+  unit = "tokens",
+  showOverlap = true,
   className,
 }: {
   clientTokens: number;
@@ -88,9 +97,21 @@ export function CoverageStrip({
   overlapRows: number;
   overlapTokens: number;
   onReconcile?: () => void;
+  clientUnavailable?: boolean;
+  /** 数值单位。Qoder 两本账都按 **credits** 计 —— 用 token 的 `K/M` 会谎报单位。 */
+  unit?: "tokens" | "credits";
+  /**
+   * 是否显示「两本账重叠」。
+   *
+   * 只有**今日对账**（`get_usage_reconcile`，仅 WorkBuddy 有）能给出这个数。
+   * Trae / Qoder 没有逐条对账 ⇒ 传 `false`，否则会长期显示「重叠 0 条」——
+   * 那是把「没算过」写成「没有重叠」。
+   */
+  showOverlap?: boolean;
   className?: string;
 }) {
   const t = useT();
+  const format = unit === "credits" ? formatCredits : compactTokens;
   return (
     <div
       className={cn(
@@ -103,13 +124,17 @@ export function CoverageStrip({
       <CoverageItem
         color={LEDGER_CLIENT_COLOR}
         label={t("wbStats.usage.coverage.client")}
-        value={compactTokens(clientTokens)}
-        detail={t("wbStats.usage.coverage.requests", { n: exactTokens(clientRequests) })}
+        value={clientUnavailable ? t("wbStats.usage.coverage.unavailable") : format(clientTokens)}
+        detail={
+          clientUnavailable
+            ? undefined
+            : t("wbStats.usage.coverage.requests", { n: exactTokens(clientRequests) })
+        }
       />
       <CoverageItem
         color={LEDGER_GATEWAY_COLOR}
         label={t("wbStats.usage.coverage.gateway")}
-        value={compactTokens(gatewayTokens)}
+        value={format(gatewayTokens)}
         detail={t("wbStats.usage.coverage.requests", { n: exactTokens(gatewayRequests) })}
       />
       {gatewayFailed > 0 ? (
@@ -120,21 +145,23 @@ export function CoverageStrip({
       <span className="text-muted-foreground">
         {t("wbStats.usage.coverage.recorded", { recorded, total: windowDays })}
       </span>
-      <span className="inline-flex items-center gap-1.5 text-muted-foreground">
-        {t("wbStats.usage.coverage.overlap", {
-          n: exactTokens(overlapRows),
-          tokens: compactTokens(overlapTokens),
-        })}
-        {onReconcile ? (
-          <button
-            type="button"
-            onClick={onReconcile}
-            className="cursor-pointer border-b border-dotted border-current text-[color:var(--data-series-indigo)] hover:text-foreground"
-          >
-            {t("wbStats.usage.coverage.seeRecon")}
-          </button>
-        ) : null}
-      </span>
+      {showOverlap ? (
+        <span className="inline-flex items-center gap-1.5 text-muted-foreground">
+          {t("wbStats.usage.coverage.overlap", {
+            n: exactTokens(overlapRows),
+            tokens: format(overlapTokens),
+          })}
+          {onReconcile ? (
+            <button
+              type="button"
+              onClick={onReconcile}
+              className="cursor-pointer border-b border-dotted border-current text-[color:var(--data-series-indigo)] hover:text-foreground"
+            >
+              {t("wbStats.usage.coverage.seeRecon")}
+            </button>
+          ) : null}
+        </span>
+      ) : null}
     </div>
   );
 }
@@ -255,13 +282,22 @@ export function GatewaySourceTables({
   endpoints,
   gatewayTokens,
   gatewayRequests,
+  unit = "tokens",
 }: {
   accounts: { key: string; tokens: number; requests: number }[];
   endpoints: { key: string; requests: number }[];
   gatewayTokens: number;
   gatewayRequests: number;
+  /**
+   * 数值单位。Qoder 的网关账按 **credits** 计（token 计数恒 0），
+   * 用 token 的 `1.2M` 去格式化 credits 会让图注说谎。
+   */
+  unit?: "tokens" | "credits";
 }) {
   const t = useT();
+  const format = unit === "credits" ? formatCredits : compactTokens;
+  const unitColumn =
+    unit === "credits" ? t("wbStats.usage.credits.col") : t("wbStats.usage.models.colTokens");
   const maxAccount = Math.max(1, ...accounts.map((row) => row.tokens));
   const maxEndpoint = Math.max(1, ...endpoints.map((row) => row.requests));
   return (
@@ -281,7 +317,7 @@ export function GatewaySourceTables({
                 <tr className="border-b text-[11px] text-muted-foreground">
                   <th className="px-4 py-2 text-left font-medium">{t("wbStats.usage.sessions.account")}</th>
                   <th className="w-[32%] px-3 py-2 text-left font-medium">{t("wbStats.usage.models.colDist")}</th>
-                  <th className="px-3 py-2 text-right font-medium">{t("wbStats.usage.models.colTokens")}</th>
+                  <th className="px-3 py-2 text-right font-medium">{unitColumn}</th>
                   <th className="px-3 py-2 text-right font-medium">{t("wbStats.usage.models.colRequests")}</th>
                   <th className="px-4 py-2 text-right font-medium">{t("wbStats.usage.models.colShare")}</th>
                 </tr>
@@ -295,7 +331,7 @@ export function GatewaySourceTables({
                     <td className="px-3 py-2">
                       <DistBar value={row.tokens} max={maxAccount} color={LEDGER_GATEWAY_COLOR} />
                     </td>
-                    <td className="px-3 py-2 text-right tabular-nums">{compactTokens(row.tokens)}</td>
+                    <td className="px-3 py-2 text-right tabular-nums">{format(row.tokens)}</td>
                     <td className="px-3 py-2 text-right tabular-nums text-muted-foreground">
                       {exactTokens(row.requests)}
                     </td>
@@ -364,7 +400,8 @@ export function CreditLedgerTable({
   total,
 }: {
   book: "client" | "gateway";
-  rows: { name: string; credit: number; requests: number }[];
+  /** `requests` 可缺：客户端账的逐模型请求数**不可得**（会话记录只按日给），缺省渲染 `—`。 */
+  rows: { name: string; credit: number; requests?: number }[];
   total: number;
 }) {
   const t = useT();
@@ -408,7 +445,7 @@ export function CreditLedgerTable({
                   {total > 0 ? `${Math.round((row.credit / total) * 100)}%` : "—"}
                 </td>
                 <td className="px-4 py-2 text-right tabular-nums text-muted-foreground">
-                  {exactTokens(row.requests)}
+                  {row.requests == null ? "—" : exactTokens(row.requests)}
                 </td>
               </tr>
             ))}

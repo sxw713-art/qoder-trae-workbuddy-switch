@@ -4,33 +4,32 @@
  * 「按密钥看用量」是 issue #76 的原始诉求之一：`key` 分给别人用之后，
  * 要能回答「**哪把 key 用掉了我多少额度**」。
  *
- * ## 数据源与判据
+ * ## 数据源：网关账本的 `keys` 维度（2026-10-28 换源）
  *
- * 聚合的原料是**网关请求日志**（`get_gateway_logs`）的 `keyId` 字段 ——
- * 它在 `8f1a1c4` 才加进日志条目，所以：
+ * 旧实现聚合的是**请求日志**（`get_gateway_logs`）。日志是环形缓冲（保留最近
+ * `log_keep` 条，缺省 200）—— 本机实测繁忙时 200 条只覆盖 **17 分钟**，页面却标
+ * 「近 30 天」⇒ 用户看到「44.2M Token / 200 次 / 100%」，量级像真的、区间是假的。
+ * 现在改为读账本 `days[].keys`（与「按模型 / 按账号」同一份账、同一个水位线，
+ * 按本地日累积 90 天），窗口才有意义。见 `src/lib/key-usage.ts` 文件头。
  *
- * - `keyId == null` ⇒ 确实没有 Key 的调用（本地直连 / 管理面探测）；
- * - `keyId == undefined` ⇒ **升级前写入的老条目**（那时还没有这个键）。
+ * ## 为什么「没有该维度」必须单独披露
  *
- * ★ 两者**分开统计**，不合并：把 `undefined` 并进「无 Key」会让历史数据凭空多出
- * 一批「匿名调用」，而这个数字一旦出现在排行里就会被当成真的。
- *
- * ## 为什么不用 `token_daily`
- *
- * 那个账本只有 client / gateway 两桶，gateway 桶的维度是模型 / 账号 / 端点 ——
- * **没有 key 维度**（规范 U4 的原话）。补 key 维度需要改账本 schema 与全部读写路径，
- * 而「按密钥看排行」是一次性的聚合查询，直接扫日志更直接、也不会让账本多一个
- * 只在某个页面用得上的维度。
+ * `keys` 是 v4 才加的维度：升级前的日期里它是**空数组**。画成「0 用量」等于说
+ * 「那几天没人用过 Key」—— 一句凭空捏造的事实。所以窗口里的覆盖天数、以及
+ * 「这一天的 key 维度只是下界」都要写出来（`keyCoverage` / `keysPartial`）。
  */
 
 import { useEffect, useMemo, useState } from "react";
 
 import {
-  aggregateByKey,
-  type KeyUsageLogEntry,
+  aggregateByKeyDim,
+  firstKeyDay,
+  keyCoverage,
   type KeyUsageSlice,
 } from "@/lib/key-usage";
-import { dateKey, usageWindowKeys, type UsageWindow } from "@/lib/usage-window";
+import { useT } from "@/lib/i18n";
+import type { GatewayUsageDim } from "@/lib/types";
+import { usageWindowKeys, type UsageWindow } from "@/lib/usage-window";
 
 import { compactTokens, sharePercent } from "./format";
 import { seriesColor } from "./palette";
@@ -49,14 +48,14 @@ export function KeyRanking({ slices }: { slices: KeyUsageSlice[] }) {
         const denominator = useTokens ? total : totalRequests;
         const share = sharePercent(value, denominator);
         return (
-          <div key={slice.keyId ?? slice.name} className="min-w-0">
+          <div key={slice.bucket} className="min-w-0">
             <div className="flex min-w-0 items-center gap-3 text-xs">
               <span className="w-5 shrink-0 font-mono text-muted-foreground">
                 {String(index + 1).padStart(2, "0")}
               </span>
               <span
                 className="min-w-0 flex-1 truncate font-medium"
-                title={slice.keyId ?? slice.name}
+                title={slice.bucket}
               >
                 {slice.name}
               </span>
@@ -86,109 +85,101 @@ export function KeyRanking({ slices }: { slices: KeyUsageSlice[] }) {
   );
 }
 
-
-/** 视图取数：返回日志条目与 `id → Key 名` 映射。 */
-export type KeyUsageLoader = () => Promise<{
-  entries: readonly KeyUsageLogEntry[];
-  keyNames: ReadonlyMap<string, string>;
-}>;
+/** 取密钥名的函数（**只取名字**：用量在账本里，不必再读日志）。 */
+export type KeyNameLoader = () => Promise<ReadonlyMap<string, string>>;
 
 /**
- * 「按密钥看用量」视图（**数据源注入**，WB / Trae 共用）。
+ * 「按密钥看用量」视图（**数据源注入**，WB / Trae / Qoder 共用）。
  *
- * 为什么要注入而不是写死 `api.getGatewayLogs`：三条产品线的日志是**三套 API**
- * （`get_gateway_logs` / `get_trae_gateway_logs` / Qoder 的），但聚合与呈现逻辑
- * 完全一样 —— 写死一份就得复制三份，三份必然漂移。
+ * 用量来自各平台的 `usage_dim`（三条产品线是三个命令，形状同构），
+ * 名字来自各自的密钥表 —— 两者**分开注入**：账本给数、密钥表给名，
+ * 任一取不到都不该让另一侧消失（名字缺失会退化成短 id）。
  *
- * @param loader 取数函数（必须已含鉴权与错误处理语义）
- * @param window 时间窗口（用 `usageWindowKeys` + `dateKey` 过滤，与另三个视图同口径）
+ * @param dim 该平台的网关账本维度（`null` = 还没取到）
+ * @param window 时间窗口（用 `usageWindowKeys` 过滤，与另三个视图同口径）
+ * @param selfScope 本页所属台账（跨台账的 Key 会标出归属）
+ * @param loadNames 取 `id → 展示名` 映射
  */
 export function KeysView({
-  loader,
+  dim,
   window,
   selfScope,
-  emptyTitle,
-  emptyHint,
-  title,
-  caption,
+  loadNames,
 }: {
-  loader: KeyUsageLoader;
+  dim: GatewayUsageDim | null;
   window: UsageWindow;
-  /** 本页所属台账（跨台账的 Key 会标出归属）。 */
   selfScope: string;
-  emptyTitle: string;
-  emptyHint: string;
-  title: string;
-  caption: string;
+  loadNames: KeyNameLoader;
 }) {
-  const [entries, setEntries] = useState<readonly KeyUsageLogEntry[] | null>(null);
+  const t = useT();
   const [keyNames, setKeyNames] = useState<ReadonlyMap<string, string>>(new Map());
-  const [error, setError] = useState<string | null>(null);
-  const [reload, setReload] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
-    setError(null);
-    void (async () => {
-      try {
-        const result = await loader();
-        if (cancelled) return;
-        setEntries(result.entries);
-        setKeyNames(result.keyNames);
-      } catch (e) {
-        if (!cancelled) setError(String(e));
-      }
-    })();
+    /* 名字取不到不算错：`aggregateByKeyDim` 会用短 id 兜底。
+       这里**不设错误态** —— 为了一列展示名把整张排行换成错误页，是把可用降成不可用。 */
+    void loadNames()
+      .then((names) => {
+        if (!cancelled) setKeyNames(names);
+      })
+      .catch(() => undefined);
     return () => {
       cancelled = true;
     };
-  }, [loader, reload]);
+  }, [loadNames]);
 
-  const slices = useMemo(() => {
-    if (!entries) return [];
-    /* 窗口过滤复用**同一个**日期键算法 —— 自己写 `toISOString().slice(0,10)`
-       会按 UTC 切日，与另三个视图在时区边界上差一天。 */
-    const inWindow = new Set(usageWindowKeys(window));
-    const filtered = entries.filter((entry) => inWindow.has(dateKey(new Date(entry.ts))));
-    return aggregateByKey(filtered, keyNames, selfScope);
-  }, [entries, keyNames, window, selfScope]);
+  const windowKeyList = useMemo(() => usageWindowKeys(window), [window]);
+  const windowKeySet = useMemo(() => new Set(windowKeyList), [windowKeyList]);
 
-  const reloadAction = (
-    <button
-      type="button"
-      className="rounded-md border border-border px-2.5 py-1 text-xs hover:bg-muted"
-      onClick={() => setReload((value) => value + 1)}
-    >
-      重新读取日志
-    </button>
+  const slices = useMemo(
+    () => (dim ? aggregateByKeyDim(dim.days, windowKeySet, keyNames, selfScope) : []),
+    [dim, windowKeySet, keyNames, selfScope],
   );
+  const coverage = useMemo(
+    () => keyCoverage(dim?.days ?? [], windowKeyList),
+    [dim, windowKeyList],
+  );
+  const since = useMemo(() => firstKeyDay(dim?.days ?? [], windowKeySet), [dim, windowKeySet]);
 
-  if (error) {
-    return (
-      <div className="rounded-xl border border-border p-6 text-center">
-        <p className="text-sm font-medium">{emptyTitle}</p>
-        <p className="mt-1 text-xs text-muted-foreground">{error}</p>
-        <div className="mt-3">{reloadAction}</div>
-      </div>
-    );
-  }
-  if (!entries) {
-    return <div className="h-[180px] animate-pulse rounded-xl bg-muted" />;
-  }
+  if (!dim) return <div className="h-[180px] animate-pulse rounded-xl bg-muted" />;
+
   if (slices.length === 0) {
     return (
       <div className="rounded-xl border border-border p-6 text-center">
-        <p className="text-sm font-medium">{emptyTitle}</p>
-        <p className="mt-1 text-xs text-muted-foreground">{emptyHint}</p>
-        <div className="mt-3">{reloadAction}</div>
+        <p className="text-sm font-medium">{t("wbStats.usage.keys.empty")}</p>
+        <p className="mt-1 text-xs text-muted-foreground">
+          {coverage.days === 0
+            ? t("wbStats.usage.keys.emptyNoDim")
+            : t("wbStats.usage.keys.emptyHint")}
+        </p>
       </div>
     );
   }
+
   return (
     <div className="space-y-3">
-      <div className="text-xs font-medium">{title}</div>
+      <div className="text-xs font-medium">{t("wbStats.usage.keys.title")}</div>
       <KeyRanking slices={slices} />
-      <p className="text-[11.5px] leading-5 text-muted-foreground">{caption}</p>
+      <div className="space-y-1">
+        <p className="text-[11.5px] leading-5 text-muted-foreground">
+          {t("wbStats.usage.keys.caption")}
+        </p>
+        {/* ★ 窗口内缺这个维度的天数必须说出来：「没有记录」≠「用量为 0」。 */}
+        {coverage.missing > 0 ? (
+          <p className="text-[11.5px] leading-5 text-muted-foreground">
+            {t("wbStats.usage.keys.coverageMissing", {
+              days: coverage.days,
+              missing: coverage.missing,
+              since: since ?? "—",
+            })}
+          </p>
+        ) : null}
+        {coverage.partial > 0 ? (
+          <p className="text-[11.5px] leading-5 text-muted-foreground">
+            {t("wbStats.usage.keys.coveragePartial", { days: coverage.partial })}
+          </p>
+        ) : null}
+      </div>
     </div>
   );
 }

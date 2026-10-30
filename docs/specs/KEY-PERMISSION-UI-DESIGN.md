@@ -272,9 +272,27 @@ pub scope_groups: Vec<String>,    // 允许访问的**分组** id（与 scope_ac
 
 ### 6.4 用量账本补「按密钥」维度（U4 的前置）
 
-- `token_daily` 现有：client / gateway 两桶，gateway 桶的维度是 模型 / 账号 / 端点。
-- 要做「按 key 看用量」，需要网关请求日志里带 **key id**（现在只有账号/模型/端点），并在 `token_daily` 增一个 `gateway_keys` 维度。
+- `token_daily` 现有：client / gateway 两桶，gateway 桶的维度是 **密钥 / 模型 / 账号 / 端点**（密钥维度 v4 落地）。
+- 要做「按 key 看用量」，需要网关请求日志里带 **key id**，并在账本增一个 `gateway_keys` 维度。
 - 这一步**独立于本功能**：即便配额不做，用量页按 key 看排行也有价值；可先落地再接配额。
+
+★ **2026-10-28 补：为什么必须进账本，不能只扫请求日志**（用户报障驱动的修正）
+
+第一版实现（`2'` 标 ✅ 的那一版）为了省事，直接聚合 `get_gateway_logs` 的条目。
+但那个日志是**环形缓冲**（保留最近 `log_keep` 条，缺省 200）—— 本机实测繁忙时
+200 条只覆盖 **17 分钟**，而页面标的是「近 30 天」⇒ 出现
+`44.2M Token / 200 次 / 100%` 这种**量级像真的、区间是假的**读数。
+
+现在改为读账本维度（`token_daily::gateway_usage_dim` 的 `days[].keys`，
+Trae/Qoder 走 `gateway_ledger::usage_dim`）：
+
+- 桶键 `{keyScope}:{keyId}`；两个哨兵 `__legacy__`（升级前的条目，那时日志还没有
+  `keyId` 字段）与 `__none__`（确实没带 Key）**分开统计** —— 与另外三个维度同轮
+  同水位线产出 ⇒ 「按密钥合计 = 网关总量」仍是恒等式（单测守着）；
+- 「没有该维度」（升级前的日期，空数组）与「用量为 0」在 UI 上**分别表述**：
+  `keysPartial` + `keyCoverage` 披露覆盖天数与下界，绝不画成 0；
+- 播种：升级当天 `gateway_keys` 为空而该日已有 token ⇒ 整窗补一次并标
+  `keysPartial`（否则当天此前的请求全部漏记，看着像「这把 Key 只用了这么点」）。
 
 ## 7. 实施拆解
 
@@ -295,7 +313,7 @@ pub scope_groups: Vec<String>,    // 允许访问的**分组** id（与 scope_ac
 |:--|:--|:--|
 | 1 密钥记录扩字段 | ✅ | `apikey.rs`：四枚举 + 7 字段（全 `serde(default)`）+ `update_policy` + `normalized` |
 | 2 日志带 key id | ✅ | `RequestMeta.key_id` + 日志 `keyId` 键（三条 LLM 路由 12 个构造点）；前端类型区分 `null`（无 Key）与 `undefined`（老条目） |
-| 2' 用量页「按密钥」维度 | ✅ **WB + Trae + Qoder** | `KeysView`（数据源注入，`key-ranking.tsx`）+ 三个页面的 tab。统一网关没有自己的日志（全部转发给产品线），所以它不单独出这一页 —— 它的请求会出现在**目标产品线**的排行里，用 `keyScope: "unified"` 标出「这是统一网关的密钥」 |
+| 2' 用量页「按密钥」维度 | ✅ **WB + Trae + Qoder** | `KeysView`（数据源注入，`key-ranking.tsx`）+ 三个页面的 tab。**数据源是账本的 `keys` 维度**（2026-10-28 换源，见 §6.4 ★）：视图只注入密钥表取名字，用量不再扫请求日志。统一网关没有自己的日志（全部转发给产品线），所以它不单独出这一页 —— 它的请求会出现在**目标产品线**的排行里，用 `keyScope: "unified"` 标出「这是统一网关的密钥」 |
 | 3 用量计数 | ✅ | `key_usage.rs`（**两口径各自一份计数**，见下方 ★） |
 | 4 配额 429 + 白名单 | ✅ | `relay.rs`（选号前判）+ `pool/pick.rs` 的 `allowed` 通道 |
 | 5 管理面命令 | ✅ | `set_key_policy` + `key_usage`（server / tauri / invoke 全同步） |

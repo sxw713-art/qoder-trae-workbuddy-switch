@@ -18,9 +18,9 @@ use serde_json::{json, Value};
 
 use buddy_switch_core::modules::{
     account, auth_file, backup, checkin, client_limits, client_settings, codebuddy_cli, config,
-    credit_usage, credits, diagnostics, export_import, migrate, oauth, process, programs, qoder,
-    refresh, region::Region, region::RegionFilter, rotate, schedule, scheduler, session, skill,
-    switch, token_daily, token_stats, trae, travel, update, vscode_session,
+    credit_usage, credits, diagnostics, export_import, gateway_ledger, migrate, oauth, process,
+    programs, qoder, refresh, region::Region, region::RegionFilter, rotate, schedule, scheduler,
+    session, skill, switch, token_daily, token_stats, trae, travel, update, vscode_session,
 };
 use buddy_switch_gateway::unified::UnifiedGatewayConfig;
 use buddy_switch_gateway::GatewayProduct;
@@ -372,6 +372,20 @@ fn api_routes() -> Router {
             "/api/gateway/model-image-caps",
             get(api_gateway_model_image_caps).post(api_gateway_set_model_image_cap),
         )
+        // 模型降级链（P13）：读 / 存 / 预演，与三个 Tauri 命令一一对应。
+        .route(
+            "/api/gateway/model-fallback",
+            get(api_gateway_model_fallback).post(api_save_gateway_model_fallback),
+        )
+        .route(
+            "/api/gateway/model-fallback/preview",
+            post(api_preview_gateway_model_fallback),
+        )
+        // 降级统计：读**落盘账本**（不是环形缓冲），「近 N 天」才成立。
+        .route(
+            "/api/gateway/fallback-stats",
+            get(api_gateway_fallback_stats),
+        )
         .route("/api/gateway/logs", get(api_gateway_logs))
         .route("/api/gateway/logs/clear", post(api_gateway_clear_logs))
         // 限流探测（账号 × 模型矩阵 · 一次性作业 + 轮询）：start 异步作业 / status 快照 / cancel。
@@ -475,6 +489,22 @@ fn api_routes() -> Router {
         .route("/api/trae/checkin", post(api_trae_checkin))
         .route("/api/trae/credits", get(api_trae_credits))
         .route("/api/trae/token-stats", get(api_trae_token_statistics))
+        // Trae 客户端账本（导入用户自己导出的明文库；不内置解密）。
+        .route("/api/trae/client-import/probe", get(api_trae_client_probe))
+        .route(
+            "/api/trae/client-import/config",
+            get(api_trae_client_config),
+        )
+        .route(
+            "/api/trae/client-import/path",
+            post(api_trae_save_client_path),
+        )
+        // 内置解密：口令由用户输入，工具内部完成「加密库 → 明文副本」。
+        .route(
+            "/api/trae/client-import/unlock",
+            post(api_trae_unlock_client_db),
+        )
+        .route("/api/trae/client-usage", get(api_trae_client_usage))
         .route("/api/trae/logs", get(api_trae_logs))
         .route("/api/trae/credits/refresh", post(api_trae_refresh_credits))
         .route("/api/trae/refresh-jwt", post(api_trae_refresh_jwt))
@@ -600,6 +630,11 @@ fn api_routes() -> Router {
             "/api/qoder/gateway/logs/clear",
             post(api_qoder_clear_gateway_logs),
         )
+        // 网关账本（用量页「账本」视图，issue #63 的平台补齐）。
+        .route(
+            "/api/qoder/gateway/usage-dim",
+            get(api_qoder_gateway_usage_dim),
+        )
         .route("/api/trae/device/reset", post(api_trae_reset_device))
         .route(
             "/api/trae/settings",
@@ -637,6 +672,11 @@ fn api_routes() -> Router {
             post(api_trae_set_key_policy),
         )
         .route("/api/trae/gateway/keys/usage", get(api_trae_key_usage))
+        // 网关账本（用量页「账本」视图，issue #63 的平台补齐）。
+        .route(
+            "/api/trae/gateway/usage-dim",
+            get(api_trae_gateway_usage_dim),
+        )
         .route(
             "/api/trae/gateway/keys/restore",
             post(api_trae_restore_api_key),
@@ -683,11 +723,60 @@ fn json_err(e: String, code: StatusCode) -> Response {
 // ---------------------------------------------------------------------------
 
 /// 从 query 中读取一个参数值（URL 解码为最简实现，仅处理 `%` 之外的常规字符）。
+/// 解析 GET 查询串里某个键的值（**做过 percent-decode**）。
+///
+/// ## 为什么必须解码（2026-10-28 修）
+///
+/// 前端用 `URLSearchParams` 拼 query，它会把 Windows 路径编码成
+/// `D%3A%5Ctrae-plain%5Cdatabase.db`、把空格编码成 `+`。旧实现直接
+/// `value.to_string()` 取原始片段 ⇒ 服务端拿到的是一条**没解码**的串，
+/// 路径必然打不开，而桌面端（走 IPC，参数不经 URL）完全正常 ——
+/// 这是典型的「两个通道语义分叉」。
+///
+/// 这个缺陷以前看不出来：既有 GET 参数全是 `region` / `days` / `scope` / 逗号 id
+/// 这类枚举值，没有任何需要编码的字符。一传**文件路径**就暴露。
+///
+/// 解码规则与 `application/x-www-form-urlencoded` 一致：`%XX` → 字节、`+` → 空格。
+/// 非法的 `%` 序列**原样保留**（宁可让路径打不开并报错，也不要静默丢字符）。
 fn query_value(query: Option<&str>, name: &str) -> Option<String> {
     query.unwrap_or("").split('&').find_map(|pair| {
         let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
-        (key == name).then(|| value.to_string())
+        (decode_query_component(key) == name).then(|| decode_query_component(value))
     })
+}
+
+/// `%XX` 与 `+` 的解码（[`query_value`] 的唯一实现）。
+fn decode_query_component(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => {
+                out.push(b' ');
+                index += 1;
+            }
+            b'%' if index + 2 < bytes.len() => {
+                let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).ok();
+                match hex.and_then(|digits| u8::from_str_radix(digits, 16).ok()) {
+                    Some(byte) => {
+                        out.push(byte);
+                        index += 3;
+                    }
+                    // 非法转义：原样收下 `%`，继续往后走（不吞字符）。
+                    None => {
+                        out.push(bytes[index]);
+                        index += 1;
+                    }
+                }
+            }
+            byte => {
+                out.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// 解析**逗号分隔**的账号 id 列表（`accountIds=a,b,c`；缺失 / 空串 ⇒ 空数组）。
@@ -1830,12 +1919,35 @@ async fn api_gateway_token_trend(RawQuery(query): RawQuery) -> Response {
     json_ok(token_daily::gateway_token_trend(region))
 }
 
-/// GET /api/account/usage-dim —— 网关三维度（模型 / 账号 / 端点）逐日历史。
+/// GET /api/account/usage-dim —— 网关四维度（密钥 / 模型 / 账号 / 端点）逐日历史。
 ///
 /// 与 `src-tauri/src/commands.rs` 的 `get_gateway_usage_dim` **一一对应**。
 async fn api_gateway_usage_dim(RawQuery(query): RawQuery) -> Response {
     let region = parse_region(query_value(query.as_deref(), "region").as_deref());
     json_ok(token_daily::gateway_usage_dim(region))
+}
+
+/// GET /api/trae/gateway/usage-dim —— Trae 网关账本（四维度逐日）。
+///
+/// 与 `src-tauri/src/commands.rs` 的 `get_trae_gateway_usage_dim` **一一对应**。
+/// `scope` 取 `cn` / `global` / `unlabeled` / `all`（缺省 `all`，合并放后端）。
+async fn api_trae_gateway_usage_dim(RawQuery(query): RawQuery) -> Response {
+    let scope = query_value(query.as_deref(), "scope").unwrap_or_else(|| "all".to_string());
+    json_ok(gateway_ledger::usage_dim(
+        gateway_ledger::LedgerProduct::Trae,
+        &scope,
+    ))
+}
+
+/// GET /api/qoder/gateway/usage-dim —— Qoder 网关账本（四维度逐日）。
+///
+/// 与 `src-tauri/src/commands.rs` 的 `get_qoder_gateway_usage_dim` **一一对应**。
+async fn api_qoder_gateway_usage_dim(RawQuery(query): RawQuery) -> Response {
+    let scope = query_value(query.as_deref(), "scope").unwrap_or_else(|| "all".to_string());
+    json_ok(gateway_ledger::usage_dim(
+        gateway_ledger::LedgerProduct::Qoder,
+        &scope,
+    ))
 }
 
 /// GET /api/account/usage-reconcile —— 今日客户端 ↔ 网关对账。
@@ -3563,6 +3675,125 @@ async fn api_gateway_set_model_disabled(Json(body): Json<Value>) -> Response {
     }))
 }
 
+/// 某作用域降级链的视图 JSON。
+///
+/// **与 Tauri 命令共用同一份派生**（`model_fallback::build_view`）—— 两个管理面
+/// （桌面 / WebUI）如果各拼一份，状态点迟早会在两边给出不同结论。
+async fn fallback_view_json(scope: buddy_switch_core::modules::product::Scope) -> Value {
+    let state = crate::gateway_host::shared_state();
+    let fb = state.fallback.read().await.clone();
+    let disabled = state.disabled.read().await.clone();
+    let gates: Vec<(String, i64)> = {
+        let pool = state.pool.read().await;
+        pool.model_gates()
+            .iter()
+            .map(|gate| (gate.model.clone(), gate.until_ms))
+            .collect()
+    };
+    let refs: Vec<(&str, i64)> = gates
+        .iter()
+        .map(|(model, until)| (model.as_str(), *until))
+        .collect();
+    let view = buddy_switch_gateway::model_fallback::build_view(
+        &fb,
+        &disabled,
+        scope,
+        &state.catalogs,
+        &refs,
+        buddy_switch_gateway::timeutil::now_ms(),
+    );
+    serde_json::to_value(view).unwrap_or(Value::Null)
+}
+
+/// GET /api/gateway/model-fallback —— 某作用域的降级链（含备选**实时**健康态）。
+async fn api_gateway_model_fallback(RawQuery(query): RawQuery) -> Response {
+    let scope = match resolve_scope_param(query_value(query.as_deref(), "scope").as_deref()) {
+        Ok(scope) => scope,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    json_ok(fallback_view_json(scope).await)
+}
+
+/// POST /api/gateway/model-fallback —— 保存某作用域的降级链（**立即生效**）。
+///
+/// `config` 是**整作用域覆盖**（与 Tauri 命令同一语义）：前端提交时必须把其它链带上。
+async fn api_save_gateway_model_fallback(Json(body): Json<Value>) -> Response {
+    let scope = match resolve_scope_param(body.get("scope").and_then(Value::as_str)) {
+        Ok(scope) => scope,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    let raw = body.get("config").cloned().unwrap_or(Value::Null);
+    let parsed: buddy_switch_gateway::model_fallback::ScopeFallback =
+        match serde_json::from_value(raw) {
+            Ok(value) => value,
+            Err(error) => {
+                return json_err(format!("降级链格式错误: {error}"), StatusCode::BAD_REQUEST)
+            }
+        };
+    let normalized = buddy_switch_gateway::model_fallback::normalize(parsed);
+    let store = buddy_switch_gateway::model_fallback::shared();
+    {
+        let mut guard = store.write().await;
+        guard.set_scope(scope, normalized);
+        // 写失败必须回传：否则用户以为保存了，重启后配置又变回去。
+        if let Err(error) = guard.save() {
+            return json_err(error, StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    }
+    json_ok(fallback_view_json(scope).await)
+}
+
+/// GET /api/gateway/fallback-stats —— 某作用域近 `days` 天的降级统计（**落盘账本**）。
+async fn api_gateway_fallback_stats(RawQuery(query): RawQuery) -> Response {
+    let scope = match resolve_scope_param(query_value(query.as_deref(), "scope").as_deref()) {
+        Ok(scope) => scope,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    let days = query_value(query.as_deref(), "days")
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(7);
+    json_ok(buddy_switch_gateway::model_fallback::stats_payload(
+        scope, days,
+    ))
+}
+
+/// POST /api/gateway/model-fallback/preview —— 保存前**预演**（**纯计算，零副作用**）。
+async fn api_preview_gateway_model_fallback(Json(body): Json<Value>) -> Response {
+    let scope = match resolve_scope_param(body.get("scope").and_then(Value::as_str)) {
+        Ok(scope) => scope,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    let from = body.get("from").and_then(Value::as_str).unwrap_or("");
+    let targets: Vec<String> = body
+        .get("targets")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let state = crate::gateway_host::shared_state();
+    let now = buddy_switch_gateway::timeutil::now_ms();
+    let disabled = state.disabled.read().await.clone();
+    let gates: Vec<(String, i64)> = {
+        let pool = state.pool.read().await;
+        pool.model_gates()
+            .iter()
+            .map(|gate| (gate.model.clone(), gate.until_ms))
+            .collect()
+    };
+    let refs: Vec<(&str, i64)> = gates
+        .iter()
+        .map(|(model, until)| (model.as_str(), *until))
+        .collect();
+    json_ok(buddy_switch_gateway::model_fallback::preview_payload(
+        scope, from, &targets, &disabled, &refs, now,
+    ))
+}
+
 /// GET /api/gateway/model-image-caps —— 某**作用域**被用户手动指定的图片能力覆盖（issue #101）。
 ///
 /// 形状 `{ scope, caps: { "<模型 id>": true|false } }`：**缺失的键 = 跟随上游**。
@@ -3841,6 +4072,162 @@ async fn api_trae_token_statistics(RawQuery(query): RawQuery) -> Response {
         .map(|value| trae::token_stats::TraeTokenScope::parse(&value))
         .unwrap_or_default();
     json_ok(trae::handlers::token_statistics(days, scope))
+}
+
+/// GET /api/trae/client-import/probe —— 探测一个**用户自己导出的明文库**能否读。
+///
+/// 与 `src-tauri/src/commands.rs` 的 `probe_trae_client_db` **一一对应**。
+/// 只探测、不保存配置；`error.code` 决定界面文案（五种错误必须分开显示）。
+async fn api_trae_client_probe(RawQuery(query): RawQuery) -> Response {
+    let path = query_value(query.as_deref(), "path").unwrap_or_default();
+    let value = tokio::task::spawn_blocking(move || trae::client_import::probe(&path))
+        .await
+        .unwrap_or_else(|error| {
+            serde_json::json!({
+                "ok": false,
+                "path": "",
+                "error": { "code": "io", "message": format!("探测失败: {error}") },
+                "tables": [],
+            })
+        });
+    json_ok(value)
+}
+
+/// GET /api/trae/client-import/config —— 已保存的导入路径与「文件还在不在」。
+async fn api_trae_client_config() -> Response {
+    let value = tokio::task::spawn_blocking(|| {
+        let path = trae::client_import::configured_path();
+        let exists = path
+            .as_deref()
+            .map(|target| std::path::Path::new(target).is_file())
+            .unwrap_or(false);
+        serde_json::json!({ "path": path, "exists": exists })
+    })
+    .await
+    .unwrap_or_else(
+        |error| serde_json::json!({ "path": null, "exists": false, "error": error.to_string() }),
+    );
+    json_ok(value)
+}
+
+/// POST /api/trae/client-import/path —— 保存 / 清除导入路径（`path` 缺省或空串即清除）。
+async fn api_trae_save_client_path(Json(body): Json<Value>) -> Response {
+    let path = body
+        .get("path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let value = tokio::task::spawn_blocking(move || match path.as_deref() {
+        Some(target) => serde_json::json!({
+            "ok": trae::client_import::save_config(target),
+            "path": target,
+        }),
+        None => serde_json::json!({
+            "ok": trae::client_import::clear_config(),
+            "path": Value::Null,
+        }),
+    })
+    .await
+    .unwrap_or_else(
+        |error| serde_json::json!({ "ok": false, "path": null, "error": error.to_string() }),
+    );
+    json_ok(value)
+}
+
+/// POST /api/trae/client-import/unlock —— 用口令把**加密库**导出成明文副本。
+///
+/// 与 `src-tauri/src/commands.rs` 的 `unlock_trae_client_db` **一一对应**（同一套分支语义：
+/// `decrypted` / `plaintext` / `error`）。
+async fn api_trae_unlock_client_db(Json(body): Json<Value>) -> Response {
+    let path = body
+        .get("path")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let passphrase = body
+        .get("passphrase")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+
+    let value = tokio::task::spawn_blocking(move || {
+        let source = std::path::PathBuf::from(&path);
+        let plain = trae::client_import::plaintext_path();
+        let target = plain.to_string_lossy().to_string();
+        match buddy_switch_vault::verify(&source, &passphrase) {
+            Ok(info) => {
+                if let Err(error) =
+                    buddy_switch_vault::export_plaintext(&source, &passphrase, &plain)
+                {
+                    return serde_json::json!({
+                        "ok": false,
+                        "error": { "code": error.code(), "message": error.message() },
+                    });
+                }
+                let saved = trae::client_import::save_config(&target);
+                serde_json::json!({
+                    "ok": saved,
+                    "mode": "decrypted",
+                    "compatibility": info.compatibility,
+                    "tables": info.tables,
+                    "path": target,
+                    "probe": trae::client_import::probe(&target),
+                })
+            }
+            Err(buddy_switch_vault::VaultError::AlreadyPlaintext) => {
+                let saved = trae::client_import::save_config(&path);
+                serde_json::json!({
+                    "ok": saved,
+                    "mode": "plaintext",
+                    "path": path,
+                    "probe": trae::client_import::probe(&path),
+                })
+            }
+            Err(error) => serde_json::json!({
+                "ok": false,
+                "error": { "code": error.code(), "message": error.message() },
+            }),
+        }
+    })
+    .await
+    .unwrap_or_else(|error| {
+        serde_json::json!({
+            "ok": false,
+            "error": { "code": "io", "message": format!("解锁失败: {error}") },
+        })
+    });
+    json_ok(value)
+}
+
+/// GET /api/trae/client-usage —— 客户端账本（读导入的明文库）。
+///
+/// `path` 缺省时用已保存的路径；两者都没有 ⇒ `{ configured: false }`
+/// （**不是空统计**：「没导入」与「导入了但这段没用量」必须能分开）。
+async fn api_trae_client_usage(RawQuery(query): RawQuery) -> Response {
+    let path = query_value(query.as_deref(), "path").filter(|value| !value.trim().is_empty());
+    let days = query_value(query.as_deref(), "days").and_then(|value| value.parse::<i64>().ok());
+    let scope = query_value(query.as_deref(), "scope")
+        .map(|value| trae::token_stats::TraeTokenScope::parse(&value))
+        .unwrap_or_default();
+    let value = tokio::task::spawn_blocking(move || {
+        let target = path
+            .or_else(trae::client_import::configured_path)
+            .unwrap_or_default();
+        if target.trim().is_empty() {
+            return serde_json::json!({ "source": "trae-client", "configured": false });
+        }
+        trae::client_import::summarize(&target, days, scope)
+    })
+    .await
+    .unwrap_or_else(|error| {
+        serde_json::json!({
+            "source": "trae-client",
+            "error": { "code": "io", "message": format!("读取客户端账本失败: {error}") },
+        })
+    });
+    json_ok(value)
 }
 
 /// GET /api/trae/logs —— 运行日志（`kind` / `date` / `keyword` / `limit` / `variant` 均可选）。
@@ -5341,6 +5728,33 @@ mod tests {
         assert_eq!(query_value(None, "region"), None);
         assert_eq!(query_value(Some("flag"), "flag").as_deref(), Some(""));
         assert_eq!(query_value(Some("x=1&x=2"), "x").as_deref(), Some("1"));
+    }
+
+    /// GET 参数必须解码：Windows 路径经 `URLSearchParams` 编码后要能还原。
+    ///
+    /// 这条是 2026-10-28 的缺陷回归测试：不解码时 `path=D%3A%5Cx` 会原样传给后端，
+    /// 桌面端（IPC）却正常 —— 两个通道语义分叉，且只在「传路径」时暴露。
+    #[test]
+    fn query_value_decodes_percent_and_plus() {
+        assert_eq!(
+            query_value(Some("path=D%3A%5Ctrae-plain%5Cdatabase.db"), "path").as_deref(),
+            Some(r"D:\trae-plain\database.db")
+        );
+        // `URLSearchParams` 把空格编码成 `+`（不是 `%20`），必须还原。
+        assert_eq!(
+            query_value(Some("path=C%3A%5CProgram+Files%5Cx.db"), "path").as_deref(),
+            Some(r"C:\Program Files\x.db")
+        );
+        // 非法的 `%` 序列原样保留（不静默丢字符）。
+        assert_eq!(
+            query_value(Some("q=100%ZZ"), "q").as_deref(),
+            Some("100%ZZ")
+        );
+        // 中文路径（多字节 UTF-8）也要能还原。
+        assert_eq!(
+            query_value(Some("path=%E6%A1%8C%E9%9D%A2%5Cx.db"), "path").as_deref(),
+            Some("桌面\\x.db")
+        );
     }
 
     #[test]
