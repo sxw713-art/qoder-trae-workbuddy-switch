@@ -32,7 +32,8 @@ import {
   type DetailSwitchTarget,
 } from "@/components/account-detail-drawer";
 import { ScopeChip, scopeLabel } from "@/components/scope-chip";
-import { TraeAccountCard, formatCredits, jwtBadge, shortTime, type TraeProgram } from "@/components/trae-account-card";
+import { TraeAccountCard, formatCredits, jwtBadge, shortTime, shortTimeFromMs, type TraeProgram } from "@/components/trae-account-card";
+import { secondsToMs, toDetailPacks } from "@/lib/credit-packs";
 import { REFRESH_DONE_LABEL, useAccountRefreshBusy, type AccountRefreshKind } from "@/lib/account-refresh";
 import { TraeExportAccountsDialog } from "@/components/trae-export-accounts-dialog";
 import { TraeImportAccountsDialog } from "@/components/trae-import-accounts-dialog";
@@ -111,6 +112,8 @@ import type {
 import { cn } from "@/lib/utils";
 import { scopeOf } from "@/lib/scope";
 import { useCachedResource } from "@/lib/use-cached-resource";
+import { useAutoRefreshWhenVisible } from "@/lib/use-auto-refresh";
+import { CREDITS_LOCAL_REFRESH_INTERVAL_MS } from "@/lib/use-credit-auto-refresh";
 import { useRefreshAction } from "@/lib/use-refresh-action";
 import { showUndoToast } from "@/lib/undo-toast";
 import { useTraeVariant } from "@/lib/use-trae-variant";
@@ -241,7 +244,22 @@ export default function TraeAccountsPage() {
     loading,
     error,
     refresh: loadAll,
+    revalidate: revalidateSnapshot,
+    at: snapshotAt,
   } = useCachedResource<AccountsSnapshot>(`trae:accounts:${variant}`, loadSnapshot);
+
+  /**
+   * ★ 卡片上的积分自动跟随本地快照（issue #133）。
+   *
+   * 后端的 `TRAE_CREDITS_REFRESH_INTERVAL_MS` 循环把新读数写进账号库，但**界面不会自己知道** ——
+   * 快照缓存只在挂载 / 变更操作后重取，所以用户看到的余额可以停十几分钟。
+   * 这里用 `revalidate`（不强发、同键在飞复用）：它才是「轮询心跳」，`refresh` 会把页面
+   * 变成「每次心跳都强制重取」，两个入口同时挂载时请求数翻倍。
+   *
+   * ★ 节拍用 **`CREDITS_LOCAL_REFRESH_INTERVAL_MS`（3 分钟）** 而不是打上游那一档：
+   * 这里只读本地库，零上游成本 ⇒ 可以跟得更紧（issue #133 复核 §3 的「两类成本分开」）。
+   */
+  useAutoRefreshWhenVisible(snapshotAt, revalidateSnapshot, CREDITS_LOCAL_REFRESH_INTERVAL_MS);
 
   /**
    * 签到跳过策略存在设置里，与设置页**共用同一把键** `trae:settings`：
@@ -1761,40 +1779,47 @@ export default function TraeAccountsPage() {
     ];
   }, [detail, t, todayTokens, todayTokensTruncated, checkinMap]);
 
+  /**
+   * 资源包明细（issue #144 复核 · L1/L2）：过滤 / 排序 / `ratio` 走共用装配。
+   *
+   * ★ **量纲只在这里转一次**：Trae 的 `expireAt` 是**秒**（后端直接透传上游
+   * `expire_time`），而抽屉与 `formatAbsoluteTime` 要毫秒。此前聚合页直接把秒当毫秒
+   * 渲染，到期列全是 `1970-01-22`（#144 回归）—— `* 1000` 现在只允许出现在这一行。
+   *
+   * ★ `expiringSoon` 改读**后端标记**（`EXPIRING_SOON_SECS` = 14 天）：此前这里前端
+   * 写死 7 天，于是「10 天后到期的包」在卡片上说临期、点开抽屉却不说 —— 同一枚徽章
+   * 两个答案。
+   */
   const detailPacks: DetailPack[] = detail
-    ? (detail.creditPackages ?? [])
-        .filter((item) => item.remaining > 0)
-        .map((item, index) => ({ item, index }))
-        .sort((left, right) => {
-          const leftExpiry = left.item.expireAt ?? Number.POSITIVE_INFINITY;
-          const rightExpiry = right.item.expireAt ?? Number.POSITIVE_INFINITY;
-          return leftExpiry === rightExpiry ? left.index - right.index : leftExpiry - rightExpiry;
-        })
-        .map(({ item }) => ({
+    ? toDetailPacks(
+        (detail.creditPackages ?? []).map((item) => ({
           key: `${item.packageCode ?? item.packageName ?? "pack"}-${item.expireAt ?? "none"}`,
           // 同 WorkBuddy 账号页：`packageName` / `packageCode` 可能被后端吐成对象，
           // 直接当 React 子节点会白屏（issue #2）。过 `displayText` 出口归一。
-          name: displayText(item.packageName) || displayText(item.packageCode) || t("trae.comp.card.package.fallback"),
-          remainingText: formatCredits(item.remaining),
-          totalText: formatCredits(item.total),
-          usedText: t("trae.comp.card.package.used", { n: formatCredits(item.used) }),
-          expiryText: item.expired
-            ? t("trae.comp.card.package.expired")
-            : item.expireAt
-              ? t("trae.comp.card.expiry.short", { date: shortTime(item.expireAt) })
-              : t("trae.comp.card.expiry.permanent"),
+          name:
+            displayText(item.packageName) ||
+            displayText(item.packageCode) ||
+            t("trae.comp.card.package.fallback"),
+          total: item.total,
+          remaining: item.remaining,
+          used: item.used,
+          expireAtMs: secondsToMs(item.expireAt),
           expired: item.expired,
-          /* ⚠️ `item.expireAt` 是**秒**（后端 `expire_times`，与 WB `CreditResource.expireAt`
-             的毫秒口径**不同** —— 见 `trae-usage-charts.ts` 的同款说明）⇒ 必须 `* 1000`。
-             下界 `> now` 与上界取**同一个** `now`：只判上界会依赖「`expired` 已覆盖过去时刻」
-             这条隐式不变量。 */
-          expiringSoon:
-            !item.expired &&
-            item.expireAt != null &&
-            item.expireAt * 1000 > now &&
-            item.expireAt * 1000 - now <= 7 * 86_400_000,
-          ratio: item.total > 0 ? Math.min(100, Math.max(0, (item.remaining / item.total) * 100)) : 0,
-        }))
+          expiringSoon: item.expiringSoon,
+        })),
+        {
+          remainingText: formatCredits,
+          totalText: formatCredits,
+          usedText: (value) => t("shared.credit.packUsed", { n: formatCredits(value) }),
+          expiryText: (expireAtMs, expired) =>
+            expired
+              ? t("trae.comp.card.package.expired")
+              : expireAtMs !== null
+                ? t("trae.comp.card.expiry.short", { date: shortTimeFromMs(expireAtMs) })
+                : t("trae.comp.card.expiry.permanent"),
+        },
+        now,
+      )
     : [];
   // 只读程序位徽标（**非**切换控件）：复用卡片的 `programsFor`，标签带区域标识消歧。
   const detailPrograms: DetailProgramBadge[] = detail
@@ -2063,6 +2088,7 @@ export default function TraeAccountsPage() {
           installed={regionStatus?.installed ?? false}
           dataDir={regionStatus?.dataDir ?? null}
           dataDirExists={regionStatus?.dataDirExists ?? false}
+          storageJsonExists={regionStatus?.storageJsonExists ?? false}
           onRecheck={() => loadAll()}
           onImport={() => void importLocal()}
           onOAuth={() => setOauthOpen(true)}
@@ -2620,6 +2646,7 @@ function EmptyTraeCard({
   installed,
   dataDir,
   dataDirExists,
+  storageJsonExists,
   onRecheck,
   onImport,
   onOAuth,
@@ -2638,6 +2665,15 @@ function EmptyTraeCard({
    */
   dataDir: string | null;
   dataDirExists: boolean;
+  /**
+   * 该目录里是否真的有 `storage.json`（issue #136）。
+   *
+   * **必须与 `dataDirExists` 分开判**：真机现场 `%APPDATA%\Trae CN` 目录在（客户端跑过），
+   * 但 `User\globalStorage\storage.json` 从未生成 ⇒ 旧代码把这种「空壳目录」
+   * 也写成「已探测的登录态目录」，用户因此以为「文件在、只是读不出」，
+   * 反复重启客户端却永远好不了。
+   */
+  storageJsonExists: boolean;
   onRecheck: () => void | Promise<void>;
   onImport: () => void;
   onOAuth: () => void;
@@ -2646,6 +2682,13 @@ function EmptyTraeCard({
   launching: boolean;
 }) {
   const t = useT();
+  /**
+   * 「登录态文件真的在那儿」——空态文案的唯一判据。
+   *
+   * 两个条件缺一不可：目录在（客户端跑过）**且** `storage.json` 在（它写出过设备凭证）。
+   * 只用前者的后果见 `storageJsonExists` 的文档（issue #136）。
+   */
+  const sessionPresent = dataDirExists && storageJsonExists;
   /** 「重新检测」的进行中态（最小展示 500ms，本地探测快于 500ms 时也能看见转圈）。 */
   const { busy, run } = useRefreshAction();
   return (
@@ -2711,10 +2754,12 @@ function EmptyTraeCard({
           </div>
 
           <div className="mt-4">
-            {/* 目录不存在时不许写「已探测」——拿一个并不存在的路径当「探测结果」
-                会把用户引向「文件在、只是读不出」，而真相是客户端从没启动过。 */}
+            {/* 只有「目录在 **且** storage.json 在」才配写「已探测的登录态目录」——
+                目录存在只说明客户端跑过，不代表它写出过设备凭证（issue #136）。
+                拿一个没有 storage.json 的空壳目录当「探测结果」，用户会读成
+                「文件在、只是读不出」，于是反复重启客户端，永远解决不了。 */}
             <p className="text-sm font-medium text-foreground/80">
-              {dataDirExists ? t("trae.page.accounts.emptyDetectedDir") : t("trae.page.accounts.emptyExpectedDir")}
+              {sessionPresent ? t("trae.page.accounts.emptyDetectedDir") : t("trae.page.accounts.emptyExpectedDir")}
             </p>
             <div className="mt-1.5 flex flex-wrap items-center gap-2">
               <code className="min-w-0 break-all rounded-md border border-border bg-muted/40 px-2 py-1 font-mono text-[11px] text-muted-foreground">
@@ -2725,8 +2770,15 @@ function EmptyTraeCard({
                   {t("trae.page.accounts.dataDirMissing")}
                 </span>
               )}
+              {/* 目录在、文件不在：必须单独说一句，否则与上一行的「预期位置」自相矛盾
+                  （用户看着一个真实存在的目录，被告诉「预期位置」）。 */}
+              {dataDirExists && !storageJsonExists && (
+                <span className="text-xs text-warning">
+                  {t("trae.page.accounts.storageJsonMissing")}
+                </span>
+              )}
             </div>
-            {dataDirExists && (
+            {sessionPresent && (
               <p className="mt-1.5 text-xs text-muted-foreground">
                 {t("trae.page.accounts.emptyDirNote")}
               </p>

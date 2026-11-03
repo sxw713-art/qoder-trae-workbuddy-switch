@@ -88,6 +88,7 @@ export const en = {
   "shared.gateway.models.imageNo": "Not supported",
   "shared.gateway.models.imageUndeclared": "Not declared",
   "shared.gateway.models.imageSourceUpstream": "Declared image-capable by the upstream catalog",
+  "shared.gateway.models.imageSourceKnown": "Declared by the gateway built-in table (upstream has no capability field)",
   "shared.gateway.models.imageSourceOverride": "Manually set on this page (overrides upstream)",
   "shared.gateway.models.imageUndeclaredHint":
     "The upstream catalog does not say whether this model accepts images. Clients default to \"not supported\" and drop images before the request reaches the gateway — mark it here if you know better.",
@@ -155,6 +156,8 @@ export const en = {
   "shared.gateway.fallback.stats": "Last {days} days: {total} fallbacks ({ok} succeeded · {fail} failed)",
   "shared.gateway.fallback.events": "Fallback log",
   "shared.gateway.fallback.eventsHide": "Hide log",
+  "shared.gateway.fallback.expand": "Expand",
+  "shared.gateway.fallback.collapse": "Collapse",
   "shared.gateway.fallback.event.time": "Time",
   "shared.gateway.fallback.event.path": "Actual path",
   "shared.gateway.fallback.event.reason": "Trigger",
@@ -345,6 +348,10 @@ export const en = {
   "shared.gateway.probe.emptyAllSkippedDesc":
     "None of these accounts have a usable credential — they may be signed out, hold an encrypted-envelope credential, or have been removed from the account store. Sign in again or import an account on the \"Accounts\" page; if there is no desktop client on this machine (Docker / headless), add an account by QR scan under \"Gateway → Account pool\"; if the \"Pinned account\" strategy is in use, make sure that account is still in the local account store.",
   "shared.gateway.pool.totalRequests": "{count} requests",
+  // issue #129: "auto switch when an account fails" toggle in the pool card toolbar.
+  "shared.gateway.pool.autoFailover": "Switch account on failure",
+  "shared.gateway.pool.autoFailoverHint":
+    "When an account fails mid-reply, the gateway turns that failure into a retryable error so the client reruns the whole step on another account — you get the full answer rewritten from the start. Cost: the partial output is discarded and the step is billed again. Off keeps the previous behaviour (upstream errors are surfaced as-is). Off by default: it changes what clients see on errors.",
   "shared.gateway.pool.tile.available": "Routable",
   // Sub-line inside the "Routable" tile: some of them are merely **at the in-flight cap**
   // (account is fine, clears by itself in seconds). See `GatewayPoolSummary.inFlightFull`
@@ -654,6 +661,15 @@ export const en = {
   "shared.refreshPart.checkin": "Check-in status refreshed",
   "shared.refreshPart.credential": "Credential status refreshed",
   "shared.refreshPart.fail": "Refresh failed",
+  // Credit auto-refresh cadence and "last refreshed" (shared by all three credit views, issue #133).
+  // Two strings for two cost profiles: `autoEvery` hits upstream, `autoFollow` only re-reads
+  // the local snapshot. Jitter makes "every {n} min" false, hence "about".
+  "shared.credit.autoEvery": "Queries upstream about every {n} min",
+  "shared.credit.autoFollow": "Follows background sync",
+  "shared.credit.autoOff": "Auto-refresh is off (enable in Settings · General)",
+  /* The "Used X" line in the pack list — shared by all four assembly sites (issue #144 review §3.4). */
+  "shared.credit.packUsed": "Used {n}",
+  "shared.credit.lastRefresh": "Last refreshed {time}",
   "shared.stat.credits": "Credits",
   "shared.stat.tokens": "Today's tokens",
   "shared.stat.checkin": "Check-in",

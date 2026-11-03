@@ -349,6 +349,13 @@ export interface Session {
   hasHistory: boolean;
   /** WorkBuddy playground（侧栏「任务」）；缺省视为空间会话。 */
   isPlayground?: boolean;
+  /**
+   * ★ issue #147：该会话是**某次复制的产物**（复制账本里有它的血缘）。
+   *
+   * 只在「db 读不到、退回 jsonl 反扫」时由后端给出（`degraded` 同源）。这类条目
+   * 默认**不勾选**：再复制一代只会让 `projects/` 下的 jsonl 数量翻倍。
+   */
+  isCopy?: boolean;
 }
 
 /**
@@ -442,6 +449,60 @@ export interface ExtCopyResponse {
   errors: Array<{ workspaceHash: string; conversationId: string; error: string }>;
   copiedCount: number;
   failCount: number;
+}
+
+/**
+ * issue #87 · **会话导出**报告。
+ *
+ * `skipped` 里的每一条都有原因 —— 导出不做「静默少几条」：用户勾了 10 个、只出去 8 个，
+ * 必须当场看见少了哪两个、为什么。
+ */
+export interface SessionBundleExportReport {
+  /** 落盘路径（用户用「另存为」选的）。 */
+  path: string;
+  /** 真正写进包里的会话数。 */
+  exported: number;
+  /** 跳过的会话（找不到正文 / 不在 projects/ 下 / 读失败）。 */
+  skipped: Array<{ id: string; reason: string }>;
+  /** 包体积（字节）。 */
+  bytes: number;
+}
+
+/** issue #87 · **导出包预览**（导入前给用户确认）。 */
+export interface SessionBundlePreview {
+  kind: string;
+  schema: number | null;
+  exportedAt: string | null;
+  /** 导出端所在的区域（`cn` / `global`）—— 只作参考，导入按当前账号的区域写。 */
+  region: string | null;
+  count: number;
+  /** 前 50 条（`count` 可能更大）。 */
+  sessions: Array<{
+    title: string | null;
+    sourceCid: string | null;
+    workspace: string | null;
+    /** 包里是否带索引行（不带 ⇒ 导入只写正文，客户端列表里可能看不到）。 */
+    hasRow: boolean;
+  }>;
+}
+
+/**
+ * issue #87 · **会话导入**报告。
+ *
+ * ★ **只做加法**：每条都生成新 id，绝不覆盖既有会话；同一份包导两次就是两份副本
+ * （不静默去重 —— 「我以为覆盖了，结果两份」比「我以为合并了，结果只有一份」更难查）。
+ */
+export interface SessionBundleImportReport {
+  imported: Array<{
+    sourceCid: string;
+    /** 新会话 id（带连字符的 UUID）。 */
+    newId: string;
+    /** 是否写了索引行；`false` = 包里没带行，只写了正文。 */
+    rowWritten: boolean;
+  }>;
+  failed: Array<{ sourceCid: string; error: string }>;
+  importedCount: number;
+  failedCount: number;
 }
 
 /**
@@ -549,6 +610,16 @@ export interface SessionReplicaBaseline {
 export interface SessionReplicaContent {
   status: "latest" | "behind" | "diverge" | "unknown";
   commonPrefix: number | null;
+  /**
+   * ★ issue #141：`commonPrefix` 是**精确值**还是**下界**。
+   *
+   * 逐行 hash 只覆盖前 512 行（`PREFIX_HASH_LIMIT`）⇒ 长会话在窗口之外分叉时，
+   * 后端只能保证「至少 512 行相同」，**具体多少不知道**。此时为 `false`，界面必须说
+   * 「至少 N 条」——说成「N 条」就是拿窗口上限冒充真值。
+   *
+   * 旧后端没有这个字段 ⇒ 前端按 `false` 处理（保守）。
+   */
+  commonPrefixExact?: boolean;
   deltas: Record<string, number>;
   latestLineCount: number | null;
   sinceBaseline: Record<string, number | null>;
@@ -1638,6 +1709,14 @@ export interface GatewayConfig {
   per_key_rate_limit?: number | null;
   /** 上下文上限策略（默认 true）：清单声明上游上限窗口；false ⇒ 默认窗口。 */
   max_context: boolean;
+  /**
+   * ★ issue #129：**账号故障时自动切换**（默认 `false`）。
+   *
+   * 开启后，流中途的账号级失败不再被「补终止标记」伪装成成功，而是先发一条
+   * **可重试**的错误帧（含 `HTTP 429` / `HTTP 502`）；失败账号同时写冷却、解绑粘性
+   * ⇒ 客户端整步重跑时必然落到另一个号。
+   */
+  auto_failover: boolean;
 }
 
 /* ─────────── 模型降级链（P13）───────────
@@ -1980,7 +2059,7 @@ export interface CatalogModel {
    */
   supports_images?: boolean | null;
   /** 能力的来源：`upstream`（上游目录）/ `override`（本页手动指定）/ `null`（未声明）。 */
-  image_input_source?: "upstream" | "override" | null;
+  image_input_source?: "upstream" | "override" | "known" | null;
   /** 积分倍率**原文**（`x0.79` / `x0.34 credits` 三种写法并存）。 */
   credits?: string | null;
   /** 积分倍率数字（后端已归一）；`null` = 上游没给。渲染一律用这个，别自己剥 `x`。 */
@@ -2272,6 +2351,18 @@ export interface GatewayLogEntry {
    */
   credit?: number | null;
   stream: boolean;
+  /**
+   * ★ issue #129：**流中途被判失败**时的错误摘要（上游原文，含账号名 / 状态码）。
+   *
+   * - `null` = 这次请求正常结束；
+   * - `undefined` = 升级前写入的老条目（那时还没有这个键）。
+   *
+   * 为什么要单独一个字段：流式条目的 `status` 在写日志那一刻已经定成 200
+   * （上游响应头到达时就写了），**事后断流改不回来** —— 所以后端在开关开启时
+   * 会用这个字段把 `status` 改成真实的 429 / 502 并附上原因。缺了它，
+   * 一次「账号在流中途挂掉」在日志页会显示成**成功的 200 请求**。
+   */
+  error?: string | null;
 }
 
 // ── P7 全局备份：导入预览 / 结果 / 自动备份（与后端 `backup.rs` 同源）─────────────

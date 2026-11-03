@@ -71,13 +71,29 @@ jobs:
                   "update_archive_name": "BuddySwitch-windows-x86_64-setup.exe",
               },
               {
+                  # 桌面端只发 deb + AppImage，但**只有 AppImage 能自更新**
+                  # （tauri-plugin-updater 在 Linux 上仅支持 AppImage，deb 无法原地升级）。
+                  # update_* 四个字段必须给全：Generate updater manifest 的进入条件是
+                  # matrix.update_arch 非空串；缺一个整步就被跳过 ⇒ 不产出
+                  # latest-linux-x86_64.json ⇒ 合并出的 latest.json 里没有 linux-* 平台键
+                  # ⇒ 已安装的 Linux 客户端「检查更新」永远报
+                  #   None of the fallback platforms ["linux-x86_64-appimage","linux-x86_64"]
+                  #   were found in the response "platforms" object
                   "name": "linux-x64",
                   "os": "ubuntu-latest",
                   "target": "x86_64-unknown-linux-gnu",
                   "cli_bin": "buddy-switch-linux-x64",
                   "platform_tag": "linux-x64",
                   "bundles": "deb,appimage",
-                  "update_arch": "",
+                  "update_os": "linux",
+                  "update_arch": "x86_64",
+                  "update_bundle": "appimage",
+                  # ★ 刻意留空：Linux 的更新包**就是那个版本化的 `.AppImage` 本身**
+                  # （tauri-bundler ≥2.10 把 AppImage 归为 v2 自包含目标，不再包 tar.gz），
+                  # 而 `Stage artifacts` 步骤已经把它原样放进 dist-bin。
+                  # 留空 ⇒ 清单里的 url 用产物名（`…_<ver>_amd64.AppImage`），
+                  # 既不会 404，也不必为了一个「稳定名」再复制一份 ~98MB 的资产。
+                  "update_archive_name": "",
               },
               {
                   # ⚠️ **只编 CLI，不编桌面 App**（`bundles` 为空 ⇒ 跳过 `Build desktop app`）。
@@ -133,7 +149,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
 
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
@@ -355,14 +371,27 @@ jobs:
           # 那样产出的安装包名与后面的断言/清单就会互相对不上。
           echo "updater bundle dir: $BUNDLE_DIR (version $VER)"
           ls -la "$BUNDLE_DIR" || true
+          # createUpdaterArtifacts 产出的「可自更新归档」各平台不同：
+          #   macos   → <Product>_<ver>_<arch>.app.tar.gz
+          #   linux   → **`.AppImage` 本身**（+ 同名 `.sig`），**没有 tar.gz**
+          #             tauri-bundler ≥2.10 把 AppImage 归为 v2 自包含目标
+          #             （`bundle.rs::has_self_contained_target`），只有 legacy v1
+          #             兼容模式才包 tar.gz。`install_appimage` 是直接把下载的字节
+          #             写成新 AppImage，不需要解包。
+          #   windows → 直接用 nsis 安装包本身，路径可推导，不必 find
           if [ "$UPDATE_OS" = "windows" ]; then
             ARCHIVE="$BUNDLE_DIR/BuddySwitch_${VER}_x64-setup.exe"
           else
-            ARCHIVE="$(find "$BUNDLE_DIR" -maxdepth 1 -type f -name '*.app.tar.gz' | sort)"
+            case "$UPDATE_OS" in
+              linux) ARCHIVE_GLOB='*.AppImage' ;;
+              *)     ARCHIVE_GLOB='*.app.tar.gz' ;;
+            esac
+            ARCHIVE="$(find "$BUNDLE_DIR" -maxdepth 1 -type f -name "$ARCHIVE_GLOB" | sort)"
             COUNT=$(printf '%s\n' "$ARCHIVE" | sed '/^$/d' | wc -l | tr -d ' ')
             if [ "$COUNT" != 1 ]; then
-              echo "error: expected exactly 1 .app.tar.gz, found $COUNT" >&2
+              echo "error: expected exactly 1 $ARCHIVE_GLOB, found $COUNT" >&2
               printf '%s\n' "$ARCHIVE" >&2
+              ls -la "$BUNDLE_DIR" >&2 || true
               exit 1
             fi
           fi
@@ -370,10 +399,16 @@ jobs:
             echo "error: missing signed updater archive ($ARCHIVE)" >&2
             exit 1
           fi
-          cp "$ARCHIVE" "dist-bin/$UPDATE_ARCHIVE_NAME"
-          cp "$ARCHIVE.sig" "dist-bin/$UPDATE_ARCHIVE_NAME.sig"
+          # 目标资产名：给了就改名（mac/win 要**稳定名**，这样 `releases/latest/download/<name>`
+          # 跨版本都指向同一个键）；没给就沿用产物名 —— Linux 的 `.AppImage` 已经是版本化名字，
+          # 而且上一步（Stage artifacts）已经把它放进 dist-bin 了，再复制一份 ~98MB 纯浪费。
+          TARGET_NAME="${UPDATE_ARCHIVE_NAME:-$(basename "$ARCHIVE")}"
+          if [ "$TARGET_NAME" != "$(basename "$ARCHIVE")" ]; then
+            cp "$ARCHIVE" "dist-bin/$TARGET_NAME"
+            cp "$ARCHIVE.sig" "dist-bin/$TARGET_NAME.sig"
+          fi
           if [ "$UPDATE_OS" = "windows" ]; then
-            cmp -s "dist-bin/$UPDATE_ARCHIVE_NAME" "dist-bin/BuddySwitch_${VER}_x64-setup.exe"
+            cmp -s "dist-bin/$TARGET_NAME" "dist-bin/BuddySwitch_${VER}_x64-setup.exe"
           fi
           UPDATE_VERSION="$VER" sh scripts/gen-update-json.sh
           MANIFEST="$BUNDLE_DIR/latest-${UPDATE_OS}-${UPDATE_ARCH}.json"
@@ -416,7 +451,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
 
       # 只下本平台那一个 artifact（linux 那个有 ~100MB，不必全下）
       - uses: actions/download-artifact@v4
@@ -454,7 +489,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
       - name: Publish main package
         env:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
@@ -490,7 +525,7 @@ jobs:
       # 与 `build` / `publish-*` 各 job 显式声明版本号保持一致，不吃 runner 预装版本。
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
 
       - uses: actions/download-artifact@v4
         with:

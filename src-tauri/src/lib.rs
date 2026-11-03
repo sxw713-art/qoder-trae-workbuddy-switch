@@ -51,9 +51,13 @@ const SCREENSHOT_DEMO_ENV: &str = "BUDDY_SWITCH_SCREENSHOT_DEMO";
 /// 丢 30 秒不会造成错误决策），又远长于一次请求。
 const POOL_PERSIST_INTERVAL_MS: u64 = 30_000;
 
-/// Trae 积分刷新周期（毫秒）。与 WorkBuddy 余额刷新的缺省间隔（30 分钟）一致：
-/// 同一管理面不该有两种节奏。
-const TRAE_CREDITS_REFRESH_INTERVAL_MS: u64 = 30 * 60 * 1000;
+/// Trae 积分刷新周期（毫秒）。
+///
+/// 10 分钟（issue #133）：界面的积分视图与账号卡按同一个间隔自动重读，
+/// 上下游同节奏，用户不会看到「页面刷新了但数字还是十分钟前的」。
+/// ⚠️ 与 `buddy-switch-server` 的 `TRAE_CREDITS_REFRESH_INTERVAL_MS` **必须同值**
+/// —— 两个宿主各写一份，只能靠这条注释与 review 守住。
+const TRAE_CREDITS_REFRESH_INTERVAL_MS: u64 = 10 * 60 * 1000;
 
 /// 定时备份的**检查**周期（毫秒）。
 ///
@@ -604,6 +608,9 @@ pub fn run() {
             commands::sync_session_replicas,
             // P8 · **分歧处理（覆盖式统一）**：目标分歧内容会被丢弃 ⇒ 前端二次确认（两宿主同步）。
             commands::unify_session_replicas,
+            commands::export_sessions_bundle,
+            commands::preview_sessions_bundle,
+            commands::import_sessions_bundle,
             commands::copy_sessions,
             // P14 S4a · VS Code 插件 / CodeBuddy IDE 的**会话仓**（只读枚举 + 加法复制；两宿主同步）。
             commands::list_vscode_sessions,
@@ -801,6 +808,9 @@ pub fn run() {
             commands::qoder_web_credit_packs_probe,
             commands::qoder_web_credit_packs,
             commands::qoder_web_session_status,
+            commands::qoder_web_window_cookies,
+            commands::qoder_web_proxy_get,
+            commands::qoder_web_proxy_set,
             commands::qoder_web_session_logout,
             commands::trae_merge_legacy_regions,
             commands::trae_save_login,

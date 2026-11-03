@@ -25,9 +25,9 @@
 //!      ⚠️ 档位号 **N 会随客户端升级往上搬**（实测 v2 → v3 → v4），由
 //!      [`edge_sync_db_path_for`] 动态发现，**不要写死**。
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 /// 源会话行：(列名, 列值)。两处「读源会话行」共用同一份返回形状，
 /// 抽成别名避免同一条深嵌套签名在 impl 里写两遍（clippy::type_complexity）。
@@ -43,7 +43,7 @@ use crate::modules::config::{backup_dir, home_dir, now_ms, now_secs, utc_iso};
 use crate::modules::region::Region;
 
 /// 打开数据库并设置 busy_timeout（对照 Python `sqlite3.connect(timeout=5)`）。
-fn open_db(path: &Path, read_only: bool) -> Option<Connection> {
+pub(crate) fn open_db(path: &Path, read_only: bool) -> Option<Connection> {
     let conn = if read_only {
         Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?
     } else {
@@ -413,7 +413,7 @@ fn find_project_jsonl_in(projects: &Path, cid: &str) -> Option<PathBuf> {
 /// - 只收 `.jsonl`（`.file-rollback.ndjson` / `.meta.json` / 子代理文件不参与）；
 /// - **直立在先**：`projects/{cid}.jsonl` 与子目录里的同名文件并存时，直立赢；
 /// - 子目录兜底：`projects/{workspace}/{cid}.jsonl`。
-fn build_projects_index_for(region: Region) -> HashMap<String, PathBuf> {
+pub(crate) fn build_projects_index_for(region: Region) -> HashMap<String, PathBuf> {
     build_projects_index_in(&session_data_dir(region).join("projects"))
 }
 
@@ -483,6 +483,26 @@ pub const PREFIX_HASH_LIMIT: usize = 512;
 pub struct SessionFingerprint {
     pub line_count: usize,
     pub prefix_hashes: Vec<u64>,
+    /// **整份正文**的累计摘要（逐行 FNV，行间续入 `\n`；与 `prefix_hashes` 同一套归一化）。
+    ///
+    /// ## 为什么必须有它（issue #141）
+    ///
+    /// `prefix_hashes` 只覆盖**前 [`PREFIX_HASH_LIMIT`] 行**，而判据曾经写成
+    /// 「公共前缀 < 最短副本行数 ⇒ `diverge`」⇒ 任何 **> 512 行**的组，公共前缀的
+    /// **上限**就是 512，`common < min_lines` **恒为真** ⇒ 逐字节相同的长会话也被报成
+    /// 「有分歧」（且 `behind` 对长会话永不可达，「处理分歧」走全量比对又认为本来就一致
+    /// ⇒ 点完什么都不发生，用户看到的是死循环）。
+    ///
+    /// 整份摘要给出一个**窗口之外**的判据：行数相同 + 摘要相同 ⇒ 内容相同（`latest`），
+    /// 不必把窗口放大到全文（那会让响应体与落盘缓存随会话长度线性膨胀）。
+    /// 行数不同时仍需验证「短的是不是长的前缀」，见 [`prefix_digest_of_file`]。
+    ///
+    /// ⚠️ **代价**：算它要把**每一行**都过一遍 FNV（原先只 hash 前 512 行）。冷缓存那一次
+    /// 会多出约 66 GB 的纯 CPU 哈希（真机账本口径），相对 7 分钟的 IO 约一成；而结果随
+    /// `(size, mtime)` 落盘复用 ⇒ 同一份文件只付一次。**不要**为了省这点 CPU 把它改成
+    /// 「只对长会话算」：那会让 `full_hash` 的含义随文件长度变化，判据更难推理。
+    #[serde(skip)]
+    pub full_hash: u64,
 }
 
 /// 读一个会话的**内容指纹**；jsonl 不存在 / 不可读时返回 `None`（**fail-closed**）。
@@ -518,12 +538,17 @@ pub fn fingerprint_of_file(path: &Path, cid: &str) -> Option<SessionFingerprint>
 /// 4 是「能把 NVMe 队列喂饱、又不至于让机械盘彻底抖动」的稳妥值。
 const FINGERPRINT_READ_THREADS: usize = 4;
 
-/// 缓存条目的本体：指纹 + **失效判据**（大小 / mtime）。
+/// 缓存条目的本体：指纹 + **失效判据**（大小 / mtime）+ 一个**前缀探针**。
 #[derive(Clone)]
 struct CachedFingerprint {
     size: u64,
     mtime_ms: i64,
     fingerprint: SessionFingerprint,
+    /// 探针：`(前 N 行的累计摘要)`，N 由**搭档副本的行数**决定。
+    ///
+    /// 只留**一个**槽位而不是一张表：同一份文件在一组里通常只被同一个搭档追问，
+    /// 而每多留一个槽位就要为 25k 个条目各付 16 字节。换搭档 ⇒ 覆盖重算（读一次）。
+    probe: Option<(usize, u64)>,
 }
 
 /// ★ 指纹缓存（键 = `region ␟ cid`）—— **进程内 + 落盘**两级。
@@ -570,7 +595,10 @@ const FINGERPRINT_CACHE_FILE: &str = "session-fingerprints.bin";
 
 /// 落盘格式的魔数 + 版本。**改格式必须换它** —— 否则老文件会被按新布局解读，
 /// 读出满屏垃圾读数（比缓存失效坏得多，因为它是**静默的错**）。
-const FINGERPRINT_CACHE_MAGIC: &[u8; 8] = b"BSFPC002";
+///
+/// 版本史：`BSFPC001` 初版 → `BSFPC002` 加 `lineCount` → `BSFPC003` 加
+/// `full_hash`（整份摘要）与探针位（issue #141 的前缀验证）。
+const FINGERPRINT_CACHE_MAGIC: &[u8; 8] = b"BSFPC003";
 
 /// 条目数上限：超过就不落盘（内存缓存照常工作）。
 ///
@@ -654,10 +682,28 @@ impl FingerprintStore {
                 size,
                 mtime_ms,
                 fingerprint,
+                probe: None,
             },
         );
         self.dirty = true;
         self.fresh_reads += 1;
+    }
+
+    /// 取**已记录的前缀探针**（`offset` = 需要的行数）：命中且行数相同 ⇒ 直接给摘要。
+    fn probe(&self, key: &str, offset: usize) -> Option<u64> {
+        match self.entries.get(key)?.probe {
+            Some((cached_offset, digest)) if cached_offset == offset => Some(digest),
+            _ => None,
+        }
+    }
+
+    /// 记下**刚算出来**的前缀探针（随条目一起落盘 ⇒ 下次开页零 IO）。
+    fn record_probe(&mut self, key: &str, offset: usize, digest: u64) {
+        let Some(entry) = self.entries.get_mut(key) else {
+            return;
+        };
+        entry.probe = Some((offset, digest));
+        self.dirty = true;
     }
 
     /// 从磁盘载入（**fail-safe**：文件缺失 / 魔数不符 / 中途损坏都退化成空表）。
@@ -705,6 +751,13 @@ impl FingerprintStore {
                 };
                 prefix_hashes.push(hash);
             }
+            let (Some(full_hash), Some(probe_offset), Some(probe_digest)) = (
+                read_u64(body, &mut cursor),
+                read_u64(body, &mut cursor),
+                read_u64(body, &mut cursor),
+            ) else {
+                return store;
+            };
             store.entries.insert(
                 key,
                 CachedFingerprint {
@@ -713,7 +766,10 @@ impl FingerprintStore {
                     fingerprint: SessionFingerprint {
                         line_count: line_count as usize,
                         prefix_hashes,
+                        full_hash,
                     },
+                    // `offset == 0` 是「没有探针」的哨兵（行数 0 的探针没有意义）。
+                    probe: (probe_offset > 0).then_some((probe_offset as usize, probe_digest)),
                 },
             );
         }
@@ -768,6 +824,10 @@ impl FingerprintStore {
             for hash in hashes {
                 bytes.extend_from_slice(&hash.to_le_bytes());
             }
+            bytes.extend_from_slice(&entry.fingerprint.full_hash.to_le_bytes());
+            let (probe_offset, probe_digest) = entry.probe.unwrap_or((0, 0));
+            bytes.extend_from_slice(&(probe_offset as u64).to_le_bytes());
+            bytes.extend_from_slice(&probe_digest.to_le_bytes());
         }
         if crate::modules::config::atomic_write_bytes(path, &bytes).is_err() {
             // 写失败**不清 dirty**：下次还有机会重写（否则一次瞬时失败就永久停写）。
@@ -909,26 +969,72 @@ fn fingerprints_for_members(
 pub fn fingerprint_of_text(text: &str, cid: &str) -> SessionFingerprint {
     let mut line_count = 0usize;
     let mut prefix_hashes: Vec<u64> = Vec::new();
+    let mut full_hash = FNV_OFFSET_BASIS;
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
         line_count += 1;
+        // ★ 先 trim 再归一化：占位符不含空白 ⇒ 与「先整串 replace 再 trim」等价。
+        let normalized = normalized_line(line, cid);
         if prefix_hashes.len() < PREFIX_HASH_LIMIT {
-            // ★ 先 trim 再归一化：占位符不含空白 ⇒ 与「先整串 replace 再 trim」等价。
-            let hash = if cid.is_empty() || !line.contains(cid) {
-                hash_line(line)
-            } else {
-                hash_line(&line.replace(cid, SESSION_ID_PLACEHOLDER))
-            };
-            prefix_hashes.push(hash);
+            prefix_hashes.push(hash_line(&normalized));
         }
+        // ★ 整份摘要与逐行 hash **同一套归一化**（否则两个副本的 `full_hash` 永远不等）。
+        full_hash = fnv_step(full_hash, &normalized);
     }
     SessionFingerprint {
         line_count,
         prefix_hashes,
+        full_hash,
     }
+}
+
+/// 一行正文的**归一化**形态（把本会话自己的 cid 换成占位符）。
+///
+/// 逐行按需替换：整串 `replace` 会为每个会话多分配一份与正文等大的字符串
+/// （真机均值 2.85 MB × 25k 副本 ≈ 70 GB 的纯拷贝）。
+fn normalized_line<'a>(line: &'a str, cid: &str) -> std::borrow::Cow<'a, str> {
+    if cid.is_empty() || !line.contains(cid) {
+        std::borrow::Cow::Borrowed(line)
+    } else {
+        std::borrow::Cow::Owned(line.replace(cid, SESSION_ID_PLACEHOLDER))
+    }
+}
+
+/// 只读**前 `upto` 行**算累计摘要（与 [`SessionFingerprint::full_hash`] 同口径）。
+///
+/// ## 用途（issue #141）
+///
+/// 判「短副本是不是长副本的**前缀**」（即 `behind`）需要长副本**前 N 行**的摘要，
+/// 而指纹里只存了整份摘要与前 512 行的逐行 hash。这里**只读到第 N 行就停**
+/// （不是读全文），并允许调用方把它记进 [`FingerprintStore`] 的探针位 —— 于是同一对
+/// 文件第二次开页**零 IO**。
+///
+/// ⚠️ 行数不足 `upto` ⇒ `None`：那说明文件比指纹记录的短（正在被改写 / 已被截断），
+/// 此时**不给结论**（宁可 `unknown`，也不把「读不到」当成「前缀相同」）。
+fn prefix_digest_of_file(path: &Path, cid: &str, upto: usize) -> Option<u64> {
+    use std::io::BufRead as _;
+    if upto == 0 {
+        return Some(FNV_OFFSET_BASIS);
+    }
+    let file = std::fs::File::open(path).ok()?;
+    let mut state = FNV_OFFSET_BASIS;
+    let mut seen = 0usize;
+    for line in std::io::BufReader::new(file).lines() {
+        let line = line.ok()?;
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        seen += 1;
+        state = fnv_step(state, &normalized_line(line, cid));
+        if seen >= upto {
+            return Some(state);
+        }
+    }
+    None
 }
 
 /// FNV-1a 64 的初始值与乘数（**不引第三方依赖**：本 crate 的依赖面刻意保持小）。
@@ -946,6 +1052,15 @@ fn fnv1a(bytes: &[u8], mut state: u64) -> u64 {
         state = state.wrapping_mul(FNV_PRIME);
     }
     state
+}
+
+/// 把**一行**续进累计摘要：先并入行字节，再并入 `\n`（行分隔也参与 hash ⇒
+/// 「同样的字节被切成不同行」不会撞成同一个摘要）。
+///
+/// ⚠️ 必须是**可增量**的：`prefix_digest_of_file` 要能算出「前 N 行」的摘要并与
+/// 整份摘要比较，靠的就是同一套逐步累积。
+fn fnv_step(state: u64, line: &str) -> u64 {
+    fnv1a(b"\n", fnv1a(line.as_bytes(), state))
 }
 
 /// 稳定 hash（FNV-1a 64）—— **不引第三方依赖**（本 crate 只有 `serde_json`）。
@@ -1641,6 +1756,10 @@ fn scan_sessions_from_jsonl_for(region: Region) -> Vec<Value> {
     if !projects.is_dir() {
         return Vec::new();
     }
+    // ★ issue #147：反扫列表必须能标出「这条其实是副本」—— 否则用户会把上一代副本
+    //   当成源会话再勾选一遍（前端据此默认不勾选）。
+    let ledger = load_copy_ledger_at(&copy_ledger_path_for(region));
+    let (copy_origins, _) = build_origin_indexes(&ledger);
     let mut sessions: Vec<(i64, Value)> = Vec::new();
     let Ok(entries) = std::fs::read_dir(&projects) else {
         return Vec::new();
@@ -1648,14 +1767,14 @@ fn scan_sessions_from_jsonl_for(region: Region) -> Vec<Value> {
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_file() {
-            push_jsonl_session(&path, &mut sessions);
+            push_jsonl_session(&path, &copy_origins, &mut sessions);
             continue;
         }
         let Ok(children) = std::fs::read_dir(&path) else {
             continue;
         };
         for child in children.flatten() {
-            push_jsonl_session(&child.path(), &mut sessions);
+            push_jsonl_session(&child.path(), &copy_origins, &mut sessions);
         }
     }
     sessions.sort_by_key(|s| std::cmp::Reverse(s.0));
@@ -1663,7 +1782,14 @@ fn scan_sessions_from_jsonl_for(region: Region) -> Vec<Value> {
 }
 
 /// 把单个路径收成一条会话记录；不是 `.jsonl` 文件 / 读不出元数据时跳过（**绝不报错**）。
-fn push_jsonl_session(path: &Path, out: &mut Vec<(i64, Value)>) {
+///
+/// `copy_origins` 是账本血缘索引：命中即说明该 cid 是某次复制生成的副本，
+/// 条目上打 `isCopy: true`（issue #147）。
+fn push_jsonl_session(
+    path: &Path,
+    copy_origins: &HashMap<String, (String, String)>,
+    out: &mut Vec<(i64, Value)>,
+) {
     if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
         return;
     }
@@ -1706,6 +1832,8 @@ fn push_jsonl_session(path: &Path, out: &mut Vec<(i64, Value)>) {
             "hasHistory": true,
             "isPlayground": false,
             "degraded": true,
+            // ★ issue #147：副本标记 —— 前端据此默认不勾选，避免「副本的副本」。
+            "isCopy": copy_origins.contains_key(cid),
         }),
     ));
 }
@@ -1881,9 +2009,10 @@ pub fn copy_session_to_user_for(
 /// 报告里的 `skipped` 条目逐字一致（同一条管线的两个出口）。
 ///
 /// **降级**：源 sessions 表不可读时，从 jsonl 第一行推断 cwd 做 Claw 检查；
-/// 目标 sessions 表不可写时，jsonl 仍能复制但索引行留空（返回 `warning`）。
-/// 这样即便 workbuddy.db 损坏 / 索引缺失，至少 jsonl 正文能落到目标账号，
-/// WorkBuddy AI 重启后建索引即可看到。
+/// 源行缺失（全新账号 / 仅 jsonl 存在）时**合成最小索引行**（issue #146）。
+/// 目标 sessions 表不可写时，jsonl 仍能复制，但报告 `sessionRowWritten: false` +
+/// `sessionRowError` + 批次 `failed: true` —— **不得**承诺「重启后客户端会重建索引」：
+/// 客户端只认 `sessions` 表，不会从 jsonl 反推。
 ///
 /// 单发入口：内部走与批量复制**同一条**三段管线（见模块文档），
 /// 再把唯一一个会话的结局还原成旧签名的 `Result`（Claw 拒绝 → `Err`）。
@@ -1962,6 +2091,10 @@ struct CopyBatch {
     projects_index: Option<HashMap<String, PathBuf>>,
     /// 复制账本（整批一次读入内存；`dirty` 控制末尾落盘）。
     ledger: serde_json::Map<String, Value>,
+    /// 副本 id → 血缘 `(origin_uid, origin_cid)`（issue #147；加载时构建、登记时增量更新）。
+    copy_origins: HashMap<String, (String, String)>,
+    /// `(origin_cid, target_uid)`：该原始会话是否已复制给目标账号（跨代去重）。
+    origin_copied: HashSet<(String, String)>,
     ledger_path: PathBuf,
     ledger_dirty: bool,
     /// **整批一次**的库备份（懒触发：第一个真正复制的会话之前）。
@@ -1999,6 +2132,8 @@ impl CopyBatch {
         // 账本整批一次读入（旧实现每个会话都读一遍、写完再读一遍）。
         let ledger_path = copy_ledger_path_for(target_region);
         let ledger = load_copy_ledger_at(&ledger_path);
+        // ★ issue #147：血缘索引同一次加载时构建，复制前的「副本识别」靠它。
+        let (copy_origins, origin_copied) = build_origin_indexes(&ledger);
         // 基线表同样整批一次读入（与账本**同 region 目录**，见 `session_baseline_path_for`）。
         let baselines_path = session_baseline_path_for(target_region);
         let baselines = load_session_baselines_at(&baselines_path);
@@ -2013,6 +2148,8 @@ impl CopyBatch {
             dst_columns: None,
             projects_index: None,
             ledger,
+            copy_origins,
+            origin_copied,
             ledger_path,
             ledger_dirty: false,
             backup_attempted: false,
@@ -2086,27 +2223,35 @@ impl CopyBatch {
 
     /// 账本命中**且副本仍存活** → 既有副本 id（语义与旧 `ledger_hit_for` 一致）。
     fn ledger_hit(&mut self, cid: &str) -> Option<String> {
-        let new_cid = self
-            .ledger
-            .get(&copy_ledger_key_for(
-                self.source_region,
-                self.target_region,
-                &self.source_uid,
-                &self.target_uid,
-                cid,
-            ))?
-            .as_str()?
-            .trim()
-            .to_string();
-        if new_cid.is_empty() {
-            return None;
-        }
+        let key = copy_ledger_key_for(
+            self.source_region,
+            self.target_region,
+            &self.source_uid,
+            &self.target_uid,
+            cid,
+        );
+        let new_cid = ledger_new_of(self.ledger.get(&key)?)?;
         let target_uid = self.target_uid.clone();
         self.session_exists(&new_cid, &target_uid)
             .then_some(new_cid)
     }
 
+    /// 该 cid 本身是副本时返回它的血缘 `(origin_uid, origin_cid)`（issue #147）。
+    fn copy_origin(&self, cid: &str) -> Option<(String, String)> {
+        self.copy_origins.get(cid).cloned()
+    }
+
+    /// 该原始会话是否**已经复制给当前目标账号**（issue #147 的跨代去重判据）。
+    fn origin_already_copied(&self, origin_cid: &str) -> bool {
+        self.origin_copied
+            .contains(&(origin_cid.to_string(), self.target_uid.clone()))
+    }
+
     /// 登记一次复制（先进内存；落盘见 [`Self::flush_ledger`]）。
+    ///
+    /// ★ issue #147：值里带**血缘**。源会话本身是副本时沿用它的 origin，否则
+    /// origin 就是「源账号 + 源 cid」。没有血缘时账本只能回答「谁复制过谁」，
+    /// 无法回答「这个 cid 是不是副本」⇒ 副本会被当成源会话再复制一代（雪崩）。
     fn ledger_record(&mut self, source_cid: &str, new_cid: &str) {
         let key = copy_ledger_key_for(
             self.source_region,
@@ -2115,7 +2260,20 @@ impl CopyBatch {
             &self.target_uid,
             source_cid,
         );
-        self.ledger.insert(key, Value::String(new_cid.to_string()));
+        let origin = self
+            .copy_origins
+            .get(source_cid)
+            .cloned()
+            .unwrap_or_else(|| (self.source_uid.clone(), source_cid.to_string()));
+        let value = json!({
+            "new": new_cid,
+            "originUid": origin.0,
+            "originCid": origin.1,
+        });
+        self.ledger.insert(key, value);
+        self.origin_copied
+            .insert((origin.1.clone(), self.target_uid.clone()));
+        self.copy_origins.insert(new_cid.to_string(), origin);
         self.ledger_dirty = true;
     }
 
@@ -2208,7 +2366,7 @@ fn dedup_report(cid: &str, existing: &str) -> Value {
 }
 
 /// 从源行里取进度展示名（`custom_title` 优先，与 [`session_display_title`] 同优先级）。
-fn row_title(cols: &[String], vals: &[rusqlite::types::Value]) -> String {
+pub(crate) fn row_title(cols: &[String], vals: &[rusqlite::types::Value]) -> String {
     let column = |name: &str| -> Option<String> {
         let index = cols.iter().position(|c| c == name)?;
         match vals.get(index)? {
@@ -2260,6 +2418,26 @@ fn run_copy_batch(
     let mut skipped: Vec<Value> = Vec::new();
     let mut errors: Vec<Value> = Vec::new();
     for cid in session_ids {
+        // ⓪ 副本识别（issue #147）：源会话本身是某次复制的产物 ⇒ 按血缘去重。
+        //    没有这一步，B 的副本会在下一次切换时被当成「源会话」再复制一代，
+        //    每切一次账号副本就翻一倍（现场实测 18 个真实会话堆成 300+ 个 jsonl）。
+        if let Some((origin_uid, origin_cid)) = batch.copy_origin(cid) {
+            let reason = if origin_uid == target_uid {
+                Some("该会话是副本，原始会话属于目标账号")
+            } else if batch.origin_already_copied(&origin_cid) {
+                Some("该会话是副本，原始会话已复制到目标账号")
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                skipped.push(json!({
+                    "id": cid,
+                    "deduplicated": true,
+                    "reason": reason,
+                }));
+                continue;
+            }
+        }
         // ① 账本去重（内存账本 + 副本存活判定）
         if let Some(existing) = batch.ledger_hit(cid) {
             skipped.push(dedup_report(cid, &existing));
@@ -2359,12 +2537,20 @@ fn run_copy_batch(
         // 备份整批只做一次：在**第一个**真正复制的会话之前拍快照。
         let backup = batch.ensure_backup();
         let columns = batch.dst_columns();
-        let session_row_written = match (&plan.row, batch.dst_conn()) {
+        // ★ issue #146：源行缺失（全新账号 / 仅 jsonl 存在）时**合成**最小索引行。
+        //   跳过写库 = 目标账号在客户端里永远「暂无任务」，且下次切换会把刚复制出的
+        //   副本当成源会话再复制一遍（雪崩，见 #147）。
+        let session_row = match (plan.row.as_ref(), batch.dst_conn()) {
             (Some((cols, vals)), Some(dst)) => {
                 insert_session_row(dst, &columns, cols, vals, &plan.new_cid, &target_uid)
             }
-            _ => false,
+            (None, Some(dst)) => {
+                let (cols, vals) = synthesize_session_row(&columns, plan);
+                insert_session_row(dst, &columns, &cols, &vals, &plan.new_cid, &target_uid)
+            }
+            (_, None) => Err("目标库不可用（workbuddy.db 不存在）".to_string()),
         };
+        let session_row_written = session_row.is_ok();
         let mapping_written = match batch.edge_conn() {
             Some(edge) => insert_edge_sync_mapping_conn(edge, &plan.new_cid, &target_uid),
             None => false,
@@ -2385,9 +2571,14 @@ fn run_copy_batch(
             Some(error) => Some(format!(
                 "复制前备份失败（{error}）；本次复制没有可回滚的备份点，请手动备份后重试"
             )),
-            None if jsonl_ok && !session_row_written => Some(
-                "目标账号的会话索引不可写；已复制正文，请重启 WorkBuddy 让其重建索引".to_string(),
-            ),
+            None if jsonl_ok && !session_row_written => Some(format!(
+                "会话索引未写入（{}）；目标账号在客户端里看不到该会话",
+                session_row
+                    .as_ref()
+                    .err()
+                    .map(String::as_str)
+                    .unwrap_or("原因未知")
+            )),
             None if jsonl_ok && !mapping_written => {
                 Some("云端映射注册失败；新会话暂时无法在 WorkBuddy 中显示云端历史".to_string())
             }
@@ -2405,6 +2596,11 @@ fn run_copy_batch(
         });
         if let Some(warning) = warning {
             report["warning"] = json!(warning);
+        }
+        // ★ issue #146：失败原因必须可诊断，不能只留一句泛化的 warning。
+        if let Err(error) = &session_row {
+            report["sessionRowError"] = json!(error);
+            report["failed"] = json!(true);
         }
         copied.push(report);
     }
@@ -2436,6 +2632,14 @@ fn run_copy_batch(
     if !errors.is_empty() {
         report["errors"] = json!(errors);
     }
+    // ★ issue #146：索引行写失败时整批标记 failed —— 「报告成功但目标账号看不到」
+    //   是本次事故最坏的一面，不能再让调用方从 `copied` 计数里猜。
+    if copied
+        .iter()
+        .any(|item| item.get("sessionRowError").is_some())
+    {
+        report["failed"] = json!(true);
+    }
     report
 }
 
@@ -2460,7 +2664,7 @@ fn target_jsonl_path_for(
 }
 
 /// 表的列名清单（按 PRAGMA 顺序）；表不存在时为空。
-fn table_columns(conn: &Connection, table: &str) -> Vec<String> {
+pub(crate) fn table_columns(conn: &Connection, table: &str) -> Vec<String> {
     let Ok(mut stmt) = conn.prepare(&format!("PRAGMA table_info({table})")) else {
         return Vec::new();
     };
@@ -2476,7 +2680,7 @@ fn table_columns(conn: &Connection, table: &str) -> Vec<String> {
 ///
 /// 入参是**连接**而不是路径：批量管线的 phase 0 对每个会话都要读行，
 /// 连接由调用方（[`CopyBatch`]）整批复用 —— 旧实现每个会话各开一次库。
-fn read_session_row(
+pub(crate) fn read_session_row(
     conn: &Connection,
     cid: &str,
     source_uid: &str,
@@ -2511,24 +2715,85 @@ fn read_session_row(
     Ok(Some((cols, vals)))
 }
 
+/// 源会话行缺失时合成的最小索引行（issue #146）。
+///
+/// ## 为什么不能「跳过写库」
+///
+/// 全新账号在 `sessions` 表里 0 行 ⇒ 会话列表退回 jsonl 反扫（`degraded: true`），
+/// 这些 cid 在库里**属于别的账号或根本不存在** ⇒ [`read_session_row`] 必然返回 `None`。
+/// 旧实现在这里直接不写索引行，只留一条「请重启 WorkBuddy 让其重建索引」的 warning ——
+/// 而客户端**不会**从 jsonl 重建索引，于是目标账号永远显示「暂无任务」，
+/// 且下次切换会把刚复制出的副本当成源会话再复制一遍（雪崩，见 #147）。
+///
+/// 合成行只填客户端要求的非空列（`id` / `user_id` / `cwd` / `status` / `transport` /
+/// 两个时间戳）；`id` 与 `user_id` 由 [`insert_session_row`] 统一覆盖，这里给占位值。
+/// 目标库缺的列直接不出现，其余列交给库默认值 —— 真失败由写后回读报错，不再静默。
+fn synthesize_session_row(dst_cols: &[String], plan: &CopyPlan) -> SessionRow {
+    let meta = plan.jsonl_src.as_deref().and_then(read_jsonl_meta);
+    let cwd = meta
+        .as_ref()
+        .map(|meta| meta.cwd.clone())
+        .unwrap_or_default();
+    // 标题与侧栏同口径：jsonl 里的（customTitle > aiTitle）优先，退回 phase 0 算出的展示名。
+    let title = meta
+        .as_ref()
+        .map(|meta| meta.title.clone())
+        .filter(|title| !title.trim().is_empty())
+        .unwrap_or_else(|| plan.title.clone());
+    let now = now_ms();
+    let candidates: Vec<(&str, rusqlite::types::Value)> = vec![
+        ("id", rusqlite::types::Value::Text(String::new())),
+        ("user_id", rusqlite::types::Value::Text(String::new())),
+        ("cwd", rusqlite::types::Value::Text(cwd)),
+        ("title", rusqlite::types::Value::Text(title)),
+        (
+            "status",
+            rusqlite::types::Value::Text("completed".to_string()),
+        ),
+        (
+            "transport",
+            rusqlite::types::Value::Text("local".to_string()),
+        ),
+        ("created_at", rusqlite::types::Value::Integer(now)),
+        ("updated_at", rusqlite::types::Value::Integer(now)),
+    ];
+    let mut cols = Vec::with_capacity(candidates.len());
+    let mut vals = Vec::with_capacity(candidates.len());
+    for (col, value) in candidates {
+        if !dst_cols.iter().any(|existing| existing == col) {
+            continue;
+        }
+        cols.push(col.to_string());
+        vals.push(value);
+    }
+    (cols, vals)
+}
+
 /// 把**已读出的源行**写入目标库（动态列，覆盖 id/user_id/时间戳）。
 ///
 /// 源与目标可以是两个版本的 db。目标库缺某一列时**丢弃该列**而不是整条失败 ——
 /// 两版 schema 高度同源但允许有差异，丢弃比让整次复制失败更接近用户预期。
 ///
-/// 返回 `true` = 写入了 sessions 索引行；`false` = 软失败（目标库 / 表不可用、
-/// 列被丢空、执行失败）—— 调用方据此决定是否提示用户「重启 WorkBuddy 重建索引」。
+/// ## 返回值语义（issue #146）
+///
+/// `Ok(())` = 目标库**回读确认**该行存在且 `user_id` 就是目标账号；
+/// `Err(原因)` = 没写成 / 写歪了。旧实现返回 `bool` 并把 `rusqlite::Error` 整个丢掉，
+/// 调用方无法区分「表不存在」「NOT NULL 违约」「归属被改」—— 于是只能笼统地报
+/// 「索引不可写，请重启客户端」，把可诊断的失败变成了玄学。
+///
+/// ★ 必须回读：`execute` 成功只代表语句没报错，触发器 / 约束 / 主键冲突都可能让行
+/// 落到别处或根本不存在，而「报告成功但目标账号看不到」正是本次事故的根因。
 /// Claw 拒绝发生在**读行**阶段（[`read_session_row`]），与本函数无关。
-fn insert_session_row(
+pub(crate) fn insert_session_row(
     dst: &Connection,
     dst_cols: &[String],
     cols: &[String],
     vals: &[rusqlite::types::Value],
     new_cid: &str,
     target_uid: &str,
-) -> bool {
+) -> Result<(), String> {
     if !table_exists(dst, "sessions") {
-        return false;
+        return Err("目标库没有 sessions 表".to_string());
     }
     let mut insert_cols: Vec<&str> = Vec::with_capacity(cols.len());
     let mut insert_vals: Vec<rusqlite::types::Value> = Vec::with_capacity(vals.len());
@@ -2547,7 +2812,7 @@ fn insert_session_row(
         insert_vals.push(v);
     }
     if insert_cols.is_empty() {
-        return false;
+        return Err("目标库 sessions 表没有可写列".to_string());
     }
 
     let placeholders = insert_cols
@@ -2558,9 +2823,23 @@ fn insert_session_row(
     let colnames = insert_cols.join(", ");
     let sql = format!("INSERT OR REPLACE INTO sessions ({colnames}) VALUES ({placeholders})");
     let params: Vec<&rusqlite::types::Value> = insert_vals.iter().collect();
-    // 执行失败也降级为软失败：jsonl 已复制，至少正文能落到目标账号。
     dst.execute(&sql, rusqlite::params_from_iter(params))
-        .is_ok()
+        .map_err(|e| format!("写入会话索引失败：{e}"))?;
+
+    // ★ 写后回读：确认这一行真的属于目标账号（issue #146 的验收口径）。
+    let owner = dst
+        .query_row(
+            "SELECT user_id FROM sessions WHERE id = ?1",
+            rusqlite::params![new_cid],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map_err(|e| format!("回读会话索引失败：{e}"))?;
+    match owner.flatten() {
+        Some(uid) if uid == target_uid => Ok(()),
+        Some(uid) => Err(format!("会话索引归属不是目标账号（{uid}）")),
+        None => Err("会话索引写入后回读不到该行".to_string()),
+    }
 }
 
 /// 按**路径**的插入入口（`#[cfg(test)]`：只服务单测）。
@@ -2593,9 +2872,7 @@ fn insert_session_copy(
         return Ok(false);
     };
     let dst_cols = table_columns(&dst, "sessions");
-    Ok(insert_session_row(
-        &dst, &dst_cols, &cols, &vals, new_cid, target_uid,
-    ))
+    insert_session_row(&dst, &dst_cols, &cols, &vals, new_cid, target_uid).map(|()| true)
 }
 
 /// 把新会话注册进 edge_sync_mapping（云端归属关键）。失败不致命，返回 False。
@@ -2802,6 +3079,70 @@ fn copy_ledger_key_for(
     }
 }
 
+/// 账本值里的字段名（issue #147：值从裸 `new_cid` 升级为带血缘的对象）。
+///
+/// 旧值是字符串 `"<new_cid>"`，新值是
+/// `{"new": "<new_cid>", "originUid": "<原始账号>", "originCid": "<原始会话>"}`。
+/// 两种都要能读 —— 用户升级前的账本不能作废（否则所有会话被重新复制一遍）。
+const LEDGER_NEW: &str = "new";
+const LEDGER_ORIGIN_UID: &str = "originUid";
+const LEDGER_ORIGIN_CID: &str = "originCid";
+
+/// 从账本值取副本 id：兼容旧格式（裸字符串）与新格式（对象）。
+fn ledger_new_of(value: &Value) -> Option<String> {
+    let new = match value {
+        Value::String(text) => Some(text.as_str()),
+        Value::Object(map) => map.get(LEDGER_NEW).and_then(Value::as_str),
+        _ => None,
+    }?;
+    let trimmed = new.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+/// 从账本值取血缘 `(origin_uid, origin_cid)`；旧格式（无血缘）返回 `None`。
+fn ledger_origin_of(value: &Value) -> Option<(String, String)> {
+    let map = value.as_object()?;
+    let uid = map.get(LEDGER_ORIGIN_UID)?.as_str()?.trim();
+    let cid = map.get(LEDGER_ORIGIN_CID)?.as_str()?.trim();
+    (!uid.is_empty() && !cid.is_empty()).then(|| (uid.to_string(), cid.to_string()))
+}
+
+/// 从账本键里取 `target_uid`（键形如 `[region␟]source␟target␟cid`）。
+fn ledger_key_target(key: &str) -> Option<String> {
+    let parts: Vec<&str> = key.split(LEDGER_SEP).collect();
+    match parts.as_slice() {
+        [_, target, _] => Some((*target).to_string()),
+        [_, _, target, _] => Some((*target).to_string()),
+        _ => None,
+    }
+}
+
+/// 从账本构建两个血缘索引（issue #147）。
+///
+/// - `copy_origins`：副本 id → `(origin_uid, origin_cid)` —— 回答「这个 cid 是哪个原始会话的副本」；
+/// - `origin_copied`：`(origin_cid, target_uid)` —— 回答「该原始会话是否已复制给目标账号」。
+///
+/// 旧格式条目（值是裸字符串）没有血缘 ⇒ 只能当「它不是副本」，两个索引里都不出现。
+fn build_origin_indexes(
+    ledger: &serde_json::Map<String, Value>,
+) -> (HashMap<String, (String, String)>, HashSet<(String, String)>) {
+    let mut copy_origins = HashMap::new();
+    let mut origin_copied = HashSet::new();
+    for (key, value) in ledger {
+        let Some(new_cid) = ledger_new_of(value) else {
+            continue;
+        };
+        let Some(origin) = ledger_origin_of(value) else {
+            continue;
+        };
+        if let Some(target) = ledger_key_target(key) {
+            origin_copied.insert((origin.1.clone(), target));
+        }
+        copy_origins.insert(new_cid, origin);
+    }
+    (copy_origins, origin_copied)
+}
+
 /// 读取复制账本；文件缺失 / 损坏 / 结构不符时返回空表（视为无登记）。
 fn load_copy_ledger_at(path: &Path) -> serde_json::Map<String, Value> {
     let Ok(text) = std::fs::read_to_string(path) else {
@@ -2993,10 +3334,28 @@ pub fn list_replica_groups_for(region: Region) -> Value {
         }
         let baseline = newest_baseline(&entry.baselines);
         let mut json = entry.json.clone();
+        // ★ issue #141：超窗口组的前缀验证。**只有**「最短副本 > 512 行且行数不等」时才会
+        //   真的读盘，且只读到第 N 行就停（不是读全文）；算出来的摘要记进探针位随缓存落盘
+        //   ⇒ 同一对文件下次开页**零 IO**（`FingerprintStore` 的「命中不读盘」不被破坏）。
+        let mut probe = |index: usize, offset: usize| -> Option<u64> {
+            let fingerprint = fingerprints.get(index)?.as_ref()?;
+            if offset >= fingerprint.line_count {
+                return Some(fingerprint.full_hash);
+            }
+            let (_uid, cid) = entry.members.get(index)?;
+            let path = projects.get(cid)?;
+            let key = fingerprint_key(region, cid);
+            if let Some(digest) = store.probe(&key, offset) {
+                return Some(digest);
+            }
+            let digest = prefix_digest_of_file(path, cid, offset)?;
+            store.record_probe(&key, offset, digest);
+            Some(digest)
+        };
         if let Some(object) = json.as_object_mut() {
             object.insert(
                 "content".to_string(),
-                derive_content_status(&entry.members, &fingerprints, baseline),
+                derive_content_status(&entry.members, &fingerprints, baseline, &mut probe),
             );
         }
         groups.push(json);
@@ -3082,18 +3441,19 @@ fn replica_group_members_from_ledger(
         else {
             continue;
         };
-        // 值为空串的登记视作无登记（与 `CopyBatch::ledger_hit` 的判据一致）。
-        let Some(new_cid) = value.as_str().map(str::trim).filter(|s| !s.is_empty()) else {
+        // 值为空串 / 空对象的登记视作无登记（与 `CopyBatch::ledger_hit` 的判据一致）。
+        // ★ issue #147：值可能是 `{new, originUid, originCid}` 对象，统一走 `ledger_new_of`。
+        let Some(new_cid) = ledger_new_of(value) else {
             continue;
         };
         let source_key = replica_vertex_key(&source_uid, &source_cid);
-        let target_key = replica_vertex_key(&target_uid, new_cid);
+        let target_key = replica_vertex_key(&target_uid, &new_cid);
         label
             .entry(source_key.clone())
             .or_insert((source_uid, source_cid));
         label
             .entry(target_key.clone())
-            .or_insert((target_uid, new_cid.to_string()));
+            .or_insert((target_uid, new_cid.clone()));
         adjacency
             .entry(source_key.clone())
             .or_default()
@@ -3308,17 +3668,36 @@ pub const STATUS_UNKNOWN: &str = "unknown";
 ///
 /// ## 判据（与前端逐字对齐，改一处必须同步另一处）
 ///
-/// - `latest`：行数全相同且公共前缀 = 行数；
-/// - `behind`：行数不等，但公共前缀**覆盖到最短副本** ⇒ 只是有人多写了，无分叉；
-/// - `diverge`：公共前缀 < 最短副本行数 ⇒ 双方在共同旧版之后各自改过；
-/// - `unknown`：**有副本取不到指纹**（jsonl 缺失 / 正在写入）⇒ 诚实标注，**不臆造**。
+/// - `latest`：行数全相同且内容相同（公共前缀 = 行数；超窗口时用整份摘要）；
+/// - `behind`：行数不等，但**最短副本是其余成员的前缀** ⇒ 只是有人多写了，无分叉；
+/// - `diverge`：在共同旧版之后各自改过（窗口内即分叉，或前缀关系不成立）；
+/// - `unknown`：**有副本取不到指纹**，或**超窗口且无法验证前缀关系**
+///   ⇒ 诚实标注，**不臆造**。
+///
+/// ## ★ issue #141：窗口被截断时**不许**拿 512 当全文
+///
+/// `prefix_hashes` 最多 [`PREFIX_HASH_LIMIT`] 项，而旧判据是「公共前缀 < 最短副本行数
+/// ⇒ `diverge`」⇒ 只要组内最短副本 **> 512 行**，`common ≤ 512 < min_lines` **恒为真**
+/// ⇒ 逐字节相同的长会话也报「有分歧」。连带三个后果：`behind` 对长会话**永不可达**
+/// （「安全同步（只追加）」按钮再也不出现）、用户被引向**覆盖式**统一（会丢目标侧新行）、
+/// `deltas` 虚增（800 行的会话被算成「落后 288 条」）。
+///
+/// 现在的处置分三档（只在**窗口被截断**时才多走两步）：
+///
+/// 1. 行数全相同 ⇒ 比 `full_hash`：全等 ⇒ `latest`，否则 `diverge`（**精确**，零额外 IO）；
+/// 2. 行数不等 ⇒ 逐成员验证「它是不是**最长副本**的前缀」：取最长副本**前 N 行**的累计
+///    摘要（`probe`，N = 该成员行数）与它的 `full_hash` 比。全过 ⇒ `behind`；
+///    有一条不过 ⇒ `diverge`；取不到摘要 ⇒ `unknown`（**不把读不到当成相同**）；
+/// 3. `commonPrefix` 在「超窗口 + 有分叉」时只是**下界**（≥512）⇒ 用
+///    `commonPrefixExact: false` 标出来，界面据此说「至少 N 条」而不是「N 条」。
 ///
 /// ⚠️ **不得**用 `updatedAt` 派生本状态（`P8-ARCH.md` §1.2「时间新 ≠ 内容新」）。
-/// 本函数**根本不接触**会话行 —— 输入只有指纹与基线。
+/// 本函数**根本不接触**会话行 —— 输入只有指纹、基线与一个按需取摘要的 `probe`。
 fn derive_content_status(
     members: &[(String, String)],
     fingerprints: &[Option<SessionFingerprint>],
     baseline: Option<&GroupBaseline>,
+    probe: &mut dyn FnMut(usize, usize) -> Option<u64>,
 ) -> Value {
     if members.len() < 2 {
         return unknown_content_status();
@@ -3350,12 +3729,75 @@ fn derive_content_status(
     let counts: Vec<usize> = list.iter().map(|f| f.line_count).collect();
     let min_lines = counts.iter().copied().min().unwrap_or(0);
     let max_lines = counts.iter().copied().max().unwrap_or(0);
-    let status = if common < min_lines {
+
+    // ★ 窗口真的被截断了？「最短的前缀窗口用满了」**且**「还有窗口之外的行」。
+    //   两者缺一都不算截断：例如 512 行的会话，窗口恰好覆盖全文。
+    let truncated = shortest_prefix == PREFIX_HASH_LIMIT && min_lines > PREFIX_HASH_LIMIT;
+
+    let mut exact = true;
+    let status: &str = if common < shortest_prefix {
+        // 窗口内就已经分叉 ⇒ 与窗口大小无关的**确定**结论。
         STATUS_DIVERGE
+    } else if !truncated {
+        // 公共前缀覆盖到了最短副本（窗口没被用满）⇒ 旧判据在这里本来就是精确的。
+        if max_lines == min_lines {
+            STATUS_LATEST
+        } else {
+            STATUS_BEHIND
+        }
     } else if max_lines == min_lines {
-        STATUS_LATEST
+        // 截断 + 行数相同：窗口之外只可能「全同」或「有改写」，整份摘要一次判定。
+        if list.iter().all(|f| f.full_hash == list[0].full_hash) {
+            common = min_lines;
+            STATUS_LATEST
+        } else {
+            // 有改写 ⇒ 公共前缀至少 512，但**具体多少**不知道 ⇒ 下界。
+            exact = false;
+            STATUS_DIVERGE
+        }
     } else {
-        STATUS_BEHIND
+        // 截断 + 行数不等：验证「每个成员都是最长副本的前缀」。
+        let longest = counts
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, lines)| **lines)
+            .map(|(index, _)| index)
+            .unwrap_or(0);
+        let mut verdict = Some(true);
+        for (index, fingerprint) in list.iter().enumerate() {
+            if index == longest {
+                continue;
+            }
+            let digest = if fingerprint.line_count == list[longest].line_count {
+                // 同长 ⇒ 前缀即全文。
+                Some(list[longest].full_hash)
+            } else {
+                probe(longest, fingerprint.line_count)
+            };
+            match digest {
+                Some(digest) if digest == fingerprint.full_hash => {}
+                Some(_) => {
+                    verdict = Some(false);
+                    break;
+                }
+                None => {
+                    verdict = None;
+                    break;
+                }
+            }
+        }
+        match verdict {
+            // 全体都是最长副本的前缀 ⇒ 最短那份的**全文**就是全组公共前缀。
+            Some(true) => {
+                common = min_lines;
+                STATUS_BEHIND
+            }
+            Some(false) => {
+                exact = false;
+                STATUS_DIVERGE
+            }
+            None => return unknown_content_status(),
+        }
     };
 
     // 增量按 **cid** 聚合（同 cid 出现在不同账号 ⇒ 读数相同；与前端 `Map` 口径一致）。
@@ -3390,6 +3832,8 @@ fn derive_content_status(
     json!({
         "status": status,
         "commonPrefix": common,
+        // ★ `false` ⇒ 上面的数只是**下界**（窗口被截断且确有分叉）。
+        "commonPrefixExact": exact,
         "deltas": deltas,
         "latestLineCount": max_lines,
         "sinceBaseline": since_baseline,
@@ -3401,6 +3845,7 @@ fn unknown_content_status() -> Value {
     json!({
         "status": STATUS_UNKNOWN,
         "commonPrefix": Value::Null,
+        "commonPrefixExact": false,
         "deltas": BTreeMap::<String, usize>::new(),
         "latestLineCount": Value::Null,
         "sinceBaseline": BTreeMap::<String, Option<usize>>::new(),
@@ -4973,8 +5418,10 @@ mod tests {
 
     /// 复制降级：源 jsonl 存在但 workbuddy.db 缺失 → 仍复制正文，索引行写不进时给 warning。
     ///
-    /// 这对应「目标账号 db 也坏了」的最坏情形：至少 jsonl 正文能落到目标账号，
-    /// 用户重启 WorkBuddy 重建索引后即可见。绝不能因为它「报错」就阻断整次复制。
+    /// 这对应「目标账号 db 也坏了」的最坏情形：jsonl 正文仍落到目标账号，但**索引行写不了**。
+    /// ★ 这里断言的是「报告必须说实话」（`sessionRowWritten: false` + 可诊断的
+    /// `sessionRowError` + 批次 `failed`），**不是**「重启客户端会自动重建索引」——
+    /// 那条旧承诺从未成立，客户端不会从 jsonl 反推索引（issue #146）。
     #[test]
     fn copy_session_degrades_when_db_missing() {
         let home = make_temp_home("copy-degraded");
@@ -5008,7 +5455,16 @@ mod tests {
         );
         assert!(
             result.get("warning").is_some(),
-            "应给出降级 warning，提示用户重启 WorkBuddy 重建索引"
+            "应给出降级 warning（索引未写入），但**不得**承诺重启后客户端会重建索引"
+        );
+        assert!(
+            result.get("sessionRowError").is_some(),
+            "失败原因必须可诊断，不能只留一句泛化 warning"
+        );
+        assert_eq!(
+            result.get("failed").and_then(Value::as_bool),
+            Some(true),
+            "索引行写失败时整批必须标记 failed"
         );
         assert_eq!(
             result.get("deduplicated").and_then(Value::as_bool),
@@ -5022,6 +5478,68 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().to_string())
             .any(|name| name.ends_with(".jsonl") && name != "cid-S.jsonl");
         assert!(copied, "应生成新 cid 的 jsonl 副本");
+        cleanup_temp_home(&home);
+    }
+
+    /// ★ issue #146 回归：源账号在 `sessions` 表里没有该 cid 的行（全新账号 / 列表来自
+    /// jsonl 反扫），复制必须**合成**索引行 —— 只复制正文会让目标账号永远「暂无任务」。
+    #[test]
+    fn copy_synthesizes_index_row_when_source_row_missing() {
+        let home = make_temp_home("copy-synth-row");
+        let _g = crate::modules::config::HomeOverrideGuard::set(&home);
+        let ws = home.join(".workbuddy").join("projects").join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(
+            ws.join("cid-S.jsonl"),
+            "{\"cwd\":\"/proj/s\",\"title\":\"S\",\"sessionId\":\"cid-S\"}\n",
+        )
+        .unwrap();
+        // 目标库存在，但 `cid-S` 属于别的账号（源账号是全新的，库里没有它的行）。
+        let db = workbuddy_db_path_for(Region::Cn);
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                cwd TEXT,
+                title TEXT,
+                status TEXT,
+                transport TEXT,
+                created_at INTEGER,
+                updated_at INTEGER,
+                deleted_at INTEGER
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions (id, user_id, cwd, title, status, transport, created_at, updated_at)
+             VALUES ('cid-S', 'uid-other', '/x', 'old', 'completed', 'local', 1, 1)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let result =
+            copy_session_to_user_cross(Region::Cn, Region::Cn, "cid-S", "uid-src", "uid-dst")
+                .expect("复制不应报错");
+        assert_eq!(
+            result.get("sessionRowWritten").and_then(Value::as_bool),
+            Some(true),
+            "源行缺失时必须合成索引行：{result}"
+        );
+        assert!(result.get("sessionRowError").is_none(), "{result}");
+        assert!(result.get("failed").is_none(), "{result}");
+
+        let conn = Connection::open(&db).unwrap();
+        let (count, cwd): (i64, String) = conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(MAX(cwd), '') FROM sessions WHERE user_id = 'uid-dst'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "目标账号必须拿到 1 条索引行");
+        assert_eq!(cwd, "/proj/s", "cwd 应从 jsonl 取，供客户端工作区分组");
         cleanup_temp_home(&home);
     }
 
@@ -5171,6 +5689,105 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// ★ issue #147：账本值必须同时读得懂旧格式（裸字符串）与新格式（带血缘对象）。
+    ///
+    /// 变异：把 `ledger_new_of` 改回 `value.as_str()` ⇒ 升级后所有旧账本失配、
+    /// 全部会话被重新复制一遍（正是本次事故的放大器）。
+    #[test]
+    fn ledger_value_supports_legacy_and_bloodline_shapes() {
+        assert_eq!(
+            ledger_new_of(&json!("copy-1")).as_deref(),
+            Some("copy-1"),
+            "旧账本（裸字符串）必须继续可读"
+        );
+        let value = json!({"new": "copy-2", "originUid": "uid-a", "originCid": "cid-1"});
+        assert_eq!(ledger_new_of(&value).as_deref(), Some("copy-2"));
+        assert_eq!(
+            ledger_origin_of(&value),
+            Some(("uid-a".to_string(), "cid-1".to_string()))
+        );
+        assert_eq!(ledger_origin_of(&json!("copy-1")), None, "旧格式没有血缘");
+        assert_eq!(ledger_new_of(&json!({})), None);
+        assert_eq!(ledger_new_of(&json!("   ")), None);
+    }
+
+    /// 账本键 → `target_uid`：同 region 三元与跨 region 四元都要认。
+    #[test]
+    fn ledger_key_target_reads_both_key_shapes() {
+        let sep = LEDGER_SEP;
+        assert_eq!(
+            ledger_key_target(&format!("a{sep}b{sep}c")),
+            Some("b".to_string())
+        );
+        assert_eq!(
+            ledger_key_target(&format!("cn{sep}a{sep}b{sep}c")),
+            Some("b".to_string())
+        );
+        assert_eq!(ledger_key_target("nonsense"), None);
+    }
+
+    /// 副本识别索引：能回答「这个 cid 是哪个原始会话的副本」「已复制给谁」。
+    #[test]
+    fn origin_indexes_answer_bloodline_questions() {
+        let sep = LEDGER_SEP;
+        let mut map = serde_json::Map::new();
+        map.insert(
+            format!("uid-a{sep}uid-b{sep}cid-1"),
+            json!({"new": "copy-1", "originUid": "uid-a", "originCid": "cid-1"}),
+        );
+        // 旧格式条目：无血缘 ⇒ 不进索引（不能凭空猜）。
+        map.insert(format!("uid-x{sep}uid-y{sep}cid-9"), json!("copy-9"));
+
+        let (origins, copied) = build_origin_indexes(&map);
+        assert_eq!(
+            origins.get("copy-1").cloned(),
+            Some(("uid-a".to_string(), "cid-1".to_string()))
+        );
+        assert!(!origins.contains_key("copy-9"), "旧条目没有血缘可查");
+        assert!(copied.contains(&("cid-1".to_string(), "uid-b".to_string())));
+        assert!(!copied.contains(&("cid-1".to_string(), "uid-a".to_string())));
+    }
+
+    /// ★ issue #147 端到端：把副本当源再复制时，必须被血缘判定拦下（skipped），
+    /// 而不是再造一代副本。
+    #[test]
+    fn copying_a_replica_back_is_skipped_by_bloodline() {
+        let home = make_temp_home("copy-replica-skip");
+        let _g = crate::modules::config::HomeOverrideGuard::set(&home);
+        let ws = home.join(".workbuddy").join("projects").join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("cid-1.jsonl"), "{\"cwd\":\"/p\",\"title\":\"T\"}\n").unwrap();
+        // B 的副本（上一次 A→B 的产物）
+        std::fs::write(
+            ws.join("copy-1.jsonl"),
+            "{\"cwd\":\"/p\",\"title\":\"T\"}\n",
+        )
+        .unwrap();
+
+        let mut map = serde_json::Map::new();
+        map.insert(
+            format!("uid-a{LEDGER_SEP}uid-b{LEDGER_SEP}cid-1"),
+            json!({"new": "copy-1", "originUid": "uid-a", "originCid": "cid-1"}),
+        );
+        std::fs::write(
+            copy_ledger_path_for(Region::Cn),
+            serde_json::to_string(&Value::Object(map)).unwrap(),
+        )
+        .unwrap();
+
+        // B 的副本再复制回 A（origin 就是 A 自己的会话）⇒ 必须跳过。
+        let result = copy_session_to_user_cross(Region::Cn, Region::Cn, "copy-1", "uid-b", "uid-a")
+            .expect("副本识别不应报错");
+        assert_eq!(
+            result.get("deduplicated").and_then(Value::as_bool),
+            Some(true),
+            "副本回流必须判为去重跳过：{result}"
+        );
+        let files = std::fs::read_dir(&ws).unwrap().flatten().count();
+        assert_eq!(files, 2, "不得生成新一代副本：{files}");
+        cleanup_temp_home(&home);
+    }
+
     /// 账本命中还必须要求副本仍存活：副本被删则允许重新复制。
     #[test]
     fn ledger_only_hits_when_copy_still_alive() {
@@ -5219,9 +5836,15 @@ mod fingerprint_tests {
     use super::*;
 
     fn fp(line_count: usize, prefix_hashes: Vec<u64>) -> SessionFingerprint {
+        // 整份摘要由逐行 hash **确定性**折出来：内容不同 ⇒ `full_hash` 不同（与本文件的
+        // 真实口径无关，测试只关心「相等 / 不相等」这一层语义）。
+        let full_hash = prefix_hashes.iter().fold(FNV_OFFSET_BASIS, |state, hash| {
+            fnv_step(state, &hash.to_string())
+        });
         SessionFingerprint {
             line_count,
             prefix_hashes,
+            full_hash,
         }
     }
 
@@ -6264,14 +6887,17 @@ mod content_status_tests {
         let a = SessionFingerprint {
             line_count: 9,
             prefix_hashes: vec![1, 2, 3, 4, 5],
+            full_hash: 0,
         };
         let b = SessionFingerprint {
             line_count: 7,
             prefix_hashes: vec![1, 2, 3, 4, 6],
+            full_hash: 0,
         };
         let c = SessionFingerprint {
             line_count: 6,
             prefix_hashes: vec![1, 2, 9, 9, 9],
+            full_hash: 0,
         };
         let fps = vec![Some(a.clone()), Some(b.clone()), Some(c.clone())];
 
@@ -6289,7 +6915,7 @@ mod content_status_tests {
             .iter()
             .map(|cid| ("uid".to_string(), cid.to_string()))
             .collect();
-        let status = derive_content_status(&members, &fps, None);
+        let status = derive_content_status(&members, &fps, None, &mut |_, _| None);
         assert_eq!(
             status["commonPrefix"],
             json!(2),
@@ -6308,9 +6934,10 @@ mod content_status_tests {
         let full = SessionFingerprint {
             line_count: 5,
             prefix_hashes: vec![1, 2, 3, 4, 5],
+            full_hash: 0,
         };
         let same = vec![Some(full.clone()), Some(full)];
-        let equal = derive_content_status(&members[..2], &same, None);
+        let equal = derive_content_status(&members[..2], &same, None, &mut |_, _| None);
         assert_eq!(equal["status"], json!(STATUS_LATEST));
         assert_eq!(equal["commonPrefix"], json!(5));
         assert_eq!(equal["latestLineCount"], json!(5));
@@ -6319,9 +6946,10 @@ mod content_status_tests {
             Some(SessionFingerprint {
                 line_count: 3,
                 prefix_hashes: vec![1, 2, 3],
+                full_hash: 0,
             }),
         ];
-        let behind = derive_content_status(&members[..2], &prefix_only, None);
+        let behind = derive_content_status(&members[..2], &prefix_only, None, &mut |_, _| None);
         assert_eq!(behind["status"], json!(STATUS_BEHIND));
         assert_eq!(
             behind["commonPrefix"],
@@ -6332,7 +6960,7 @@ mod content_status_tests {
         // 缺一个指纹 ⇒ 整体 unknown（**不臆造**）。
         let missing = vec![Some(a), None];
         assert_eq!(
-            derive_content_status(&members[..2], &missing, None)["status"],
+            derive_content_status(&members[..2], &missing, None, &mut |_, _| None)["status"],
             json!(STATUS_UNKNOWN)
         );
     }
@@ -6391,7 +7019,7 @@ mod content_status_tests {
             ("uid-b".to_string(), "cid-a-copy".to_string()),
         ];
         let fingerprints = fingerprints_for_members(&mut store, Region::Cn, &index, &members);
-        let status = derive_content_status(&members, &fingerprints, None);
+        let status = derive_content_status(&members, &fingerprints, None, &mut |_, _| None);
         assert_eq!(
             status["status"],
             json!(STATUS_LATEST),
@@ -6403,7 +7031,7 @@ mod content_status_tests {
         let mut three = members.clone();
         three.push(("uid-c".to_string(), "cid-c".to_string()));
         let fingerprints = fingerprints_for_members(&mut store, Region::Cn, &index, &three);
-        let status = derive_content_status(&three, &fingerprints, None);
+        let status = derive_content_status(&three, &fingerprints, None, &mut |_, _| None);
         assert_eq!(status["status"], json!(STATUS_BEHIND));
         assert_eq!(status["latestLineCount"], json!(14));
         assert_eq!(status["deltas"]["cid-c"], json!(2));
@@ -6417,9 +7045,229 @@ mod content_status_tests {
         let fingerprints = fingerprints_for_members(&mut store, Region::Cn, &index, &ghost);
         assert!(fingerprints[1].is_none());
         assert_eq!(
-            derive_content_status(&ghost, &fingerprints, None)["status"],
+            derive_content_status(&ghost, &fingerprints, None, &mut |_, _| None)["status"],
             json!(STATUS_UNKNOWN)
         );
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    // ------------------------------------------------------- issue #141：超窗口的长会话
+
+    /// 写一份会话正文，并允许改写**指定行**（用来造「窗口之外才分叉」的现场）。
+    fn write_jsonl_with(
+        projects: &Path,
+        workspace: &str,
+        cid: &str,
+        lines: usize,
+        rewrite: impl Fn(usize, String) -> String,
+    ) {
+        let mut body = String::new();
+        for index in 0..lines {
+            let line = format!("{{\"type\":\"message\",\"sessionId\":\"{cid}\",\"n\":{index}}}");
+            body.push_str(&rewrite(index, line));
+            body.push('\n');
+        }
+        let dir = projects.join(workspace);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{cid}.jsonl")), body).unwrap();
+    }
+
+    /// 生产同款探针（缓存 → 只读到第 N 行 → 回填缓存）。
+    fn probe_for<'a>(
+        store: &'a mut FingerprintStore,
+        index: &'a HashMap<String, PathBuf>,
+        members: &'a [(String, String)],
+        fingerprints: &'a [Option<SessionFingerprint>],
+    ) -> impl FnMut(usize, usize) -> Option<u64> + 'a {
+        move |position: usize, offset: usize| {
+            let fingerprint = fingerprints.get(position)?.as_ref()?;
+            if offset >= fingerprint.line_count {
+                return Some(fingerprint.full_hash);
+            }
+            let (_uid, cid) = members.get(position)?;
+            let path = index.get(cid)?;
+            let key = fingerprint_key(Region::Cn, cid);
+            if let Some(digest) = store.probe(&key, offset) {
+                return Some(digest);
+            }
+            let digest = prefix_digest_of_file(path, cid, offset)?;
+            store.record_probe(&key, offset, digest);
+            Some(digest)
+        }
+    }
+
+    /// ★ issue #141 的核心回归：**逐字节相同的长会话不许被判成「有分歧」**。
+    ///
+    /// 620 行 > [`PREFIX_HASH_LIMIT`] ⇒ 旧判据 `common(512) < min_lines(620)` **恒为真**，
+    /// 会无条件报 `diverge`（用户点「处理分歧」又什么都不发生 —— 全量比对认为本来就一致）。
+    ///
+    /// 可证伪：把 `truncated` 分支里的 `full_hash` 比较删掉 / 恒为 `false` ⇒ 本条红。
+    #[test]
+    fn long_identical_copies_are_not_reported_as_divergent() {
+        let (home, projects) = temp_projects("long-identical");
+        write_jsonl(&projects, "ws-a", "cid-a", 620);
+        write_jsonl(&projects, "ws-b", "cid-a-copy", 620);
+        let index = build_projects_index_in(&projects);
+        let mut store = FingerprintStore::default();
+        let members = vec![
+            ("uid-a".to_string(), "cid-a".to_string()),
+            ("uid-b".to_string(), "cid-a-copy".to_string()),
+        ];
+        let fingerprints = fingerprints_for_members(&mut store, Region::Cn, &index, &members);
+        // 行数相同 ⇒ 不该碰探针（零额外 IO）。
+        let mut probe = |_: usize, _: usize| -> Option<u64> { panic!("行数相同不该读盘") };
+        let status = derive_content_status(&members, &fingerprints, None, &mut probe);
+        assert_eq!(
+            status["status"],
+            json!(STATUS_LATEST),
+            "两份 620 行、内容逐字节相同（只换了 id）⇒ 必须「已一致」"
+        );
+        assert_eq!(status["commonPrefix"], json!(620));
+        assert_eq!(status["commonPrefixExact"], json!(true));
+        assert_eq!(status["deltas"]["cid-a"], json!(0));
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    /// ★ 超窗口的「只追加」必须仍判 `behind`（旧判据下 `behind` 对长会话**永不可达**）。
+    ///
+    /// 同时钉住探针：620 行那份是 660 行那份的**真前缀** ⇒ 公共前缀 = 620（不是 512）。
+    #[test]
+    fn long_copy_that_only_grew_is_behind_with_exact_prefix() {
+        let (home, projects) = temp_projects("long-behind");
+        write_jsonl(&projects, "ws-a", "cid-a", 620);
+        write_jsonl(&projects, "ws-b", "cid-b", 660);
+        let index = build_projects_index_in(&projects);
+        let mut store = FingerprintStore::default();
+        let members = vec![
+            ("uid-a".to_string(), "cid-a".to_string()),
+            ("uid-b".to_string(), "cid-b".to_string()),
+        ];
+        let fingerprints = fingerprints_for_members(&mut store, Region::Cn, &index, &members);
+        let status = derive_content_status(
+            &members,
+            &fingerprints,
+            None,
+            &mut probe_for(&mut store, &index, &members, &fingerprints),
+        );
+        assert_eq!(
+            status["status"],
+            json!(STATUS_BEHIND),
+            "短的那份是长的真前缀 ⇒ 只追加即可，不是分歧"
+        );
+        assert_eq!(
+            status["commonPrefix"],
+            json!(620),
+            "公共前缀必须给出**真值**（不是窗口上限 512）"
+        );
+        assert_eq!(status["commonPrefixExact"], json!(true));
+        assert_eq!(status["deltas"]["cid-a"], json!(0));
+        assert_eq!(status["deltas"]["cid-b"], json!(40));
+        // ★ 探针已记进缓存 ⇒ 第二次开页零 IO（`list_replica_groups_for` 的承诺）。
+        let key = fingerprint_key(Region::Cn, "cid-b");
+        assert!(
+            store.probe(&key, 620).is_some(),
+            "验证过的前缀摘要必须留在缓存里（否则每次开页都要重读）"
+        );
+        // ★ 而且必须**随缓存落盘**：不落盘的话，「重启后第一次开页」仍然要重读长文件，
+        //   「命中零 IO」这条承诺就是空话。
+        let cache = home.join("cache.bin");
+        assert!(store.save_if_worthwhile(&cache), "有新条目 ⇒ 必须落盘");
+        let reloaded = FingerprintStore::load_from(&cache);
+        assert_eq!(
+            reloaded.probe(&key, 620),
+            store.probe(&key, 620),
+            "探针没有往返 ⇒ 落盘格式漏了这一节"
+        );
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    /// ★ 超窗口的**真分歧**：行数相同但正文在窗口之外改过 ⇒ `diverge`，且公共前缀只是下界。
+    #[test]
+    fn long_copies_with_rewritten_tail_are_divergent() {
+        let (home, projects) = temp_projects("long-diverge-same");
+        write_jsonl(&projects, "ws-a", "cid-a", 620);
+        // 第 600 行（窗口之外）换掉一个字符 ⇒ 前 512 行仍然全同。
+        write_jsonl_with(&projects, "ws-b", "cid-b", 620, |index, line| {
+            if index == 600 {
+                line.replace("\"n\":600", "\"n\":600,\"edited\":true")
+            } else {
+                line
+            }
+        });
+        let index = build_projects_index_in(&projects);
+        let mut store = FingerprintStore::default();
+        let members = vec![
+            ("uid-a".to_string(), "cid-a".to_string()),
+            ("uid-b".to_string(), "cid-b".to_string()),
+        ];
+        let fingerprints = fingerprints_for_members(&mut store, Region::Cn, &index, &members);
+        let status = derive_content_status(
+            &members,
+            &fingerprints,
+            None,
+            &mut probe_for(&mut store, &index, &members, &fingerprints),
+        );
+        assert_eq!(status["status"], json!(STATUS_DIVERGE));
+        assert_eq!(
+            status["commonPrefixExact"],
+            json!(false),
+            "窗口之外改过 ⇒ 512 只是**下界**，界面不许说「共同旧版 512 条」"
+        );
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    /// ★ 超窗口 + 行数不等 + 窗口之外改过 ⇒ 前缀关系不成立 ⇒ `diverge`（不是 `behind`）。
+    ///
+    /// 这一条挡的是「为了修 #141 就把长会话一律当 `behind`」的偷懒修法 ——
+    /// 那会让「只追加」把分叉行覆盖成一段混合历史。
+    #[test]
+    fn long_copy_with_divergent_middle_is_not_behind() {
+        let (home, projects) = temp_projects("long-diverge-diff");
+        write_jsonl(&projects, "ws-a", "cid-a", 620);
+        write_jsonl_with(&projects, "ws-b", "cid-b", 660, |index, line| {
+            if index == 590 {
+                line.replace("\"n\":590", "\"n\":590,\"edited\":true")
+            } else {
+                line
+            }
+        });
+        let index = build_projects_index_in(&projects);
+        let mut store = FingerprintStore::default();
+        let members = vec![
+            ("uid-a".to_string(), "cid-a".to_string()),
+            ("uid-b".to_string(), "cid-b".to_string()),
+        ];
+        let fingerprints = fingerprints_for_members(&mut store, Region::Cn, &index, &members);
+        let status = derive_content_status(
+            &members,
+            &fingerprints,
+            None,
+            &mut probe_for(&mut store, &index, &members, &fingerprints),
+        );
+        assert_eq!(
+            status["status"],
+            json!(STATUS_DIVERGE),
+            "短的那份不是长的前缀 ⇒ 只能走覆盖式统一"
+        );
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    /// ★ 取不到前缀摘要 ⇒ `unknown`（**不把「读不到」当成「相同」**）。
+    #[test]
+    fn long_group_without_probe_stays_unknown() {
+        let (home, projects) = temp_projects("long-unknown");
+        write_jsonl(&projects, "ws-a", "cid-a", 620);
+        write_jsonl(&projects, "ws-b", "cid-b", 660);
+        let index = build_projects_index_in(&projects);
+        let mut store = FingerprintStore::default();
+        let members = vec![
+            ("uid-a".to_string(), "cid-a".to_string()),
+            ("uid-b".to_string(), "cid-b".to_string()),
+        ];
+        let fingerprints = fingerprints_for_members(&mut store, Region::Cn, &index, &members);
+        let status = derive_content_status(&members, &fingerprints, None, &mut |_, _| None);
+        assert_eq!(status["status"], json!(STATUS_UNKNOWN));
+        assert_eq!(status["commonPrefix"], Value::Null);
         std::fs::remove_dir_all(home).unwrap();
     }
 
@@ -6442,6 +7290,7 @@ mod content_status_tests {
             SessionFingerprint {
                 line_count: 7,
                 prefix_hashes: vec![10, 20, 30],
+                full_hash: 0,
             },
         );
         assert!(store.save_if_worthwhile(&cache), "有改动就必须落盘");
@@ -6459,6 +7308,10 @@ mod content_status_tests {
         assert_eq!(entry.mtime_ms, 1_700_000_000_123);
         assert_eq!(entry.fingerprint.line_count, 7);
         assert_eq!(entry.fingerprint.prefix_hashes, vec![10, 20, 30]);
+        assert_eq!(
+            entry.fingerprint.full_hash, 0,
+            "整份摘要必须一起往返（#141 的超窗口判定全靠它）"
+        );
         assert!(
             !reloaded.dirty,
             "载入不算改动（否则每次开页都会白写一份 106 MB）"
@@ -6549,6 +7402,7 @@ mod content_status_tests {
             SessionFingerprint {
                 line_count: 2,
                 prefix_hashes: vec![1, 2],
+                full_hash: 0,
             },
         );
         assert!(store.save_if_worthwhile(&cache));
@@ -6605,6 +7459,7 @@ mod content_status_tests {
             SessionFingerprint {
                 line_count: 3,
                 prefix_hashes: vec![1],
+                full_hash: 0,
             },
         );
         assert!(
@@ -6635,6 +7490,7 @@ mod content_status_tests {
                 SessionFingerprint {
                     line_count: 1,
                     prefix_hashes: vec![index as u64],
+                    full_hash: 0,
                 },
             );
         }
@@ -6652,6 +7508,7 @@ mod content_status_tests {
                 SessionFingerprint {
                     line_count: 3,
                     prefix_hashes: vec![2],
+                    full_hash: 0,
                 },
             );
         }
@@ -6683,6 +7540,7 @@ mod content_status_tests {
                 SessionFingerprint {
                     line_count: 1,
                     prefix_hashes: vec![7],
+                    full_hash: 0,
                 },
             );
         }
@@ -6726,17 +7584,20 @@ mod content_status_tests {
             Some(SessionFingerprint {
                 line_count: 5,
                 prefix_hashes: vec![1, 2, 3, 4, 5],
+                full_hash: 0,
             }),
             Some(SessionFingerprint {
                 line_count: 3,
                 prefix_hashes: vec![1, 2, 3],
+                full_hash: 0,
             }),
             Some(SessionFingerprint {
                 line_count: 3,
                 prefix_hashes: vec![1, 2, 3],
+                full_hash: 0,
             }),
         ];
-        let status = derive_content_status(&members, &good, Some(&baseline));
+        let status = derive_content_status(&members, &good, Some(&baseline), &mut |_, _| None);
         assert_eq!(status["sinceBaseline"]["cid-a"], json!(2));
         assert_eq!(status["sinceBaseline"]["cid-b"], json!(0));
         // 基线是**成对**的：与它无关的成员**不在表里**（不是 0）。
@@ -6747,17 +7608,20 @@ mod content_status_tests {
             Some(SessionFingerprint {
                 line_count: 5,
                 prefix_hashes: vec![1, 2, 9, 4, 5],
+                full_hash: 0,
             }),
             Some(SessionFingerprint {
                 line_count: 3,
                 prefix_hashes: vec![1, 2, 3],
+                full_hash: 0,
             }),
             Some(SessionFingerprint {
                 line_count: 3,
                 prefix_hashes: vec![1, 2, 3],
+                full_hash: 0,
             }),
         ];
-        let status = derive_content_status(&members, &rewritten, Some(&baseline));
+        let status = derive_content_status(&members, &rewritten, Some(&baseline), &mut |_, _| None);
         assert!(status["sinceBaseline"]["cid-a"].is_null());
     }
 }

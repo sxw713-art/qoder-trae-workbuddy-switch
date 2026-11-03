@@ -183,6 +183,8 @@ export const zh = {
   // 应用级导航，与 appSettings 同域（§5：应用级放 shell，备份功能放 backup）。
   "settings.subnav.aria": "设置分区",
   "settings.subnav.general": "通用",
+  "settings.scope.global": "全局设置 · 对所有作用域生效，切换作用域不会改变它",
+  "settings.scope.scoped": "仅影响当前作用域（{scope}）· 其他作用域有各自的设置",
   "settings.subnav.account": "账号与登录",
   "settings.subnav.checkin": "签到与积分",
   "settings.subnav.gateway": "网关",
@@ -251,6 +253,7 @@ export const zh = {
   "wbSettings.cli.loadFailed": "读取 CLI 状态失败",
   "settings.subnav.diagnostics": "权限与诊断",
   "settings.subnav.logs": "日志",
+  "settings.subnav.network": "网络",
   "settings.subnav.backup": "备份与恢复",
 
   // ---- 网关工作台子导航（PLAN §3.9 / §3.20：7 项，两个产品线共用同一份表；Trae 侧去掉「请求代理」）----
@@ -497,6 +500,14 @@ export const zh = {
   "appSettings.scopeVisibility.toggleAria": "{scope} 可见性开关",
   "appSettings.scopeVisibility.hint": "隐藏的作用域不再出现在顶栏菜单与快捷键中；URL 直达仍可达。",
   "appSettings.scopeVisibility.onlyOneLeft": "只剩一个作用域可见——不能再隐藏更多",
+
+  // ---- 积分自动刷新（app-settings.tsx；issue #133 复核 §3：打上游默认关）----
+  "appSettings.creditAutoRefresh.groupTitle": "积分自动刷新",
+  "appSettings.creditAutoRefresh.upstreamLabel": "自动向官方查询",
+  "appSettings.creditAutoRefresh.upstreamDesc":
+    "开启后每约 10 分钟向官方查询一次余额与用量。这是真的上游请求，默认关闭 —— 关闭时只在打开页面或手动点击时更新。",
+  "appSettings.creditAutoRefresh.hint":
+    "只读本地快照的视图（Trae 积分 / 账号）不受此开关影响：它们不产生上游请求，会一直自动跟随后台同步。",
 
   // ---- 通用兜底 ----
   "common.unknownError": "未知错误",

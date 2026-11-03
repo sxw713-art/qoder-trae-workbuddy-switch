@@ -39,7 +39,7 @@ import type {
   Region,
 } from "@/lib/types";
 
-import { ModelFallbackSheet } from "./model-fallback-sheet";
+import { ModelFallbackSheet, type ModelOption } from "./model-fallback-sheet";
 
 /** 状态 → 圆点底色。`gated` 是**黄**（暂时不可用），`disabled` 是**灰**（要人去改）。 */
 const DOT_CLASS: Record<FallbackTargetState, string> = {
@@ -81,12 +81,12 @@ interface Props {
    */
   scope?: Scope;
   /**
-   * 可选模型名清单。
+   * 可选模型清单（`id` 是值、`name` 只做展示）。
    *
    * Trae 的清单来自客户端 `vscdb` 缓存、Qoder 的来自上游实时拉取，
    * **都不在 gateway store 里** ⇒ 由页面注入。缺省时退回 WB 的 catalog。
    */
-  modelOptions?: string[];
+  modelOptions?: ModelOption[];
   className?: string;
 }
 
@@ -103,6 +103,13 @@ export function ModelFallbackCard({ region, scope: scopeProp, modelOptions, clas
   /** `undefined` = 抽屉关闭；`null` = 新建；`string` = 编辑该主模型。 */
   const [editing, setEditing] = useState<string | null | undefined>(undefined);
   const [eventsOpen, setEventsOpen] = useState(false);
+  /**
+   * 折叠 / 展开（与「限流探测」卡同一套形态，默认**收起**）。
+   *
+   * 收起态仍保留标题、状态徽标、恒定明示与近 7 天统计 —— 那几句回答的是
+   * 「会不会偷偷换模型」，属于卡片的身份，不能随配置区一起折掉。
+   */
+  const [expanded, setExpanded] = useState(false);
 
   useEffect(() => {
     if (!view) void loadFallback(scope);
@@ -193,13 +200,30 @@ export function ModelFallbackCard({ region, scope: scopeProp, modelOptions, clas
               variant="ghost"
               size="sm"
               data-act="gw-fallback-events"
-              onClick={() => setEventsOpen((value) => !value)}
+              onClick={() => {
+                // 收起态点「降级流水」：先展开卡片，否则表渲染在折叠区里、点下去毫无反应。
+                setExpanded(true);
+                setEventsOpen((value) => !value);
+              }}
               aria-expanded={eventsOpen}
             >
               {eventsOpen
                 ? t("shared.gateway.fallback.eventsHide")
                 : t("shared.gateway.fallback.events")}
               {eventsOpen ? <ChevronUp /> : <ChevronDown />}
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              data-act="gw-fallback-expand"
+              onClick={() => setExpanded((value) => !value)}
+              aria-expanded={expanded}
+              aria-controls="gw-fallback-body"
+            >
+              {expanded ? <ChevronUp /> : <ChevronDown />}
+              {expanded
+                ? t("shared.gateway.fallback.collapse")
+                : t("shared.gateway.fallback.expand")}
             </Button>
           </>
         }
@@ -222,58 +246,64 @@ export function ModelFallbackCard({ region, scope: scopeProp, modelOptions, clas
         </p>
       ) : null}
 
-      <div className="flex items-center gap-2.5 border-b border-dashed border-border px-4 py-3">
-        <Switch
-          checked={view.enabled}
-          onCheckedChange={(checked) => void onToggle(checked)}
-          aria-label={t("shared.gateway.fallback.enable")}
-        />
-        <div className="min-w-0 flex-1">
-          <b className="block text-[12.5px] font-medium">
-            {t("shared.gateway.fallback.enable")}
-          </b>
-          <span className="text-[11px] text-muted-foreground">
-            {t("shared.gateway.fallback.enableHint")}
-          </span>
-        </div>
-        <Button size="sm" data-act="gw-fallback-new" onClick={() => setEditing(null)}>
-          <Plus />
-          {t("shared.gateway.fallback.new")}
-        </Button>
+      <div id="gw-fallback-body">
+        {expanded ? (
+          <>
+            <div className="flex items-center gap-2.5 border-b border-dashed border-border px-4 py-3">
+              <Switch
+                checked={view.enabled}
+                onCheckedChange={(checked) => void onToggle(checked)}
+                aria-label={t("shared.gateway.fallback.enable")}
+              />
+              <div className="min-w-0 flex-1">
+                <b className="block text-[12.5px] font-medium">
+                  {t("shared.gateway.fallback.enable")}
+                </b>
+                <span className="text-[11px] text-muted-foreground">
+                  {t("shared.gateway.fallback.enableHint")}
+                </span>
+              </div>
+              <Button size="sm" data-act="gw-fallback-new" onClick={() => setEditing(null)}>
+                <Plus />
+                {t("shared.gateway.fallback.new")}
+              </Button>
+            </div>
+
+            {chains.length ? (
+              <div className="px-4">
+                {chains.map((chain) => (
+                  <ChainRow
+                    key={chain.from}
+                    chain={chain}
+                    scope={scope}
+                    maxTargets={view.max_targets}
+                    baseline={view.baseline}
+                    onEdit={() => setEditing(chain.from)}
+                    onToggle={() => void onToggleChain(chain)}
+                  />
+                ))}
+                <p className="py-3 text-[11px] leading-relaxed text-muted-foreground">
+                  {t("shared.gateway.fallback.footNote")}
+                </p>
+              </div>
+            ) : (
+              <EmptyState
+                icon={ChevronDown}
+                title={t("shared.gateway.fallback.emptyTitle")}
+                description={t("shared.gateway.fallback.emptyDesc")}
+                action={
+                  <Button size="sm" onClick={() => setEditing(null)}>
+                    <Plus />
+                    {t("shared.gateway.fallback.new")}
+                  </Button>
+                }
+              />
+            )}
+
+            {eventsOpen ? <EventsTable events={view.events} scope={view.scope} /> : null}
+          </>
+        ) : null}
       </div>
-
-      {chains.length ? (
-        <div className="px-4">
-          {chains.map((chain) => (
-            <ChainRow
-              key={chain.from}
-              chain={chain}
-              scope={scope}
-              maxTargets={view.max_targets}
-              baseline={view.baseline}
-              onEdit={() => setEditing(chain.from)}
-              onToggle={() => void onToggleChain(chain)}
-            />
-          ))}
-          <p className="py-3 text-[11px] leading-relaxed text-muted-foreground">
-            {t("shared.gateway.fallback.footNote")}
-          </p>
-        </div>
-      ) : (
-        <EmptyState
-          icon={ChevronDown}
-          title={t("shared.gateway.fallback.emptyTitle")}
-          description={t("shared.gateway.fallback.emptyDesc")}
-          action={
-            <Button size="sm" onClick={() => setEditing(null)}>
-              <Plus />
-              {t("shared.gateway.fallback.new")}
-            </Button>
-          }
-        />
-      )}
-
-      {eventsOpen ? <EventsTable events={view.events} scope={view.scope} /> : null}
 
       <ModelFallbackSheet
         scope={scope}

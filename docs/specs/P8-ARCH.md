@@ -89,9 +89,14 @@
 
 ```
 buddy-switch-copy-ledger.json      // 位于「目标 region」的会话数据目录（session.rs:928-935）
-{ "source_uid␟target_uid␟source_cid": "new_cid", ... }        // 同 region
-{ "source_region␟source_uid␟target_uid␟source_cid": "new_cid" } // 跨 region（前缀，session.rs:958-971）
+{ "source_uid␟target_uid␟source_cid": { "new": "<new_cid>", "originUid": "<uid>", "originCid": "<cid>" }, ... }  // 同 region
+{ "source_region␟source_uid␟target_uid␟source_cid": { …同上… } }                                              // 跨 region（前缀，session.rs:958-971）
 ```
+
+> ★ issue #147（2026-11-02）：值从裸字符串 `"<new_cid>"` 升级为**带血缘的对象**。
+> `originUid` / `originCid` 指向**最初那次复制的源会话**，因此账本能回答
+> 「这个 cid 是哪个原始会话的副本」，并在「副本被当成源再复制」时直接跳过。
+> 旧格式（裸字符串）仍可读 —— 升级前的账本不作废，否则所有会话会被重新复制一遍。
 
 - 它在**每次成功复制**时写入（`record_copy_ledger`，`session.rs:1069`）；命中且副本存活时跳过重复复制（`ledger_hit_for`，`session.rs:1025`）。
 - **它就是「副本边」的原始数据**：`source_cid`（在 `source_uid` 账号里）→ `new_cid`（在 `target_uid` 账号里）。
@@ -99,7 +104,7 @@ buddy-switch-copy-ledger.json      // 位于「目标 region」的会话数据�
 **★ 三条必须承认的局限（写进文案 / 类型）**：
 
 1. **只覆盖「经本应用复制过」的会话** —— 用户在 WorkBuddy 里手动复制、或别处复制的，**不在账本里**。
-2. **无内容信息** —— 值是 `new_cid`，**没有**消息计数 / base / 时间 ⇒ **推不出「落后 / 分叉」**。
+2. **无内容信息** —— 值里只有 `new` / `originUid` / `originCid`，**没有**消息计数 / base / 时间 ⇒ **推不出「落后 / 分叉」**。
 3. **按 region 分文件** —— 一份 region 的账本只含「目标在该 region」的边；跨 region 边带源 region 前缀。**✅ #2 已决策（lead 拍板）：本期只读当前 region**（与 P10/P11 同口径）；**跨 region 的边本期不引入**（语义不清）。
 
 ⇒ **设计决策（✅ #1 已决策 · lead 拍板 2026-10-04：接受 ledger 为正式关联源）**：把 ledger **作为只读关联源暴露**，并附**五条防耦合硬约束**：
@@ -611,3 +616,61 @@ graph TD
 > **可先做（不阻塞于后端模型）**：**T01**（壳 + 门控 + 空态）与 **T03**（重启确认）—— 两者都**不需要**被阻塞的会话组 / 分歧模型。
 > **核心路径**：T01 → T02（副本只读视图 = 本期「查看」的落点）。
 > **★ 本期边界**：**组状态 / 关联图 / 分歧 / 增量同步**被后端阻塞，**登记为后续期次**（§1.6）；本期**不做**、**也不做假 UI**。
+
+---
+
+## 9. issue #87：会话导出 / 导入（2026-11-03 实施）
+
+> **状态**：后端 + 双宿主 API 已落（`session_bundle.rs`）；UI 入口已接（会话页工具栏 +
+> 导入确认对话框）。**v1 口径 = 导出当前账号的全部会话**，不做多选。
+
+### 9.1 为什么是「单文件 JSON 包」而不是 zip
+
+core 的依赖面刻意收窄（`serde_json` / `rusqlite` / `uuid` 这一小撮）。为一个「把会话搬到
+另一台机器」的功能引入 zip 编解码，等于给**所有**用户加一个解压攻击面（路径穿越、zip bomb），
+而收益只是「少一个文件」。
+
+⇒ 导出 = 一个 `.json`；导入 = 读同一个文件。代价是正文要转义、体积约翻倍；换来的是
+**人可读、可 diff、可用任何工具检查**。
+
+### 9.2 包结构
+
+```json
+{
+  "kind": "buddy-switch.sessions",
+  "schema": 1,
+  "exportedAt": "…",
+  "region": "cn",
+  "sessions": [
+    { "sourceCid": "…", "workspace": "ws-a", "title": "…",
+      "row": { "columns": ["…"], "values": ["…"] },
+      "jsonl": "…会话正文原文…" }
+  ]
+}
+```
+
+`row` 可为 `null`（源账号索引行缺失）：导入侧只写正文并回报 `rowWritten: false`。
+
+### 9.3 三条硬约束
+
+| 约束 | 判据 |
+|:--|:--|
+| **导入只做加法** | 每条生成新 id（带连字符 UUID，32 位 hex 客户端认不出）。同一份包导两次 = 两份副本，**不静默去重** ——「我以为覆盖了，结果两份」比「我以为合并了，结果只有一份」更难查 |
+| **`workspace` 只当目录名** | 它是扩展按 md5 生成的不透明串，本层不重算，但也**不许**带分隔符 / `..` / 绝对路径 —— 导入的是**别人给的文件**，必须当不可信输入 |
+| **失败不半写** | 正文写成、索引行写失败 ⇒ 删掉刚写的正文再报错（不留孤儿文件：客户端看不到它，用户也不知道它占着盘） |
+
+### 9.4 接口
+
+| 命令 / 路由 | 说明 |
+|:--|:--|
+| `export_sessions_bundle` · `POST /api/sessions/export` | `uid` / `sessionIds` 均可省略：省略 uid ⇒ 当前登录账号；省略 ids ⇒ 该账号**全部会话** |
+| `preview_sessions_bundle` · `GET /api/sessions/import/preview` | 只读：条数 + 前 50 条标题（导入前给用户确认） |
+| `import_sessions_bundle` · `POST /api/sessions/import` | 写操作；`uid` 省略 ⇒ 当前登录账号 |
+
+### 9.5 UI 口径
+
+- 导出**只读** ⇒ 一步到位（选路径 → 执行 → toast 报条数与跳过的数量）；
+- 导入**写用户数据** ⇒ **先预览再确认**：对话框里列出前 5 条、标出「仅正文」的条数，
+  并写明「只做加法：不会覆盖或删除任何现有会话」；
+- 文件对话框走 `plugin-dialog`，**动态 import**（浏览器构建里那条路径不存在，
+  静态引入会让整页崩）；取不到时提示「文件选择只在桌面端可用」。

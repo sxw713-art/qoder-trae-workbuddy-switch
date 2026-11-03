@@ -35,9 +35,9 @@ pub use entry::{CoolKind, CostTier, ModelCooldown, ModelCost, PoolEntry};
 pub use entry_like::PoolEntryLike;
 pub use gate::{GateBlock, GatePhase, ModelGate, ModelGates};
 pub use pick::{
-    no_exclusions, parse_preferred, pick, pick_with_preference, weight_of, weight_of_model,
-    PickInput, PickMode, PickPolicy, PREFERRED_AUTO, PREFERRED_MAX_CREDITS, PREFERRED_RANDOM,
-    SHORTLIST_SIZE,
+    model_cooling_until, no_exclusions, parse_preferred, pick, pick_with_preference, weight_of,
+    weight_of_model, PickInput, PickMode, PickPolicy, PREFERRED_AUTO, PREFERRED_MAX_CREDITS,
+    PREFERRED_RANDOM, SHORTLIST_SIZE,
 };
 
 /// 池内账号的归属域标记（与 core 的 `Region` 解耦，避免循环依赖）。
@@ -72,6 +72,11 @@ pub fn realm_key(realm: Option<RealmTag>) -> &'static str {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PoolSummary {
+    /// 该域内**账号库里还有凭据**的账号数（不含「账号已删除、条目仍在」的残留，
+    /// 见 [`PoolEntry::present_in_store`]）。
+    ///
+    /// ★ 语义是「有几个号」而不是「池文件里有几行」：401 文案直接拿它说
+    /// 「本机账号库有 N 个账号」，两个数不一致时那句话就是错的。
     pub total: usize,
     pub available: usize,
     pub cooling: usize,
@@ -1052,7 +1057,17 @@ impl Pool {
 
     /// 用账号库快照对齐池：新增缺失账号，**不删除**已有账号
     /// （删除会让冷却/熔断历史丢失，重登同一账号即「洗白」）。
+    ///
+    /// ★ 但「不删」≠「不标记」：账号库里已经没有的 uid 会被标成
+    /// [`PoolEntry::present_in_store`]`= false`，选号 / 摘要 / 状态列表一律跳过它们
+    /// （2026-11-02）。没有这一步，池里一条删除残留就能让整区请求失败，而
+    /// `PoolSummary` 还会拿这条残留凑数 —— 文案自相矛盾（见 `PoolSummary::total`）。
+    ///
+    /// ★★ **只反向对齐同一个 realm 的条目**：WB 池一份同时装 CN 与 Global，用 CN 的
+    /// 快照去标 Global 的条目会把国际版整区标成「不在库里」。`realm = None` 的调用方
+    /// （测试 / 域未知）不做反向对齐 —— 无从判断该对齐哪一半。
     pub fn sync_accounts(&mut self, accounts: &[Value], realm: Option<RealmTag>) {
+        let mut present: HashSet<&str> = HashSet::with_capacity(accounts.len());
         for account in accounts {
             let Some(uid) = account
                 .get("uid")
@@ -1061,11 +1076,20 @@ impl Pool {
             else {
                 continue;
             };
+            present.insert(uid);
             let nickname = account
                 .get("nickname")
                 .and_then(Value::as_str)
                 .unwrap_or("");
             self.upsert(uid, realm, nickname);
+        }
+
+        let Some(realm) = realm else { return };
+        for entry in self.entries.values_mut() {
+            if entry.realm != Some(realm) {
+                continue;
+            }
+            entry.present_in_store = present.contains(entry.uid.as_str());
         }
     }
 
@@ -1415,6 +1439,35 @@ impl Pool {
         picked
     }
 
+    /// 选号失败时的判据：**该模型是否在全部可试账号上都被限流**（issue #134）。
+    ///
+    /// 返回 `Some((最晚解冻时刻, 账号数))`；`None` = 不成立（有号其实能用，或压根没号）。
+    ///
+    /// 语义与判据细节见 [`pick::model_cooling_until`]。这里只负责把池状态拼成
+    /// [`PickInput`]：`excluded` 与 `allowed` 两条硬约束必须与选号**同源**，
+    /// 否则会出现「选号跳过了某个号、判据却把它算进来」⇒ 该报 503 的时候报 401。
+    pub fn model_cooling_until(
+        &self,
+        now_ms: i64,
+        realm: Option<RealmTag>,
+        model: &str,
+        tried: &HashSet<String>,
+        allowed: Option<&HashSet<String>>,
+    ) -> Option<(i64, usize)> {
+        let excluded = self.excluded_keys();
+        let input = PickInput {
+            realm,
+            model,
+            tried,
+            excluded: &excluded,
+            allowed,
+            // 只做判定，不选号：策略与种子不参与。
+            mode: PickMode::MaxCredits,
+            seed: 0,
+        };
+        pick::model_cooling_until(&self.entries, &self.policy(), now_ms, &input)
+    }
+
     /// **人工解除禁用**（清禁用 + 清冷却域，**保留熔断历史**）。
     ///
     /// 返回「本次是否真的解除了一个禁用」；`false` = 该 uid 不在池里，或本来就没被禁用
@@ -1576,8 +1629,17 @@ impl Pool {
 
         match event {
             UpstreamEvent::HardCredit => {
+                /* ★★ issue #129 §5.3：这里返回的是「**是否禁用了账号**」，
+                而余额不足**只是冷却到次日 04:00**（`cooldown_until_tomorrow_4am`
+                不置 `disabled`）。旧实现返回 `true` ⇒ `relay_once` 的
+                `if disabled { break; }` 在 402 上**立即终止换号**，与
+                `should_rotate` 把 `HardCredit` 明确列为「换号能救」自相矛盾：
+                池里明明有别的健康号，请求却直接失败。
+
+                Qoder 侧对 402 是明确换号的（`qoder::pool::should_rotate` 只排除
+                `ClientError`）—— 说明「402 不换号」从来不是设计意图。 */
                 entry.cooldown_until_tomorrow_4am(now_ms, HARD_CREDIT_COOLDOWN_REASON);
-                true
+                false
             }
             UpstreamEvent::SoftRate {
                 reset_at_ms,
@@ -1906,6 +1968,13 @@ impl Pool {
             ..PoolSummary::default()
         };
         for entry in self.entries.values() {
+            // ★ 账号库里已经没有的条目**不进任何计数**（2026-11-02）：它们不是「账号」，
+            //   只是治理历史的载体。留着会让 `total` 大于账号库里的号数，于是 401 文案
+            //   变成「有 3 个账号、0 个已禁用、0 个冷却中、0 个余额为 0，却 0 个可用」——
+            //   一个自相矛盾且无法据以行动的说明（那 1 条其实是删除残留）。
+            if !entry.present_in_store {
+                continue;
+            }
             if realm.is_some() && entry.realm != realm {
                 continue;
             }
@@ -1980,6 +2049,10 @@ impl Pool {
     pub fn status_list(&self, now_ms: i64) -> Vec<Value> {
         self.entries
             .values()
+            // ★ 账号库里已没有的条目**不出现在卡里**（2026-11-02）：卡片描述的是「现在的
+            //   账号」，一条删除残留渲染成「可用」会让用户去重登一个已经不存在的号。
+            //   治理状态仍留在池里 —— 账号重新导入即原地恢复（`sync_accounts` 会翻回 true）。
+            .filter(|entry| entry.present_in_store)
             .map(|entry| {
                 let status = entry.status_of(now_ms);
                 // ★ 排除是**互斥第六态**：一个被排除的号可能同时「可用」，但它不能被选中，
@@ -2106,6 +2179,9 @@ impl Pool {
     pub fn diagnose(&self, now_ms: i64) -> Vec<String> {
         self.entries
             .values()
+            // 与 [`Self::status_list`] 同源：已从账号库删除的条目不是「路由候选」，
+            // 列进诊断只会让人去排查一个不存在的账号。
+            .filter(|entry| entry.present_in_store)
             .map(|entry| {
                 let tail = entry
                     .uid
@@ -2137,6 +2213,10 @@ impl Pool {
         let accounts: Vec<Value> = self
             .entries
             .values()
+            // 与 [`Self::status_list`] 同源：账号库里已没有的条目不进快照，
+            // 否则 `/status` 的五个计数之和与 `accounts` 长度对不上
+            // （残留条目渲染成「可用」，用户会去重登一个不存在的号）。
+            .filter(|entry| entry.present_in_store)
             .map(|entry| {
                 // ★ 冷却三件套（`cool_kind` / `until_ms` / `reason`）**只在真的冷却中**才给。
                 // 它们靠墙钟到期，而没有任何人在到期时清字段 ⇒ 照搬会把两天前的
@@ -2218,6 +2298,11 @@ impl Pool {
         let mut in_flight_full = 0;
         let mut realm_totals: BTreeMap<&str, [i64; 4]> = BTreeMap::new();
         for entry in self.entries.values() {
+            // 与上面的 `accounts` 列表同源（残留条目已被过滤），否则「计数」与
+            // 「列表长度」会在同一份 `/status` 里互相矛盾。
+            if !entry.present_in_store {
+                continue;
+            }
             let is_healthy = entry.healthy(now_ms);
             // ★ 安全审计 P2-11：`is_cooling` **必须与 `disabled` 互斥**。
             //
@@ -2764,6 +2849,117 @@ mod tests {
         assert_eq!(pool.len(), 2, "对齐是增量，不得删除既有账号");
         assert!(pool.get("keep").is_some());
         assert!(pool.get("new").is_some());
+        // ★ 「不删除」≠「当作还在」：快照里没有的条目会被标成不在库，
+        //   但仍留着治理历史（账号重新导入即原地复活）。
+        assert!(
+            !pool.get("keep").unwrap().present_in_store,
+            "不在快照里的条目必须标成 present_in_store=false"
+        );
+    }
+
+    /// 账号删到回收站后：条目保留、但**从计数与所有列表视图里消失**。
+    ///
+    /// 这是 #149 遗留的一半：只修「选号跳过脏条目」还不够 —— `PoolSummary` 仍按池内
+    /// 条目计数，于是 401 文案会说「有 3 个账号、0 个已禁用、0 个冷却中、0 个余额为 0，
+    /// 却 0 个可用」，而其中 1 条是删除残留。数字与事实不符，用户无法据此行动。
+    #[test]
+    fn sync_accounts_marks_entries_missing_from_store() {
+        let mut pool = Pool::new(PoolConfig::default());
+        pool.sync_accounts(
+            &[
+                json!({"uid": "a", "nickname": "甲"}),
+                json!({"uid": "b", "nickname": "乙"}),
+                json!({"uid": "gone", "nickname": "已删"}),
+            ],
+            Some(RealmTag::Cn),
+        );
+        assert_eq!(pool.summary(NOW, Some(RealmTag::Cn)).total, 3);
+
+        // 用户把「已删」删进回收站：下一次对齐拿到的快照里没有它。
+        pool.sync_accounts(
+            &[json!({"uid": "a"}), json!({"uid": "b"})],
+            Some(RealmTag::Cn),
+        );
+
+        assert_eq!(pool.len(), 3, "条目仍保留（冷却/熔断历史不得丢）");
+        assert!(!pool.get("gone").unwrap().present_in_store);
+        assert!(pool.get("a").unwrap().present_in_store);
+
+        let summary = pool.summary(NOW, Some(RealmTag::Cn));
+        assert_eq!(summary.total, 2, "残留条目不得计入 total：{summary:?}");
+        assert_eq!(summary.available, 2);
+        assert_eq!(pool.status_list(NOW).len(), 2, "池卡不得渲染已删账号");
+        assert!(
+            !pool.diagnose(NOW).iter().any(|line| line.contains("已删")),
+            "诊断不得让人去排查一个不存在的账号"
+        );
+
+        // 账号重新导入 ⇒ 原地复活，历史还在。
+        pool.sync_accounts(
+            &[json!({"uid": "gone", "nickname": "已删"})],
+            Some(RealmTag::Cn),
+        );
+        assert!(pool.get("gone").unwrap().present_in_store);
+        assert_eq!(pool.summary(NOW, Some(RealmTag::Cn)).total, 1);
+    }
+
+    /// 反向对齐**只动同一个 realm**：WB 池一份同时装 CN 与 Global，
+    /// 用 CN 的快照去标 Global 的条目会把国际版整区标成「不在库里」（整区不可用）。
+    #[test]
+    fn sync_accounts_only_reconciles_its_own_realm() {
+        let mut pool = Pool::new(PoolConfig::default());
+        pool.upsert("cn1", Some(RealmTag::Cn), "");
+        pool.upsert("global1", Some(RealmTag::Global), "");
+
+        pool.sync_accounts(&[json!({"uid": "cn2"})], Some(RealmTag::Cn));
+
+        assert!(!pool.get("cn1").unwrap().present_in_store, "同域缺失应标记");
+        assert!(
+            pool.get("global1").unwrap().present_in_store,
+            "★ 国际版条目不得被 CN 快照连带标记"
+        );
+        assert_eq!(pool.summary(NOW, Some(RealmTag::Global)).total, 1);
+    }
+
+    /// 选号不得挑「账号库已没有」的条目 —— 即便它的积分权重最高。
+    #[test]
+    fn pick_account_skips_entries_missing_from_store() {
+        let mut pool = Pool::new(PoolConfig::default());
+        pool.upsert("alive", Some(RealmTag::Cn), "");
+        pool.upsert("gone", Some(RealmTag::Cn), "");
+        pool.set_credits("gone", 10_000, 0);
+        pool.sync_accounts(&[json!({"uid": "alive"})], Some(RealmTag::Cn));
+
+        for seed in 0..32 {
+            let picked = pool.pick_account(
+                NOW,
+                Some(RealmTag::Cn),
+                "",
+                &HashSet::new(),
+                PickMode::Weighted,
+                seed,
+                None,
+                None,
+                "test",
+            );
+            assert_eq!(picked.as_deref(), Some("alive"), "seed={seed}");
+        }
+
+        // 只剩残留条目 ⇒ 一个都选不出来（调用方据此报「账号库为空」，而不是 503 冷却）。
+        pool.sync_accounts(&[], Some(RealmTag::Cn));
+        assert!(pool
+            .pick_account(
+                NOW,
+                Some(RealmTag::Cn),
+                "",
+                &HashSet::new(),
+                PickMode::Weighted,
+                0,
+                None,
+                None,
+                "test",
+            )
+            .is_none());
     }
 
     #[test]
@@ -3005,14 +3201,30 @@ mod tests {
         assert!(!pool.acquire("ghost"));
     }
 
+    /// ★★ issue #129 §5.3：余额不足（402）**只是冷却**，返回值必须是 `false`。
+    ///
+    /// 返回值的语义是「**是否禁用了账号**」，而 `relay_once` 拿它当
+    /// `if disabled { break; }` 的判据。旧实现返回 `true` ⇒ 402 上**立即终止换号**，
+    /// 与 `should_rotate` 把 `HardCredit` 列为「换号能救」自相矛盾：
+    /// 池里明明有别的健康号，请求却直接失败（用户看到的正是「有号却不通」）。
+    ///
+    /// 可证伪：把返回值改回 `true` ⇒ 本用例红。
     #[test]
-    fn apply_error_hard_credit_cools_until_next_4am() {
+    fn apply_error_hard_credit_cools_until_next_4am_and_does_not_disable() {
         let mut pool = Pool::new(PoolConfig::default());
         pool.upsert("u1", None, "");
-        pool.apply_upstream_error("u1", "m", &UpstreamEvent::HardCredit, NOW);
+        let disabled = pool.apply_upstream_error("u1", "m", &UpstreamEvent::HardCredit, NOW);
+        assert!(
+            !disabled,
+            "余额不足不得返回「已禁用」——否则换号循环会在 402 上直接 break"
+        );
         let entry = pool.get("u1").unwrap();
         assert_eq!(entry.cool_kind, Some(CoolKind::Hard));
         assert_eq!(entry.until_ms, crate::timeutil::next_day_4am(NOW));
+        assert!(
+            !entry.disabled,
+            "冷却 ≠ 禁用：账号仍可人工恢复 / 次日自动恢复"
+        );
     }
 
     #[test]
@@ -4117,6 +4329,40 @@ mod tests {
             .is_some(),
             "无偏好时行为不变"
         );
+    }
+
+    /// 累积 `tried` 逐个跳过候选 —— `select_account` 据此剔除无凭据的池条目。
+    ///
+    /// 账号删除后池条目仍在，选中它取不到凭据；调用方把它记入 `skipped` 后重选，
+    /// 因此需要保证累积 `tried` 能穷尽候选，而不是反复返回同一个。
+    #[test]
+    fn pick_account_skips_each_tried_uid_until_exhausted() {
+        let mut pool = Pool::new(PoolConfig::default());
+        for uid in ["a", "b", "c"] {
+            pool.upsert(uid, Some(RealmTag::Cn), "");
+        }
+
+        let mut skipped: HashSet<String> = HashSet::new();
+        let mut order = Vec::new();
+        loop {
+            let Some(picked) = pool.pick_account(
+                NOW,
+                Some(RealmTag::Cn),
+                "",
+                &skipped,
+                PickMode::Weighted,
+                skipped.len() as u64,
+                None,
+                None,
+                "test",
+            ) else {
+                break;
+            };
+            assert!(skipped.insert(picked.clone()), "不得重复返回同一 uid");
+            order.push(picked);
+        }
+
+        assert_eq!(order.len(), 3, "三个候选应被穷尽：{order:?}");
     }
 
     #[test]

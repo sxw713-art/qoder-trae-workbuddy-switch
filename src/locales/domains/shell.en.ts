@@ -192,6 +192,8 @@ export const en = {
   // ---- Settings sub-nav (P7 §3.9: 9 items, the 9th is "Backup & restore") ----
   "settings.subnav.aria": "Settings sections",
   "settings.subnav.general": "General",
+  "settings.scope.global": "Global setting · applies to every scope; switching scope will not change it",
+  "settings.scope.scoped": "Affects the current scope only ({scope}) · other scopes have their own settings",
   "settings.subnav.account": "Accounts & sign-in",
   "settings.subnav.checkin": "Check-in & credits",
   "settings.subnav.gateway": "Gateway",
@@ -261,6 +263,7 @@ export const en = {
   "wbSettings.cli.loadFailed": "Could not read CLI status",
   "settings.subnav.diagnostics": "Permissions & diagnostics",
   "settings.subnav.logs": "Logs",
+  "settings.subnav.network": "Network",
   "settings.subnav.backup": "Backup & restore",
 
   // ---- Gateway workspace subnav (PLAN §3.9: 6 items, shared by both product lines) ----
@@ -486,6 +489,14 @@ export const en = {
   "appSettings.scopeVisibility.toggleAria": "Toggle visibility for {scope}",
   "appSettings.scopeVisibility.hint": "Hidden scopes disappear from the top bar and shortcuts; direct URLs remain accessible.",
   "appSettings.scopeVisibility.onlyOneLeft": "Only one scope left visible — cannot hide more",
+
+  // ---- Credit auto-refresh (app-settings.tsx; issue #133 review §3: upstream off by default) ----
+  "appSettings.creditAutoRefresh.groupTitle": "Credit auto-refresh",
+  "appSettings.creditAutoRefresh.upstreamLabel": "Query upstream automatically",
+  "appSettings.creditAutoRefresh.upstreamDesc":
+    "Queries upstream for balances and usage about every 10 minutes. These are real requests, so this is off by default — when off, data refreshes only on page load or when you click refresh.",
+  "appSettings.creditAutoRefresh.hint":
+    "Views that only re-read local snapshots (Trae credits / accounts) are unaffected: they make no upstream requests and keep following the background sync.",
 
   // ---- Shared fallbacks ----
   "common.unknownError": "Unknown error",

@@ -136,7 +136,10 @@ pub async fn messages_for_region(
         crate::model_route::rewrite_body_model(&upstream_raw, &model)
     };
 
-    let conversation_id = relay::conversation_id_of(&parsed);
+    // ★ issue #150：粘性键不能只认 body 的 `metadata.conversation_id` —— Claude Code
+    //   发 `x-claude-code-session-id` 头、Codex 发 body `session_id`，都要认
+    //   （见 `session_headers::session_key_of`）。出站 `X-Conversation-ID` 同样用它。
+    let session_key = session_headers::session_key_of(&parsed, &headers);
     let turn_key = session_headers::turn_key(&parsed);
     let inbound_request_id = header_of(&headers, "x-conversation-request-id");
     let trace_id = header_of(&headers, "x-trace-id");
@@ -147,7 +150,7 @@ pub async fn messages_for_region(
         region,
         &raw,
         &model,
-        conversation_id.clone(),
+        session_key.clone(),
         turn_key.as_deref(),
         inbound_request_id.as_deref(),
         trace_id.clone(),
@@ -170,7 +173,7 @@ pub async fn messages_for_region(
                 region,
                 &raw,
                 &model,
-                conversation_id,
+                session_key.clone(),
                 turn_key.as_deref(),
                 inbound_request_id.as_deref(),
                 trace_id,
@@ -204,8 +207,11 @@ pub async fn messages_for_region(
                     total_ms: elapsed,
                     prompt_tokens: 0,
                     completion_tokens: 0,
+                    cached_tokens: 0,
                     credit: 0.0,
                     stream: true,
+                    // ★ issue #129：流中途失败摘要（`None` = 正常结束 / 老条目）。
+                    error: None,
                 }
                 .to_value(),
             );
@@ -232,8 +238,11 @@ pub async fn messages_for_region(
                     total_ms: elapsed_ms,
                     prompt_tokens: 0,
                     completion_tokens: 0,
+                    cached_tokens: 0,
                     credit: 0.0,
                     stream: wants_stream,
+                    // ★ issue #129：流中途失败摘要（`None` = 正常结束 / 老条目）。
+                    error: None,
                 }
                 .to_value(),
             );
@@ -253,6 +262,12 @@ pub async fn messages_for_region(
                 .unwrap_or_else(|| model.clone());
             // ★ 上游**响应头**已到 ⇒ 此刻的耗时就是 `latencyMs`（TTFB）；总耗时是 `totalMs`。
             let header_at_ms = started.elapsed().as_millis() as i64;
+            // ★ issue #129：流中途失败的三个消费者（协议出口 / 请求日志 / 粘性解绑）
+            //   共用同一个信号槽。开关从**本轮**配置快照读（热生效）。
+            let auto_failover = state.config_snapshot().await.auto_failover;
+            let failure = crate::failover::StreamFailure::new(auto_failover);
+            // 粘性键用**客户端请求的模型**（与 `relay` 内部推导同一口径）。
+            let sticky_key = relay::sticky_key_for(region, &model, session_key.as_deref());
             let mut resp = if wants_stream {
                 // ★ 流式请求的日志**推迟到流结束**才写（见 `StreamingLogSink`）：
                 //   写日志时用量还没到达，此前只能写死 0（实测本机 200/200 条全 0）。
@@ -264,7 +279,8 @@ pub async fn messages_for_region(
                         key_scope: key.as_deref().map(|actor| actor.scope),
                         method: "POST",
                         region,
-                        account,
+                        // 留给 `with_failover` 的对外文案（下面还要读一次）。
+                        account: account.clone(),
                         account_uid: uid.clone(),
                         model: model.clone(),
                         status: 200,
@@ -274,24 +290,46 @@ pub async fn messages_for_region(
                         total_ms: 0,
                         prompt_tokens: 0,
                         completion_tokens: 0,
+                        cached_tokens: 0,
                         credit: 0.0,
                         stream: true,
+                        // ★ issue #129：流中途失败摘要（`None` = 正常结束 / 老条目）。
+                        error: None,
                     },
                     started,
                     &uid,
                     &model,
                     // ★ issue #76：按密钥的 token 记账（流结束才写）。
                     key.as_deref(),
+                    // ★ issue #129：日志据此写真实状态码（不是恒 200）。
+                    Some(failure.clone()),
                 );
-                sse_response(AnthropicSseStream::new(
-                    crate::protocol::usage_tap::UsageTap::new(
-                        relay::prefix_stream(prefix, response),
-                        sinks,
+                sse_response(
+                    AnthropicSseStream::new(
+                        crate::protocol::usage_tap::UsageTap::new(
+                            relay::prefix_stream(prefix, response),
+                            sinks,
+                        )
+                        // ★ 流内信封错误：与 chat 路由同一判据，只是错误体形状不同。
+                        .with_error_sink(relay::envelope_error_sink(
+                            &state,
+                            &uid,
+                            &model,
+                            sticky_key.as_deref(),
+                        ))
+                        // ★ issue #129：同一份嗅探结果也写进失败槽（出口/日志读它）。
+                        .with_failure(Some(failure.clone())),
+                        model.clone(),
                     )
-                    // ★ 流内信封错误：与 chat 路由同一判据，只是错误体形状不同。
-                    .with_error_sink(relay::envelope_error_sink(&state, &uid, &model)),
-                    model,
-                ))
+                    // ★ issue #139：`message_start` 必须当场给 `input_tokens`，而上游
+                    //   的真实 `prompt_tokens` 要到末帧 —— 先用请求侧估算占位，
+                    //   否则客户端（dsh / Claude Code）的「上下文占用」恒为 0%。
+                    .with_estimated_input(crate::protocol::anthropic::estimate_input_tokens(
+                        &parsed,
+                    ))
+                    // ★ issue #129：开关开启时，收尾发 `event: error` 而不是 `message_stop`。
+                    .with_failover(Some(failure), &account),
+                )
             } else {
                 let text = relay::body_text_with_prefix(prefix, response).await;
                 // ★ 200 信封错误（P0-3）：与 chat 路由同一判据、同一治理副作用，
@@ -314,8 +352,11 @@ pub async fn messages_for_region(
                             total_ms: elapsed_ms,
                             prompt_tokens: 0,
                             completion_tokens: 0,
+                            cached_tokens: 0,
                             credit: 0.0,
                             stream: false,
+                            // ★ issue #129：流中途失败摘要（`None` = 正常结束 / 老条目）。
+                            error: None,
                         }
                         .to_value(),
                     );
@@ -349,6 +390,13 @@ pub async fn messages_for_region(
                     .and_then(|usage| usage.get("credit"))
                     .and_then(serde_json::Value::as_f64)
                     .unwrap_or(0.0);
+                // ★ issue #154：Anthropic 的缓存命中字段叫 `cache_read_input_tokens`
+                //   （不是 OpenAI 的 `prompt_tokens_details.cached_tokens`）。
+                let cached_tokens = message
+                    .get("usage")
+                    .and_then(|usage| usage.get("cache_read_input_tokens"))
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
                 state.log.record(
                     RequestMeta {
                         endpoint: "/v1/messages",
@@ -364,8 +412,11 @@ pub async fn messages_for_region(
                         total_ms: started.elapsed().as_millis() as i64,
                         prompt_tokens,
                         completion_tokens,
+                        cached_tokens,
                         credit,
                         stream: false,
+                        // ★ issue #129：流中途失败摘要（`None` = 正常结束 / 老条目）。
+                        error: None,
                     }
                     .to_value(),
                 );

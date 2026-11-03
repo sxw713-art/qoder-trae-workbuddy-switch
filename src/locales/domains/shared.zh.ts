@@ -130,6 +130,7 @@ export const zh = {
   "shared.gateway.models.imageNo": "不支持",
   "shared.gateway.models.imageUndeclared": "未声明",
   "shared.gateway.models.imageSourceUpstream": "上游目录声明支持图片输入",
+  "shared.gateway.models.imageSourceKnown": "网关内置表声明（上游没有能力字段，可手动改）",
   "shared.gateway.models.imageSourceOverride": "你在本页手动指定（覆盖上游声明）",
   "shared.gateway.models.imageUndeclaredHint":
     "上游清单没有声明这个模型能否读图。客户端连上来时默认按「不支持」处理（图片会被它自己挡掉，请求根本不到网关），需要时可在此手动标记。",
@@ -189,6 +190,8 @@ export const zh = {
   "shared.gateway.fallback.stats": "近 {days} 天：降级 {total} 次（成功 {ok} · 失败 {fail}）",
   "shared.gateway.fallback.events": "降级流水",
   "shared.gateway.fallback.eventsHide": "收起流水",
+  "shared.gateway.fallback.expand": "展开",
+  "shared.gateway.fallback.collapse": "收起",
   "shared.gateway.fallback.event.time": "时间",
   "shared.gateway.fallback.event.path": "实际路径",
   "shared.gateway.fallback.event.reason": "触发原因",
@@ -384,6 +387,10 @@ export const zh = {
   "shared.gateway.probe.emptyAllSkippedDesc":
     "这些账号都没有可用凭据——可能没登录、凭据是加密信封、或已被移出账号库。请到「账号」页重新登录或导入账号；若本机没有对应桌面客户端（Docker / headless），请在「网关 → 账号池」用扫码方式添加；若用的是「指定账号」策略，请确认该账号仍在本机账号库中。",
   "shared.gateway.pool.totalRequests": "累计请求 {count}",
+  // ★ issue #129：账号池顶部「账号故障时自动切换」开关。
+  "shared.gateway.pool.autoFailover": "账号故障时自动切换",
+  "shared.gateway.pool.autoFailoverHint":
+    "开启后，一个账号在回复中途挂掉时，网关会把这次失败变成「可重试错误」，客户端自动换号重跑整个步骤，你看到的是从头完整重写的回复。代价：这一次回答的已输出部分作废、会再消耗一次额度。关闭时保持原有行为（上游报错按原样透出）。默认关闭：它改变对外报错方式，属于行为变更。",
   "shared.gateway.pool.tile.available": "可路由",
   // 「可路由」格里的小字注：其中几个只是**并发占满**（账号正常、几秒自愈）。
   // 不做第七格的理由见 `GatewayPoolSummary.inFlightFull` 的注释 —— 瞬时态与故障态不能并排。
@@ -716,6 +723,17 @@ export const zh = {
   "shared.refreshPart.checkin": "签到状态已刷新",
   "shared.refreshPart.credential": "凭据状态已刷新",
   "shared.refreshPart.fail": "刷新失败",
+  // 积分的自动刷新节拍与「上次刷新」（三平台积分视图共用，issue #133）。
+  // ★ 两句文案对应**两种成本**（issue #133 复核 §3）：`autoEvery` 是「打上游」的视图，
+  //   `autoFollow` 是「只读本地快照」的视图。有抖动之后「每 N 分钟」不再成立 ⇒ 用「约」。
+  "shared.credit.autoEvery": "约每 {n} 分钟向官方查询一次",
+  "shared.credit.autoFollow": "自动跟随后台同步",
+  "shared.credit.autoOff": "自动刷新已关闭（设置 · 通用可开启）",
+  /* 资源包明细里那一句「已用 X」。**四个装配点共用这一条**（issue #144 复核 §3.4）：
+     它不属于任何平台的词条域，而此前渠道页写「已用 13.99」、聚合页与 Qoder 写裸数字
+     —— 同一个抽屉里同一列有两种说法，用户无从判断那个数字是什么。 */
+  "shared.credit.packUsed": "已用 {n}",
+  "shared.credit.lastRefresh": "上次刷新 {time}",
   // 详情抽屉顶部的四个指标块（文本在页面侧格式化，这里只提供标签与固定短语）。
   "shared.stat.credits": "积分",
   "shared.stat.tokens": "今日 Token",

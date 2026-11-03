@@ -20,7 +20,8 @@ use buddy_switch_core::modules::{
     account, auth_file, backup, checkin, client_limits, client_settings, codebuddy_cli, config,
     credit_usage, credits, diagnostics, export_import, gateway_ledger, migrate, oauth, process,
     programs, qoder, refresh, region::Region, region::RegionFilter, rotate, schedule, scheduler,
-    session, skill, switch, token_daily, token_stats, trae, travel, update, vscode_session,
+    session, session_bundle, skill, switch, token_daily, token_stats, trae, travel, update,
+    vscode_session,
 };
 use buddy_switch_gateway::unified::UnifiedGatewayConfig;
 use buddy_switch_gateway::GatewayProduct;
@@ -254,6 +255,13 @@ fn api_routes() -> Router {
         .route("/api/sessions/sync", post(api_session_sync))
         .route("/api/sessions/unify", post(api_session_unify))
         .route("/api/sessions/copy", post(api_copy_sessions))
+        // issue #87 · 会话导出 / 导入（单文件 JSON 包；导入是加法写）。
+        .route("/api/sessions/export", post(api_export_sessions_bundle))
+        .route(
+            "/api/sessions/import/preview",
+            get(api_preview_sessions_bundle),
+        )
+        .route("/api/sessions/import", post(api_import_sessions_bundle))
         // P14 S4a · VS Code 插件 / CodeBuddy IDE 的会话仓（只读枚举 + 加法复制）。
         .route("/api/vscode-sessions", get(api_vscode_sessions))
         .route("/api/vscode-sessions/copy", post(api_copy_vscode_sessions))
@@ -584,8 +592,19 @@ fn api_routes() -> Router {
             get(api_qoder_web_desktop_only),
         )
         .route(
+            "/api/qoder/web/session/window-cookies",
+            get(api_qoder_web_desktop_only),
+        )
+        .route(
             "/api/qoder/web/session/logout",
             post(api_qoder_web_desktop_only),
+        )
+        // ---- Qoder 逐包出站代理（issue #111 收尾）----
+        // ★ 这是**纯配置**，不是「仅桌面端可用」：headless 服务端只要有会话文件同样要取
+        //   逐包，代理通道（国际版按 IP 判地区）对它是同等需要的能力 ⇒ 真实读写。
+        .route(
+            "/api/qoder/web/proxy",
+            get(api_qoder_web_proxy_get).post(api_qoder_web_proxy_set),
         )
         // ---- Qoder API 网关（管理面；网关本体走独立端口 57895，**不** merge 进本 Router）----
         // ⚠️ 一个监听、两个区域：区域由请求所用 API Key 的归属决定（`QoderKeyRegion`），
@@ -2502,6 +2521,131 @@ async fn api_session_unify(Json(body): Json<Value>) -> Response {
     json_ok(session::unify_session_replicas_for(region, &items))
 }
 
+/// POST /api/sessions/export —— 把选中的会话导出成一个 JSON 包（issue #87）。
+///
+/// 与 Tauri 侧 `commands::export_sessions_bundle` **同契约**（两宿主同步）。
+/// body：`{ uid, sessionIds: [...], outPath, region? }`。
+///
+/// **只读**：不碰客户端数据，只写用户指定的落点文件（单文件 JSON，不是 zip ——
+/// 见 core `session_bundle` 模块头：不为一个搬运功能引入解压攻击面）。
+async fn api_export_sessions_bundle(Json(body): Json<Value>) -> Response {
+    if let Err(error) = require_capability(Product::Workbuddy, capability::Capability::SessionCopy)
+    {
+        return json_err(error, StatusCode::FORBIDDEN);
+    }
+    // uid 省略 ⇒ 当前登录账号（与 Tauri 侧同契约）。
+    let uid = body
+        .get("uid")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let session_ids: Vec<String> = body
+        .get("sessionIds")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let Some(out_path) = body
+        .get("outPath")
+        .and_then(Value::as_str)
+        .filter(|path| !path.trim().is_empty())
+    else {
+        return json_err("缺少 outPath".to_string(), StatusCode::BAD_REQUEST);
+    };
+    let region = parse_region(body.get("region").and_then(Value::as_str));
+    let uid = match uid {
+        Some(uid) => uid,
+        None => match session::current_user_uid_for(region) {
+            Some(uid) => uid,
+            None => {
+                return json_err(
+                    "读不到当前登录账号（客户端是否已登录？）".to_string(),
+                    StatusCode::BAD_REQUEST,
+                )
+            }
+        },
+    };
+    let path = std::path::Path::new(out_path);
+    // 空 sessionIds ⇒ 导出该账号全部会话（v1 口径，与 Tauri 侧一致）。
+    let result = if session_ids.is_empty() {
+        session_bundle::export_all_for(region, &uid, path)
+    } else {
+        session_bundle::export_sessions_for(region, &uid, &session_ids, path)
+    };
+    match result {
+        Ok(report) => json_ok(report),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// GET /api/sessions/import/preview —— 只读导出包，回报条数与标题（导入前确认）。
+///
+/// 查询参数：`path`（**必填**）。
+async fn api_preview_sessions_bundle(RawQuery(query): RawQuery) -> Response {
+    if let Err(error) = require_capability(Product::Workbuddy, capability::Capability::SessionCopy)
+    {
+        return json_err(error, StatusCode::FORBIDDEN);
+    }
+    let Some(path) = query_value(query.as_deref(), "path").filter(|path| !path.trim().is_empty())
+    else {
+        return json_err("缺少 path".to_string(), StatusCode::BAD_REQUEST);
+    };
+    match session_bundle::preview_bundle(std::path::Path::new(path.trim())) {
+        Ok(preview) => json_ok(preview),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// POST /api/sessions/import —— 把导出包里的会话**作为新会话**写进指定账号（issue #87）。
+///
+/// 与 Tauri 侧 `commands::import_sessions_bundle` **同契约**（两宿主同步）。
+/// body：`{ uid, path, region? }`。
+///
+/// ★ **只做加法**：每条都生成新 id，绝不覆盖既有会话；同一份包导两次 = 两份副本
+/// （不静默去重 —— 「我以为覆盖了，结果两份」比「我以为合并了，结果只有一份」更难查）。
+async fn api_import_sessions_bundle(Json(body): Json<Value>) -> Response {
+    if let Err(error) = require_capability(Product::Workbuddy, capability::Capability::SessionCopy)
+    {
+        return json_err(error, StatusCode::FORBIDDEN);
+    }
+    let uid = body
+        .get("uid")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let Some(path) = body
+        .get("path")
+        .and_then(Value::as_str)
+        .filter(|path| !path.trim().is_empty())
+    else {
+        return json_err("缺少 path".to_string(), StatusCode::BAD_REQUEST);
+    };
+    let region = parse_region(body.get("region").and_then(Value::as_str));
+    let uid = match uid {
+        Some(uid) => uid,
+        None => match session::current_user_uid_for(region) {
+            Some(uid) => uid,
+            None => {
+                return json_err(
+                    "读不到当前登录账号（客户端是否已登录？）".to_string(),
+                    StatusCode::BAD_REQUEST,
+                )
+            }
+        },
+    };
+    match session_bundle::import_sessions_for(region, &uid, std::path::Path::new(path.trim())) {
+        Ok(report) => json_ok(report),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
 /// 把前端的 `client` 字符串解析成 [`vscode_session::ExtClient`]。
 ///
 /// ⚠️ **空串与未知值一律 `Err`**（不回落默认值）：本仓不猜「用户指的是哪个客户端」——
@@ -3730,7 +3874,7 @@ async fn api_save_gateway_model_fallback(Json(body): Json<Value>) -> Response {
                 return json_err(format!("降级链格式错误: {error}"), StatusCode::BAD_REQUEST)
             }
         };
-    let normalized = buddy_switch_gateway::model_fallback::normalize(parsed);
+    let normalized = buddy_switch_gateway::model_fallback::normalize(scope, parsed);
     let store = buddy_switch_gateway::model_fallback::shared();
     {
         let mut guard = store.write().await;
@@ -5055,6 +5199,34 @@ async fn api_companion_set_visible() -> Response {
         "桌面悬浮窗仅在桌面端可用".to_string(),
         StatusCode::BAD_REQUEST,
     )
+}
+
+/// GET /api/qoder/web/proxy —— 读逐包出站代理配置（两个区域各一个 URL；空 = 直连）。
+async fn api_qoder_web_proxy_get() -> Response {
+    match serde_json::to_value(buddy_switch_core::modules::qoder::web_proxy::WebProxyConfig::load())
+    {
+        Ok(value) => json_ok(value),
+        Err(error) => json_err(error.to_string(), StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+/// POST /api/qoder/web/proxy —— 保存逐包出站代理配置（两个字段都先过形状校验）。
+async fn api_qoder_web_proxy_set(Json(body): Json<Value>) -> Response {
+    let submitted = body.get("config").cloned().unwrap_or(body);
+    let config: buddy_switch_core::modules::qoder::web_proxy::WebProxyConfig =
+        match serde_json::from_value(submitted) {
+            Ok(config) => config,
+            Err(error) => {
+                return json_err(
+                    format!("代理配置格式错误: {error}"),
+                    StatusCode::BAD_REQUEST,
+                )
+            }
+        };
+    if let Err(error) = config.save() {
+        return json_err(error, StatusCode::BAD_REQUEST);
+    }
+    json_ok(json!({ "ok": true, "config": config }))
 }
 
 /// POST /api/qoder/web/{login-open,login-close,credit-packs/probe} —— Qoder 网页端逐包链路。
@@ -6509,6 +6681,8 @@ mod tests {
                 "allow_model_region_prefix",
                 "max_body_mb",
                 "max_context",
+                // ★ issue #129：账号故障时自动切换（WB / Trae / Qoder 三份配置同名）。
+                "auto_failover",
             ])
         );
 

@@ -40,6 +40,8 @@ import type {
   DetailStat,
 } from "@/components/account-detail-drawer";
 import { formatAbsoluteTime } from "@/lib/catalog-source";
+import { secondsToMs, toDetailPacks, type CreditPackTexts } from "@/lib/credit-packs";
+import { packState } from "@/lib/qoder-packs";
 import { displayText } from "@/lib/display-text";
 import { formatCredits } from "@/components/usage/format";
 import type { Translate } from "@/lib/i18n";
@@ -81,8 +83,6 @@ export interface AggregateDetailContext {
    */
   qoderPacks?: QoderWebCreditPacks | null;
 }
-
-const dash = "—";
 
 /**
  * 平台程序位徽标。
@@ -317,12 +317,17 @@ export function aggregateDetailSections(
 /**
  * 资源包明细。
  *
- * 只有**确实拿到包**时才给：WB 走 `credit.resources`，Trae 走 `creditPackages`。
+ * ★ **issue #144 复核 §5（L1 + L2）之后**：过滤（`remaining > 0`）、排序（已过期垫底 →
+ * 到期升序 → 永久垫后）、`ratio`（0..100）全部交给 `credit-packs.ts`，本函数只剩
+ * 「取数据 + 字段改名 + 量纲归一 + 文案」。此前这四件事在这里和三个渠道页各写一遍，
+ * 于是同一批包在四个页面上排在不同位置、`ratio` 在一处漏乘 100、Trae 的秒被当毫秒。
+ *
+ * ★ **Trae 的 `expireAt` 是 Unix 秒**（后端直接透传上游 `expire_time`），
+ * `* 1000` 只允许出现在 Trae 分支的这一行 —— 这是 #144 那个「到期列全是 1970」的根因。
  *
  * ⚠️ Qoder **有**包的概念（issue #111 已接入网页端逐资源包明细），但数据来自
- * **网页会话**链路（仅桌面端 + 需登录一次），而聚合页的账号快照里没有这份数据
- * ⇒ 这里仍然给空数组。要补需要先把逐包并进聚合快照，属后续阶段。
- * （旧注释「Qoder 没有包的概念」是错的，已更正。）
+ * **网页会话**链路（仅桌面端 + 需登录一次）⇒ 拿不到时返回空数组，抽屉不渲染该区块。
+ * 与「该账号没有包」在界面上靠「有没有区块」区分不了，真正的引导放在 Qoder 账号页。
  */
 export function aggregateDetailPacks(
   account: AggregateAccount,
@@ -330,90 +335,97 @@ export function aggregateDetailPacks(
 ): DetailPack[] {
   const { t } = ctx;
 
-  const toPack = (input: {
-    key: string;
-    name: string;
-    total: number;
-    remaining: number;
-    used: number;
-    expireAt: number | null;
-    expired: boolean;
-    expiringSoon: boolean;
-  }): DetailPack => ({
-    key: input.key,
-    name: input.name,
-    remainingText: formatCredits(input.remaining),
-    totalText: formatCredits(input.total),
-    usedText: formatCredits(input.used),
-    expiryText: input.expireAt ? formatAbsoluteTime(input.expireAt) : dash,
-    expired: input.expired,
-    expiringSoon: input.expiringSoon,
-    ratio: input.total > 0 ? Math.max(0, Math.min(1, input.remaining / input.total)) : 0,
-  });
-
   if (account.platform === "workbuddy") {
     const resources = ctx.credit?.ok ? (ctx.credit.resources ?? []) : [];
-    return resources
-      .filter((item) => item.total > 0 || item.remaining > 0)
-      .map((item, index) =>
-        toPack({
-          key: `${item.packageCode ?? "pack"}-${index}`,
-          name: displayText(item.packageName) || displayText(item.packageCode) || t("aggregate.detail.packFallbackName"),
-          total: item.total,
-          remaining: item.remaining,
-          used: item.used,
-          expireAt: item.expireAt,
-          expired: item.expired,
-          expiringSoon: item.expiringSoon,
-        }),
-      );
+    return toDetailPacks(
+      resources.map((item) => ({
+        key: `${item.packageCode ?? "pack"}-${item.expireAt ?? "none"}`,
+        name:
+          displayText(item.packageName) ||
+          displayText(item.packageCode) ||
+          t("aggregate.detail.packFallbackName"),
+        total: item.total,
+        remaining: item.remaining,
+        used: item.used,
+        /* WB 是**毫秒**（后端 `parse_timestamp_ms`）。 */
+        expireAtMs: item.expireAt,
+        expired: item.expired,
+        expiringSoon: item.expiringSoon,
+      })),
+      AGGREGATE_PACK_TEXTS(t),
+    );
   }
 
   if (account.platform === "trae") {
-    return (account.data.creditPackages ?? []).map((item, index) =>
-      toPack({
-        key: `${item.packageCode ?? "pack"}-${index}`,
+    /* ★ issue #144 复核 §4.1：「账号 + 其信号」的合并**在页面里做一次**
+       （`AggregateAccountsPage` 的 `detailAccount`），所以这里读的字段与 Trae 渠道页
+       **同名同义**（`account.creditPackages`）。此前这里多传一个 `ctx.traePacks` 侧信道，
+       而账号视图本身不含该键 ⇒ 两条路径对「这个账号有哪些包」各答一次。 */
+    const packs = account.data.creditPackages ?? [];
+    return toDetailPacks(
+      packs.map((item) => ({
+        key: `${item.packageCode ?? "pack"}-${item.expireAt ?? "none"}`,
         name: displayText(item.packageName) || t("aggregate.detail.packFallbackName"),
         total: item.total,
         remaining: item.remaining,
         used: item.used,
-        expireAt: item.expireAt,
+        /* ★ 唯一允许出现 `* 1000` 的地方：Trae 上游给的是**秒**。 */
+        expireAtMs: secondsToMs(item.expireAt),
         expired: item.expired,
         expiringSoon: item.expiringSoon,
-      }),
+      })),
+      AGGREGATE_PACK_TEXTS(t),
     );
   }
 
   if (account.platform === "qoder") {
-    /* Qoder 的逐包来自**网页会话**（issue #111）：拿不到时返回空数组，抽屉就不渲染
-       资源包区块 —— 与「该账号没有包」是两件事，界面上靠「有没有区块」区分不了，
-       所以真正的引导放在 Qoder 账号页（那里有登录入口）。聚合页只做展示。 */
     const packs = ctx.qoderPacks;
     if (!packs?.available) return [];
-    return packs.packs
-      /* 零额度条目（真机上 `plan_quota` 那条 `limit_value = 0`）不进列表：
-         它的「0 / 0」会被读成「用完了」，而它本来就不计量。 */
-      .filter((pack) => pack.limit > 0 || pack.remaining > 0)
-      .map((pack, index) => {
-        const expired = pack.expiresAtMs !== undefined ? pack.expiresAtMs <= Date.now() : false;
-        const expiringSoon =
-          !expired &&
-          pack.expiresAtMs !== undefined &&
-          pack.expiresAtMs - Date.now() <= 14 * 24 * 3600 * 1000;
-        return toPack({
+    const now = Date.now();
+    return toDetailPacks(
+      packs.packs.map((pack, index) => {
+        const state = packState(pack, now);
+        return {
           key: pack.id ?? `qoder-pack-${index}`,
           name: qoderPackSourceName(t, pack.source),
           total: pack.limit,
           remaining: pack.remaining,
           used: pack.used,
-          expireAt: pack.expiresAtMs ?? null,
-          expired,
-          expiringSoon,
-        });
-      });
+          /* Qoder 是**毫秒**（`expiresAtMs`）。 */
+          expireAtMs: pack.expiresAtMs ?? null,
+          expired: state === "expired",
+          /* Qoder 上游没有临期标记 ⇒ 用 `packState` 的窗口（14 天，与卡片浮层同源）。 */
+          expiringSoon: state === "expiring",
+        };
+      }),
+      AGGREGATE_PACK_TEXTS(t),
+      now,
+    );
   }
 
   return [];
+}
+
+/**
+ * 聚合页抽屉的**文案层**。
+ *
+ * ⚠️ 刻意**不复用**渠道页的词条域（`wbAccounts.*` / `trae.comp.*` / `qoder.page.*`）：
+ * 文案域不同，混用会串（既有判断，见 `qoderPackSourceName`）。共用的是逻辑，不是文案。
+ */
+function AGGREGATE_PACK_TEXTS(t: Translate): CreditPackTexts {
+  return {
+    remainingText: formatCredits,
+    totalText: formatCredits,
+    /* ★「已用」用**共用**词条（issue #144 复核 §3.4）：它不属于任何平台的词条域。
+       此前聚合页写裸数字、渠道页写「已用 13.99」—— 同一个抽屉同一列两种说法。 */
+    usedText: (value) => t("shared.credit.packUsed", { n: formatCredits(value) }),
+    expiryText: (expireAtMs, expired) =>
+      expired
+        ? t("aggregate.detail.packExpired")
+        : expireAtMs !== null
+          ? formatAbsoluteTime(expireAtMs)
+          : t("aggregate.detail.packForever"),
+  };
 }
 
 /** 上游 `source` → 聚合页文案（**不复用** Qoder 页的词条：文案域不同，混用会串）。 */

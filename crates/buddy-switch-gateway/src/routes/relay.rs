@@ -1021,6 +1021,8 @@ async fn relay_once(
                         model: block.model,
                         remain_secs,
                         failures: block.failures,
+                        // 闸门路径：成因是「窗口内失败次数够了」，不是「没号可换」。
+                        cooled_accounts: 0,
                         attempts: attempts.clone(),
                     },
                     account: String::new(),
@@ -1329,7 +1331,7 @@ async fn relay_once(
         //   **不可能有用**的事（报障人：切换过多个账号、桌面端和 Buddy Switch 都试过）。
         //   池快照就在手边，把事实摆出来即可。
         None => {
-            let (summary, scoped) = {
+            let (summary, scoped, model_cooling) = {
                 let pool = state.pool.read().await;
                 let summary = pool.summary(now_ms, Some(realm));
                 // ★ issue #76：白名单生效时再取一份**名单口径**快照（同一个读锁，
@@ -1337,12 +1339,41 @@ async fn relay_once(
                 let scoped = allowed
                     .as_ref()
                     .map(|uids| pool.summary_of(uids, now_ms, Some(realm)));
-                (summary, scoped)
+                // ★★ issue #134：`summary.model_cooling` 是「有**任意**模型冷却的账号数」，
+                //   与本次请求的模型无关 ⇒ 不能拿它判「这个模型整体被限流」。
+                //   必须逐账号问该模型的截止时刻（与选号同一套硬约束），见
+                //   `pool::pick::model_cooling_until`。
+                //
+                //   为什么这条判据必须存在：`#125` 把闸门开闸判据改成「去重账号数 ≥ 2」
+                //   ⇒ **单账号池里闸门永远不会开**，模型限流于是落回这里的兜底，
+                //   而兜底只有 `pool_busy`(503) / `no_credential`(401)，前者判据不成立
+                //   ⇒ 401 ⇒ 客户端判 AUTH、整轮终止（正是 #106 修掉的那个症状）。
+                let model_cooling = pool.model_cooling_until(
+                    now_ms,
+                    Some(realm),
+                    &request.model,
+                    &tried,
+                    allowed.as_ref(),
+                );
+                (summary, scoped, model_cooling)
             };
-            RelayFailure {
+            let error = match model_cooling {
+                // 该模型在**全部**可试账号上都在冷却 ⇒ 与闸门暂停同语义（503 + Retry-After）。
+                Some((until_ms, accounts)) => GatewayError::ModelGatePaused {
+                    model: request.model.clone(),
+                    remain_secs: (until_ms.saturating_sub(now_ms).max(0) as u64)
+                        .div_ceil(1000)
+                        .max(1),
+                    failures: 0,
+                    cooled_accounts: accounts,
+                    attempts: attempts.clone(),
+                },
                 // ★ 不要再写死 `NoCredential`：全部健康只是在途占满时那是 401 误报，
                 //   会让客户端去重建登录态（见 `pool_unavailable_error`）。
-                error: pool_unavailable_error(request.region, &summary, scoped.as_ref()),
+                None => pool_unavailable_error(request.region, &summary, scoped.as_ref()),
+            };
+            RelayFailure {
+                error,
                 account: String::new(),
                 uid: String::new(),
                 upstream_message: String::new(),
@@ -1407,6 +1438,12 @@ pub struct EnvelopeErrorSink {
     state: GatewayState,
     uid: String,
     model: String,
+    /// 会话粘性键（`None` = 客户端没给会话 id ⇒ 本来就没绑定）。
+    ///
+    /// ★ issue #129 §5.2 改动 3：首帧前的两条失败路径早已解绑粘性，首帧后的
+    /// sink 路径**漏了这一步** ⇒ 客户端重跑时粘性会把它拉回同一个号，
+    /// 开关看起来「没生效」（其实换号逻辑从没被执行）。
+    sticky_key: Option<String>,
 }
 
 impl crate::protocol::usage_tap::StreamErrorSink for EnvelopeErrorSink {
@@ -1414,8 +1451,19 @@ impl crate::protocol::usage_tap::StreamErrorSink for EnvelopeErrorSink {
         let state = self.state.clone();
         let uid = self.uid.clone();
         let model = self.model.clone();
+        let sticky_key = self.sticky_key.clone();
         tokio::spawn(async move {
+            // ① 冷却 / 熔断 / 模型闸门（既有唯一路径）。
             note_envelope_failure(&state, &uid, &model, &error.event).await;
+            // ② 粘性解绑：这个号已经失败过，下一轮必须换。
+            if let Some(key) = sticky_key.as_deref() {
+                state.sticky.write().await.unbind(key);
+            }
+            // ③ 管理面「最近一次失败」：流中途失败不经过 `relay()` 的唯一失败出口，
+            //    不写这里的话账号池卡片能看到冷却、而「最近一次失败」却还停在上一次。
+            state
+                .note_last_error(format!("账号「{uid}」流内失败：{}", error.message))
+                .await;
         });
     }
 }
@@ -1425,6 +1473,8 @@ pub fn envelope_error_sink(
     state: &GatewayState,
     uid: &str,
     model: &str,
+    // ★ issue #129：首帧后失败同样要解绑粘性（见 `EnvelopeErrorSink::sticky_key`）。
+    sticky_key: Option<&str>,
 ) -> Option<std::sync::Arc<dyn crate::protocol::usage_tap::StreamErrorSink>> {
     if uid.is_empty() {
         return None;
@@ -1433,6 +1483,7 @@ pub fn envelope_error_sink(
         state: state.clone(),
         uid: uid.to_string(),
         model: model.to_string(),
+        sticky_key: sticky_key.map(str::to_string),
     }))
 }
 
@@ -1591,12 +1642,28 @@ fn allowed_uids_for(policy: &crate::apikey::KeyPolicy, region: Region) -> Option
 /// 区域与模型都进键：跨区域的账号库本就分家；同一会话切模型时应允许落到各自最合适的账号
 /// （否则「模型级限流只封锁该模型」的优势会被粘性抵消）。
 fn sticky_key_of(request: &RelayRequest) -> Option<String> {
-    request
-        .conversation_id
-        .as_deref()
+    sticky_key_for(
+        request.region,
+        &request.model,
+        request.conversation_id.as_deref(),
+    )
+}
+
+/// [`sticky_key_of`] 的**路由层可用**版本（issue #129）。
+///
+/// 流中途失败的治理（解绑粘性）发生在 `StreamErrorSink` 里 —— 那是个后台任务，
+/// 拿不到 `RelayRequest`。三条路由本来就有 `(region, model, conversation_id)`，
+/// 直接用同一份推导即可；**不得**在别处另写一套拼键规则（键一不一致，
+/// 解绑就静默失效，表现为「重试还是撞同一个号」）。
+pub fn sticky_key_for(
+    region: Region,
+    model: &str,
+    conversation_id: Option<&str>,
+) -> Option<String> {
+    conversation_id
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(|value| sticky::sticky_key(request.region.as_str(), &request.model, value))
+        .map(|value| sticky::sticky_key(region.as_str(), model, value))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1632,38 +1699,41 @@ async fn select_account(
         _ => (PickMode::Weighted, sticky_uid),
     };
 
-    let (picked_uid, pool_empty) = {
-        let mut pool = state.pool.write().await;
-        if pool.is_empty() {
-            (None, true)
-        } else {
-            let seed = (now_ms as u64)
-                .wrapping_mul(31)
-                .wrapping_add(attempt as u64)
-                .wrapping_add(0x9E37_79B9_7F4A_7C15);
-            // 偏好不可用时由 `pick_with_preference` 自行回落到自动择优；
-            // 排除项由池自己持有（`sync_exclusions`），无需在这里传。
-            (
+    // 账号删除后池条目仍在（`sync_accounts` 增量 upsert），而 `find_account_for`
+    // 只查账号库 ⇒ 选中它取不到凭据。**主防线**是池内的 `present_in_store` 标记
+    // （`sync_accounts` 维护、`pick` 直接跳过，见 `PoolEntry::present_in_store`）；
+    // 这里的逐个验证是**兜底**：同步与取凭据之间仍可能有一条被删掉的号，
+    // 无凭据的记入 `skipped` 后重选，绝不让一条脏数据拖死整轮。
+    let mut skipped: HashSet<String> = tried.clone();
+    let pool_empty = state.pool.read().await.is_empty();
+    if !pool_empty {
+        loop {
+            let picked_uid = {
+                let mut pool = state.pool.write().await;
+                let seed = (now_ms as u64)
+                    .wrapping_mul(31)
+                    .wrapping_add(attempt as u64)
+                    .wrapping_add(skipped.len() as u64)
+                    .wrapping_add(0x9E37_79B9_7F4A_7C15);
+                // 偏好不可用时由 `pick_with_preference` 自行回落到自动择优；
+                // 排除项由池自己持有（`sync_exclusions`），无需在这里传。
                 pool.pick_account(
                     now_ms,
                     Some(realm),
                     model,
-                    tried,
+                    &skipped,
                     mode,
                     seed,
                     preferred,
                     allowed,
                     owner,
-                ),
-                false,
-            )
-        }
-    };
-
-    if let Some(uid) = picked_uid {
-        // 池里存在但账号库已删除 → 该 uid 无凭据可用，落回策略选择。
-        if let Some(account_value) = account::find_account_for(region, &uid) {
-            return Some(account_value);
+                )
+            };
+            let Some(uid) = picked_uid else { break };
+            if let Some(account_value) = account::find_account_for(region, &uid) {
+                return Some(account_value);
+            }
+            skipped.insert(uid);
         }
     }
 
@@ -1705,8 +1775,9 @@ async fn select_account(
 
 /// 池快照 → `no_credential` 的具体原因（**唯一判据**）。
 ///
-/// `total == 0` ⇒ 该区域在池里一条都没有：账号库为空，或库里的账号都没有 `uid`
-/// 而被 `sync_accounts` 跳过。否则是「有号，但一个都不可用」—— 这两种处境的可行动
+/// `total == 0` ⇒ 该区域在账号库里一个号都没有（空库，或库里的账号都没有 `uid` 而被
+/// `sync_accounts` 跳过，或池里只剩「账号已删除」的残留条目 —— 它们不计入 `total`，
+/// 见 `PoolEntry::present_in_store`）。否则是「有号，但一个都不可用」—— 这两种处境的可行动
 /// 指引完全不同（见 [`NoCredentialCause`]）。
 ///
 /// 刻意用 `total` 而不是「`available == 0`」：后者只说「不可用」，前者才能区分
@@ -2045,13 +2116,14 @@ pub fn stream_sinks(
     // ★ issue #76：调用方的 `KeyActor`（`None` = 无 Key 的调用 ⇒ 不记按密钥用量）。
     //   用 actor 而不是具体 Key 类型：统一网关的 Key 是第四套台账，也能带进来。
     key: Option<&crate::apikey::KeyActor>,
+    // ★ issue #129：流中途失败信号（日志据此写真实状态码而非恒 200）。
+    failure: Option<std::sync::Arc<crate::failover::StreamFailure>>,
 ) -> Vec<std::sync::Arc<dyn crate::protocol::usage_tap::UsageSink>> {
     let mut sinks: Vec<std::sync::Arc<dyn crate::protocol::usage_tap::UsageSink>> =
-        vec![std::sync::Arc::new(crate::logging::StreamingLogSink::new(
-            state.log.clone(),
-            meta,
-            started,
-        ))];
+        vec![std::sync::Arc::new(
+            crate::logging::StreamingLogSink::new(state.log.clone(), meta, started)
+                .with_failure(failure),
+        )];
     if let Some(ledger) = pool_usage_sink(state, uid, model) {
         sinks.push(ledger);
     }

@@ -39,6 +39,8 @@ export const DEFAULT_TRAE_GATEWAY_CONFIG: TraeGatewayConfig = {
   captureEnabled: false,
   // Max Mode 默认开（与 Rust `TraeGatewayConfig::default` 同值）。
   maxMode: true,
+  // ★ issue #129：账号故障时自动切换，**默认关闭**（与 Rust 默认同口径）。
+  autoFailover: false,
 };
 
 function asString(value: unknown): string | undefined {
@@ -96,6 +98,10 @@ export function normalizeTraeGatewayConfig(raw: unknown): TraeGatewayConfig {
       DEFAULT_TRAE_GATEWAY_CONFIG.captureEnabled,
     maxMode:
       asBoolean(read("maxMode", "max_mode")) ?? DEFAULT_TRAE_GATEWAY_CONFIG.maxMode,
+    // ★ issue #129：缺键 ⇒ `false`（老配置文件 / 老后端），与「默认关闭」一致。
+    autoFailover:
+      asBoolean(read("autoFailover", "auto_failover")) ??
+      DEFAULT_TRAE_GATEWAY_CONFIG.autoFailover,
   };
 }
 
@@ -121,6 +127,7 @@ export function toTraeGatewayConfigRaw(config: TraeGatewayConfig): TraeGatewayCo
     // ★ 必须写回：保存是整份覆盖，缺键 = 抓取被静默关闭（见 `captureEnabled` 注释）。
     capture_enabled: config.captureEnabled,
     max_mode: config.maxMode,
+    auto_failover: config.autoFailover,
   };
 }
 
@@ -251,3 +258,26 @@ export function normalizeTraeGatewayLogs(raw: unknown): TraeGatewayLogEntry[] {
 // 账号状态标签原先在本文件（`TRAE_POOL_STATUS_LABELS`），账号池卡**两侧共用**后
 // 迁到 `@/lib/gateway` 的 `POOL_STATUS_LABELS`（文案键 `shared.poolStatus.*`）——
 // 别在这里再建第二份，两侧文案会各自漂移。
+
+/**
+ * 归一化 `get_trae_gateway_models` 的返回 → 降级链下拉要的 `{id, name}` 列表。
+ *
+ * Trae 的 `/v1/models` 只给 `id`（给人看的 `displayName` 在**客户端目录**
+ * `get_trae_client_models` 里，那张表本模块不解析），所以 `name` 回落成 id。
+ * 与 WB / Qoder 的清单同形，降级链抽屉不必按平台分叉。
+ */
+export function normalizeTraeGatewayModels(raw: unknown): { id: string; name: string }[] {
+  const record = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
+  if (!Array.isArray(record.data)) return [];
+  const seen = new Set<string>();
+  const out: { id: string; name: string }[] = [];
+  for (const item of record.data) {
+    if (!item || typeof item !== "object") continue;
+    const row = item as Record<string, unknown>;
+    const id = asString(row.id)?.trim();
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    out.push({ id, name: id });
+  }
+  return out;
+}

@@ -34,12 +34,19 @@ import { StatTiles, type StatTile } from "@/components/usage/stat-tiles";
 import type { UsageViewProps } from "@/components/usage/view-param-bar";
 import * as api from "@/lib/api";
 import { formatCredits } from "@/components/usage/format";
+import { formatDate } from "@/lib/format";
+import { useAutoRefreshWhenVisible } from "@/lib/use-auto-refresh";
+import { CREDITS_UPSTREAM_REFRESH_INTERVAL_MS } from "@/lib/use-credit-auto-refresh";
+import { useCreditRefreshPref } from "@/lib/credit-refresh-pref";
 import { useT } from "@/lib/i18n";
 import { platformOfPath } from "@/lib/platforms/registry";
 import { scopeOf } from "@/lib/scope";
 import { useLocation } from "react-router-dom";
 import { useScope } from "@/lib/use-scope";
 import { useRefreshAction } from "@/lib/use-refresh-action";
+
+/** 文案里的「每 N 分钟」从间隔常量推导（与账号卡、WB / Trae 积分页同一个来源）。 */
+const REFRESH_INTERVAL_MINUTES = Math.round(CREDITS_UPSTREAM_REFRESH_INTERVAL_MS / 60_000);
 
 /**
  * 余额视图。
@@ -56,12 +63,15 @@ export default function QoderCreditsPage(_props: UsageViewProps) {
 
   const [data, setData] = useState<api.QoderCreditsView | null>(null);
   const [error, setError] = useState("");
+  /** 「上次刷新」的墙钟（issue #133）：只表达「这份余额是什么时候读到的」，不派生状态。 */
+  const [lastRefreshAt, setLastRefreshAt] = useState(0);
   const { busy, run } = useRefreshAction();
 
   const load = useCallback(async () => {
     setError("");
     try {
       setData(await api.qoderCredits(scope));
+      setLastRefreshAt(Date.now());
     } catch (e) {
       setError(api.asError(e));
     }
@@ -70,6 +80,21 @@ export default function QoderCreditsPage(_props: UsageViewProps) {
   useEffect(() => {
     void load();
   }, [load]);
+
+  /**
+   * ★ 自动重读（issue #133）：`qoderCredits` 逐账号打上游，读到的即当下余额。
+   *
+   * ★ **默认关，opt-in**（issue #133 复核 §3 / 方案 C）：逐账号打上游是本仓最贵的
+   * 自动动作之一，与「替用户领东西」同类 ⇒ 不替用户决定。开关在「设置 · 通用」。
+   * 关掉之后手动入口是顶部那个「重新查询」按钮。
+   */
+  const upstreamAutoRefresh = useCreditRefreshPref((state) => state.upstreamAutoRefresh);
+  useAutoRefreshWhenVisible(
+    lastRefreshAt,
+    load,
+    CREDITS_UPSTREAM_REFRESH_INTERVAL_MS,
+    upstreamAutoRefresh,
+  );
 
   const tiles = useMemo<StatTile[]>(() => {
     if (!data) return [];
@@ -133,6 +158,27 @@ export default function QoderCreditsPage(_props: UsageViewProps) {
 
   return (
     <div className="flex min-w-0 flex-col gap-4">
+      {/* ★ 正常态也要有手动刷新入口（issue #133 复核 §5.2）。
+          此前这一条只有两段文字，刷新按钮**只存在于错误态** —— 一旦自动刷新被关掉
+          （或抖动把下一轮推到十几分钟后），这一页就既不会自动更新、也没法手动更新。 */}
+      <div className="flex min-w-0 flex-wrap items-center gap-3 text-[11px] text-muted-foreground">
+        <span>
+          {upstreamAutoRefresh
+            ? t("shared.credit.autoEvery", { n: REFRESH_INTERVAL_MINUTES })
+            : t("shared.credit.autoOff")}
+        </span>
+        {lastRefreshAt > 0 && (
+          <span className="tabular-nums">
+            {t("shared.credit.lastRefresh", { time: formatDate(lastRefreshAt) })}
+          </span>
+        )}
+        <div className="grow" />
+        <Button size="sm" variant="outline" disabled={busy} onClick={() => void run(() => load())}>
+          {busy ? <RefreshCw className="animate-spin" /> : <RefreshCw />}
+          {t("qoder.page.usage.creditsView.reload")}
+        </Button>
+      </div>
+
       <StatTiles tiles={tiles} />
 
       <ChartFrame

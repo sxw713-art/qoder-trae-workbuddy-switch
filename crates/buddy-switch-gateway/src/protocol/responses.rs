@@ -26,7 +26,7 @@
 //! `stream_options.include_usage`，因此本模块的出站路径统一按 SSE 处理：
 //! 客户端要流式就转事件流，不要流式就聚合成对象。
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -56,20 +56,179 @@ fn is_custom_tool(tool: &Value) -> bool {
         .unwrap_or(false)
 }
 
+/// 命名空间工具的名字分隔符。
+///
+/// OpenAI 的 function 名只允许 `[a-zA-Z0-9_-]`（且不超过 64 字符），点号会被上游拒收
+/// ⇒ 用 `__ns__` 这种**不会自然出现**的串，还原时不需要额外状态。
+const NAMESPACE_SEP: &str = "__ns__";
+
+/// 命名空间工具（`type: "namespace"`）的命名空间名：优先 `namespace`，回落 `name`。
+fn namespace_of(tool: &Value) -> Option<&str> {
+    tool.get("namespace")
+        .and_then(Value::as_str)
+        .or_else(|| tool.get("name").and_then(Value::as_str))
+        .filter(|value| !value.is_empty())
+}
+
+/// `namespace` + 原名 → 上游能接受的 function 名。
+///
+/// ⚠️ 两个已知边界（都刻意接受，不引入额外状态）：
+///
+/// 1. **长度**：上游对 function 名的上限是 64 字符。`mcp__<server>` + `__ns__` + 工具名
+///    实测远低于上限（典型 20~35）；超长时**不做截断** —— 截断会让反向还原拿到错的工具名，
+///    那比上游回一个明确的 400 更难查。
+/// 2. **撞车**：若某个 namespace 或工具名本身含 `__ns__`，拼出来的名字会与另一对
+///    `(namespace, name)` 相同。MCP 的服务名/工具名是 `[a-z0-9_]` 形态，实际不会出现；
+///    真出现也只是「两个工具同名」，上游按同名处理，不会串到别的工具上。
+fn mangle_namespaced(namespace: &str, name: &str) -> String {
+    format!("{namespace}{NAMESPACE_SEP}{name}")
+}
+
+/// 把上游回传的**扁平名**还原成 `namespace` + 原名（不是命名空间工具 ⇒ 原样不动）。
+///
+/// ## 为什么从名字自证，而不是在三条网关里各穿一份映射
+///
+/// 名字里已经带着命名空间（[`NAMESPACE_SEP`] 分隔），还原不需要额外状态。而三条网关
+/// （统一 / Trae / Qoder）各有一条把 `custom` 传到流的链路 —— 再加一份映射就是三处都要改，
+/// 且**漏一处不报错**（本仓踩过「只 manage 不 apply」那一类）。
+///
+/// 代价：真有一个工具名恰好含 `__ns__` 时会被误拆。概率可忽略，且只影响这条路径。
+///
+/// 只在**出站**侧加两个字段：`name` 改回原名、`namespace` 补上。客户端（Codex）靠这两个
+/// 字段派发 MCP 调用 —— 只给扁平名它认不出是哪个命名空间的工具（issue #142）。
+fn restore_tool_identity(item: &mut Value, mangled: &str) {
+    let Some((namespace, name)) = mangled.split_once(NAMESPACE_SEP) else {
+        return;
+    };
+    if let Some(object) = item.as_object_mut() {
+        object.insert("name".into(), Value::String(name.to_string()));
+        object.insert("namespace".into(), Value::String(namespace.to_string()));
+    }
+}
+
+/// 把 `namespace` 工具**扁平化**成上游的 function 工具，并记下名字映射。
+///
+/// ## 为什么必须做（issue #142）
+///
+/// Codex 配 MCP 时把工具声明成：
+///
+/// ```json
+/// {"type":"namespace","namespace":"mcp__search",
+///  "tools":[{"type":"function","name":"search","description":"…","parameters":{…}}]}
+/// ```
+///
+/// 本层的 tools 过滤原先只认 `type == "function"` ⇒ **整个命名空间的工具被静默丢弃**，
+/// 上游一个都看不到 ⇒ 模型永远调不到 MCP 工具。表现是「Codex 里 MCP 完全不工作」，
+/// 而且**没有任何报错**（请求 200、回答正常，只是工具没了）——最难查的那一类。
+///
+/// 扁平化后名字里带着命名空间（`mcp__search__ns__search`），模型仍能区分同名工具；
+/// 出站再按 [`NamespaceTools::names`] 还原 `namespace` + 原名，客户端才认得回来。
+pub fn flatten_namespace_tools(body: &Value) -> NamespaceTools {
+    let mut tools: Vec<Value> = Vec::new();
+    let mut names: HashMap<String, (String, String)> = HashMap::new();
+    let Some(list) = body.get("tools").and_then(Value::as_array) else {
+        return NamespaceTools {
+            tools,
+            names: std::sync::Arc::new(names),
+        };
+    };
+    for tool in list {
+        if tool.get("type").and_then(Value::as_str) != Some("namespace") {
+            continue;
+        }
+        let Some(namespace) = namespace_of(tool) else {
+            continue;
+        };
+        let Some(inner) = tool.get("tools").and_then(Value::as_array) else {
+            continue;
+        };
+        for nested in inner {
+            let Some(name) = nested.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            if name.is_empty() {
+                continue;
+            }
+            // 命名空间里既可能有 function，也可能有 custom（freeform）——
+            // 后者同样要降级，否则「命名空间里的 freeform 工具」还是会消失。
+            let mut flat = if is_custom_tool(nested) {
+                match downgrade_custom_tool(nested) {
+                    Some(value) => value,
+                    None => continue,
+                }
+            } else {
+                json!({
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": nested.get("description").cloned().unwrap_or_else(|| json!("")),
+                        "parameters": nested
+                            .get("parameters")
+                            .cloned()
+                            .unwrap_or_else(|| json!({"type": "object", "properties": {}})),
+                    }
+                })
+            };
+            let mangled = mangle_namespaced(namespace, name);
+            if let Some(object) = flat.get_mut("function").and_then(Value::as_object_mut) {
+                object.insert("name".into(), Value::String(mangled.clone()));
+            }
+            names.insert(mangled, (namespace.to_string(), name.to_string()));
+            tools.push(flat);
+        }
+    }
+    NamespaceTools {
+        tools,
+        names: std::sync::Arc::new(names),
+    }
+}
+
+/// [`flatten_namespace_tools`] 的结果。
+pub struct NamespaceTools {
+    /// 已扁平化的 function 工具（名字已带命名空间）。
+    pub tools: Vec<Value>,
+    /// `mangled → (namespace, 原名)`；出站还原与历史项重拼共用这一份。
+    pub names: std::sync::Arc<HashMap<String, (String, String)>>,
+}
+
 /// 请求里声明为 custom（freeform）的工具名集合 —— 出站降级与入站还原共用这一份。
 pub fn custom_tool_names(body: &Value) -> HashSet<String> {
-    body.get("tools")
-        .and_then(Value::as_array)
-        .map(|tools| {
-            tools
-                .iter()
-                .filter(|tool| is_custom_tool(tool))
-                .filter_map(|tool| tool.get("name").and_then(Value::as_str))
-                .filter(|name| !name.is_empty())
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
+    let mut out: HashSet<String> = HashSet::new();
+    let Some(tools) = body.get("tools").and_then(Value::as_array) else {
+        return out;
+    };
+    for tool in tools {
+        if is_custom_tool(tool) {
+            if let Some(name) = tool.get("name").and_then(Value::as_str) {
+                if !name.is_empty() {
+                    out.insert(name.to_string());
+                }
+            }
+            continue;
+        }
+        // ★ issue #142：命名空间里声明的 custom 工具也要按 freeform 还原。
+        //   上游回给我们的是**扁平化后**的名字，所以登记 mangled 名。
+        if tool.get("type").and_then(Value::as_str) != Some("namespace") {
+            continue;
+        }
+        let Some(namespace) = namespace_of(tool) else {
+            continue;
+        };
+        let Some(inner) = tool.get("tools").and_then(Value::as_array) else {
+            continue;
+        };
+        for nested in inner {
+            if !is_custom_tool(nested) {
+                continue;
+            }
+            if let Some(name) = nested.get("name").and_then(Value::as_str) {
+                if !name.is_empty() {
+                    out.insert(mangle_namespaced(namespace, name));
+                }
+            }
+        }
+    }
+    out
 }
 
 /// 把 `custom` 工具降级成「单 `input` 字符串参数」的 function 工具。
@@ -172,8 +331,9 @@ pub fn to_upstream_request(body: &Value) -> Value {
     out.insert("messages".to_string(), Value::Array(messages));
 
     // tools：Responses 的**扁平** schema → chat 的 `function` 包装。
+    let mut converted: Vec<Value> = Vec::new();
     if let Some(tools) = body.get("tools").and_then(Value::as_array) {
-        let converted: Vec<Value> = tools
+        converted = tools
             .iter()
             .filter_map(|tool| {
                 match tool.get("type").and_then(Value::as_str) {
@@ -203,14 +363,19 @@ pub fn to_upstream_request(body: &Value) -> Value {
                     // ★ freeform（custom）工具：降级成单 `input` 参数的 function。
                     // 不降级的后果是「工具被静默丢弃」——Codex 的 apply_patch 就永远调不到。
                     Some("custom") => downgrade_custom_tool(tool),
+                    // ★ issue #142：`namespace` 工具**不许**丢（见 [`flatten_namespace_tools`]）。
+                    //   丢掉的后果是 MCP 工具整组消失，且没有任何报错。
+                    Some("namespace") => None,
                     // 内置工具（web_search / file_search / computer_use …）上游不支持 ⇒ 跳过。
                     _ => None,
                 }
             })
             .collect();
-        if !converted.is_empty() {
-            out.insert("tools".to_string(), Value::Array(converted));
-        }
+    }
+    // 命名空间工具单独摊平后追加（它们本身不是 function，不能走上面的分支）。
+    converted.extend(flatten_namespace_tools(body).tools);
+    if !converted.is_empty() {
+        out.insert("tools".to_string(), Value::Array(converted));
     }
 
     if let Some(choice) = body.get("tool_choice") {
@@ -259,7 +424,7 @@ fn input_to_messages(input: &Value, out: &mut Vec<Value>) {
                     }
                     Some("function_call") => {
                         let call_id = item.get("call_id").and_then(Value::as_str).unwrap_or("");
-                        let name = item.get("name").and_then(Value::as_str).unwrap_or("");
+                        let name = upstream_tool_name(item);
                         let arguments = item
                             .get("arguments")
                             .and_then(Value::as_str)
@@ -278,7 +443,7 @@ fn input_to_messages(input: &Value, out: &mut Vec<Value>) {
                     // 参数（与出站降级的形状对得上，多轮 Codex 才不会断）。
                     Some("custom_tool_call") => {
                         let call_id = item.get("call_id").and_then(Value::as_str).unwrap_or("");
-                        let name = item.get("name").and_then(Value::as_str).unwrap_or("");
+                        let name = upstream_tool_name(item);
                         let input = item
                             .get("input")
                             .and_then(Value::as_str)
@@ -317,6 +482,20 @@ fn input_to_messages(input: &Value, out: &mut Vec<Value>) {
             }
         }
         _ => {}
+    }
+}
+
+/// 历史项里的工具名 → 上游函数名：**带 `namespace` 的必须拼回去**。
+///
+/// 出站时我们把 `namespace` 工具摊平成 `ns__ns__name` 发给上游，而客户端回传的历史项
+/// 是**原名 + `namespace` 字段**（因为我们出站时还原过）。不拼回去的话，下一轮发给上游的
+/// `tool_calls[].function.name` 与工具清单对不上 —— 有的上游直接 400，有的把它当成未知
+/// 函数（多轮 Codex 就此断掉）。
+fn upstream_tool_name(item: &Value) -> String {
+    let name = item.get("name").and_then(Value::as_str).unwrap_or("");
+    match item.get("namespace").and_then(Value::as_str) {
+        Some(namespace) if !namespace.is_empty() => mangle_namespaced(namespace, name),
+        _ => name.to_string(),
     }
 }
 
@@ -663,6 +842,15 @@ pub struct ResponsesSseStream<S> {
     usage: Option<Value>,
     /// 声明为 custom（freeform）的工具名：这些调用要按 `custom_tool_call` 事件输出。
     custom: std::sync::Arc<HashSet<String>>,
+    /// ★ issue #129：账号故障自动切换的失败信号（`None` = 开关关闭 / 未接入）。
+    failover: Option<ResponsesFailover>,
+}
+
+/// Responses 出口的失败信号 + 对外文案所需的上下文。
+struct ResponsesFailover {
+    signal: std::sync::Arc<crate::failover::StreamFailure>,
+    /// 命中账号的展示名（写进对外文案）。
+    account: String,
 }
 
 impl<S> ResponsesSseStream<S> {
@@ -689,7 +877,21 @@ impl<S> ResponsesSseStream<S> {
             tool_calls: Vec::new(),
             usage: None,
             custom,
+            failover: None,
         }
+    }
+
+    /// ★ issue #129：接入失败信号（`None` = 保持原行为）。
+    pub fn with_failover(
+        mut self,
+        signal: Option<std::sync::Arc<crate::failover::StreamFailure>>,
+        account: impl Into<String>,
+    ) -> Self {
+        self.failover = signal.map(|signal| ResponsesFailover {
+            signal,
+            account: account.into(),
+        });
+        self
     }
 
     /// 事件序号：官方从 0 起严格递增。
@@ -815,7 +1017,7 @@ impl<S> ResponsesSseStream<S> {
         let name = item.name.clone();
         let custom = self.custom.contains(&name);
         let output_index = 2 + index;
-        let item = if custom {
+        let mut item = if custom {
             // freeform 工具：官方事件的 item 形状是 `custom_tool_call` + `input`。
             json!({
                 "id": item_id,
@@ -835,6 +1037,8 @@ impl<S> ResponsesSseStream<S> {
                 "arguments": "",
             })
         };
+        // ★ issue #142：命名空间工具要还原成「原名 + namespace」再交给客户端。
+        restore_tool_identity(&mut item, &name);
         self.push_event(
             "response.output_item.added",
             json!({
@@ -861,23 +1065,24 @@ impl<S> ResponsesSseStream<S> {
         // 上游中途报错（Qoder 的 `event:error` 帧、WB 的 `{"error":{…}}` 分片）——
         // **必须转成 Responses 的 `error` 事件**：否则本层只看到「没有 choices」，
         // 静默走完 `response.completed` ⇒ 客户端拿到「200 + 空回答」，故障隐身。
+        //
+        // ★ issue #129：对外形状走 `failover::client_error`（含等价 HTTP 状态码）。
+        //   上游私有码（`6004` / `12153`）客户端一个都归不了类 ⇒ `PI_AI_ERROR`（终态），
+        //   而流中途的账号故障本可以靠「换号 + 重跑」救回来。
         if let Some(error) = chunk.get("error") {
             let message = error
                 .get("message")
                 .and_then(Value::as_str)
                 .map(str::to_string)
                 .unwrap_or_else(|| error.to_string());
-            // OpenAI 的 `code` 是字符串；Qoder 给的是数字状态码 ⇒ 统一成字符串。
-            let code = match error.get("code") {
-                Some(Value::String(text)) => text.clone(),
-                Some(Value::Number(number)) => number.to_string(),
-                _ => "upstream_error".to_string(),
-            };
-            self.ensure_started();
-            self.push_event(
-                "error",
-                json!({"type": "error", "code": code, "message": message}),
-            );
+            let status = match error.get("code") {
+                Some(Value::Number(number)) => number.as_u64().unwrap_or(502).min(u16::MAX as u64),
+                Some(Value::String(text)) => text.parse::<u64>().unwrap_or(502),
+                _ => 502,
+            } as u16;
+            // 把上游给的码折成内部事件，好让对外形状与其他两条协议**同一口径**。
+            let event = crate::pool::classify_event(status, &message);
+            self.fail(&event, &message);
             return;
         }
         let Some(choice) = chunk
@@ -981,6 +1186,42 @@ impl<S> ResponsesSseStream<S> {
                 }
             }
         }
+    }
+
+    /// ★ issue #129：把一次流内失败转成 Responses 的 `error` 事件并**终止**本轮。
+    ///
+    /// **不补** `response.completed`：客户端见到 `error` 即终止，再补一个「正常结束」
+    /// 会把失败重新伪装成成功（正是本 issue 要修的形态）。
+    fn fail(&mut self, event: &crate::pool::UpstreamEvent, _detail: &str) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        self.ensure_started();
+        let account = self
+            .failover
+            .as_ref()
+            .map(|tail| tail.account.as_str())
+            .unwrap_or("");
+        let error = crate::failover::client_error(event, account, &self.model);
+        self.pending
+            .push_back(crate::failover::responses_error_event(&error));
+    }
+
+    /// ★ issue #129：断流收尾。返回 `true` 表示已按失败处理（发了 `error` 事件），
+    /// 调用方**不要**再 `finish()`；`false` 表示开关关闭 / 无失败记录 ⇒ 走原路径。
+    fn fail_on_break(&mut self) -> bool {
+        let Some(tail) = self.failover.as_ref() else {
+            return false;
+        };
+        if !tail.signal.is_enabled() {
+            return false;
+        }
+        let Some(failure) = tail.signal.peek() else {
+            return false;
+        };
+        self.fail(&failure.event, &failure.detail);
+        true
     }
 
     /// 收尾：关闭所有已开 item，再发 `response.completed`。
@@ -1105,7 +1346,7 @@ impl<S> ResponsesSseStream<S> {
             let item_id = self.tool_calls[index].id.clone();
             let name = self.tool_calls[index].name.clone();
             let arguments = self.tool_calls[index].arguments.clone();
-            let done_item = if custom {
+            let mut done_item = if custom {
                 json!({
                     "id": item_id,
                     "type": "custom_tool_call",
@@ -1124,6 +1365,7 @@ impl<S> ResponsesSseStream<S> {
                     "arguments": arguments,
                 })
             };
+            restore_tool_identity(&mut done_item, &name);
             self.push_event(
                 "response.output_item.done",
                 json!({
@@ -1169,25 +1411,28 @@ impl<S> ResponsesSseStream<S> {
                 continue;
             }
             let item = &self.tool_calls[index];
-            if self.custom.contains(&item.name) {
-                output.push(json!({
+            let mut value = if self.custom.contains(&item.name) {
+                json!({
                     "id": item.id,
                     "type": "custom_tool_call",
                     "status": "completed",
                     "call_id": item.id,
                     "name": item.name,
                     "input": unwrap_custom_input(&item.arguments),
-                }));
+                })
             } else {
-                output.push(json!({
+                json!({
                     "id": item.id,
                     "type": "function_call",
                     "status": "completed",
                     "call_id": item.id,
                     "name": item.name,
                     "arguments": item.arguments,
-                }));
-            }
+                })
+            };
+            // ★ issue #142：`response.completed` 的 output 与 added/done 必须**同一形状**。
+            restore_tool_identity(&mut value, &item.name);
+            output.push(value);
         }
 
         let mut response = self.response_skeleton("completed");
@@ -1214,6 +1459,14 @@ impl<S> ResponsesSseStream<S> {
             if let Some(rest) = trimmed.strip_prefix("data:") {
                 let payload = rest.trim();
                 if !payload.is_empty() {
+                    /* ★ issue #129：每帧先判错误信封（`{"code":6004,…}` 这种没有
+                    `error` 字段的形态，`handle_payload` 的旧分支看不见）⇒ 从前它落到
+                    「没有 choices ⇒ 丢弃」，最后 `finish()` 补 `response.completed`
+                    = 把失败伪装成正常结束。 */
+                    if let Some(found) = crate::protocol::error_sniffer::sniff_payload(payload) {
+                        self.fail(&found.event, &found.message);
+                        continue;
+                    }
                     self.handle_payload(payload);
                 }
             }
@@ -1245,19 +1498,20 @@ where
                 Poll::Ready(None) => {
                     this.finish();
                     this.finished = true;
-                    if let Some(chunk) = this.pending.pop_front() {
-                        return Poll::Ready(Some(Ok(chunk)));
-                    }
-                    return Poll::Ready(None);
+                    // 回到循环顶部逐条发完 `pending`（`finish` 会一次产出多条事件，
+                    // 只 pop 一条就把其余丢掉了）。
+                    continue;
                 }
                 Poll::Ready(Some(Err(error))) => {
                     eprintln!("[gateway] Responses 上游 SSE 流中途异常: {error:?}");
-                    this.finish();
-                    this.finished = true;
-                    if let Some(chunk) = this.pending.pop_front() {
-                        return Poll::Ready(Some(Ok(chunk)));
+                    /* ★ issue #129 §3.3：断流是**账号级失败**，不是「模型说完了」。
+                    开关开启时发 `error` 事件（可重试）而不是 `finish()` 补
+                    `response.completed`。 */
+                    if !this.fail_on_break() {
+                        this.finish();
                     }
-                    return Poll::Ready(None);
+                    this.finished = true;
+                    continue;
                 }
                 Poll::Ready(Some(Ok(chunk))) => this.ingest(&chunk),
             }
@@ -1607,6 +1861,61 @@ mod tests {
         assert_eq!(types.last().unwrap(), "response.completed");
     }
 
+    /// ★★ issue #129：开关开启 + 上游**断流** ⇒ `error` 事件，且**不补**
+    /// `response.completed`（后者会把失败重新伪装成「正常结束」）。
+    #[tokio::test]
+    async fn broken_stream_with_failover_emits_error_instead_of_completed() {
+        let signal = crate::failover::StreamFailure::new(true);
+        signal.record(crate::pool::UpstreamEvent::Server, "上游连接中断");
+        let stream = ResponsesSseStream::new(
+            futures_util::stream::iter(vec![
+                chunk("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"),
+                Err(std::io::Error::other("connection reset")),
+            ]),
+            "m".to_string(),
+            empty_custom(),
+        )
+        .with_failover(Some(signal), "一号");
+        let events = collect_events(stream).await;
+        let error = events
+            .iter()
+            .find(|event| event["type"] == "error")
+            .expect("必须有 error 事件");
+        assert!(
+            error["message"].as_str().unwrap().contains("HTTP 502"),
+            "{error}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| event["type"] == "response.completed"),
+            "失败时不得补「正常结束」：{events:?}"
+        );
+    }
+
+    /// 开关**关闭**时断流仍走原路径（补 `response.completed`，字节与改造前一致）。
+    #[tokio::test]
+    async fn broken_stream_without_failover_still_completes() {
+        let signal = crate::failover::StreamFailure::new(false);
+        let stream = ResponsesSseStream::new(
+            futures_util::stream::iter(vec![
+                chunk("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"),
+                Err(std::io::Error::other("connection reset")),
+            ]),
+            "m".to_string(),
+            empty_custom(),
+        )
+        .with_failover(Some(signal), "一号");
+        let events = collect_events(stream).await;
+        assert!(
+            events
+                .iter()
+                .any(|event| event["type"] == "response.completed"),
+            "关闭时必须保持改造前行为：{events:?}"
+        );
+        assert!(!events.iter().any(|event| event["type"] == "error"));
+    }
+
     /// 上游中途报错帧 ⇒ **`error` 事件**（不能静默成「200 + 空回答」，issue #64）。
     ///
     /// 可证伪：去掉 `handle_payload` 里那段 `chunk.get("error")` ⇒ 本用例一条断言都拿不到。
@@ -1653,6 +1962,129 @@ mod tests {
             "跨 chunk 切分的 JSON 必须正确拼回"
         );
     }
+    // ---------------------------------------------------------------------
+    // ★ issue #142：命名空间（MCP）工具
+    // ---------------------------------------------------------------------
+
+    /// 出站：`type: "namespace"` 的工具**不许被静默丢弃**。
+    ///
+    /// 可证伪：把 `to_upstream_request` 里那句 `converted.extend(flatten_namespace_tools(…))`
+    /// 删掉 ⇒ `tools` 只剩 1 条（普通 function），本用例红。这正是 #142 的原始症状：
+    /// Codex 里 MCP 工具整组消失，请求 200、回答正常，**没有任何报错**。
+    #[test]
+    fn namespace_tools_are_flattened_instead_of_dropped() {
+        let body = json!({
+            "model": "m",
+            "input": "hi",
+            "tools": [
+                {"type": "function", "name": "plain", "description": "", "parameters": {"type": "object"}},
+                {"type": "namespace", "name": "mcp__search", "namespace": "mcp__search", "tools": [
+                    {"type": "function", "name": "search", "description": "d", "parameters": {"type": "object"}},
+                    {"type": "custom", "name": "apply", "description": "e"}
+                ]}
+            ]
+        });
+        let upstream = to_upstream_request(&body);
+        let tools = upstream["tools"].as_array().expect("必须有工具");
+        let names: Vec<&str> = tools
+            .iter()
+            .filter_map(|tool| tool["function"]["name"].as_str())
+            .collect();
+        assert_eq!(tools.len(), 3, "1 个普通 + 2 个命名空间内工具: {names:?}");
+        assert!(names.contains(&"plain"));
+        assert!(
+            names.contains(&"mcp__search__ns__search"),
+            "命名空间内的 function 必须扁平化保留: {names:?}"
+        );
+        assert!(
+            names.contains(&"mcp__search__ns__apply"),
+            "命名空间内的 freeform 也要降级保留: {names:?}"
+        );
+        // freeform 降级后的形状：单 `input` 参数。
+        let apply = tools
+            .iter()
+            .find(|tool| tool["function"]["name"] == "mcp__search__ns__apply")
+            .unwrap();
+        assert_eq!(
+            apply["function"]["parameters"]["required"],
+            json!(["input"])
+        );
+    }
+
+    /// 入站历史项：带 `namespace` 的调用必须**拼回扁平名**，否则下一轮上游对不上工具清单。
+    #[test]
+    fn namespaced_history_items_are_remangled() {
+        let body = json!({
+            "model": "m",
+            "input": [
+                {"type": "function_call", "call_id": "c1", "name": "search",
+                 "namespace": "mcp__search", "arguments": "{}"},
+                {"type": "custom_tool_call", "call_id": "c2", "name": "apply",
+                 "namespace": "mcp__search", "input": "x"}
+            ]
+        });
+        let upstream = to_upstream_request(&body);
+        let calls = upstream["messages"][0]["tool_calls"]
+            .as_array()
+            .expect("两条调用并进同一条 assistant 消息");
+        assert_eq!(calls[0]["function"]["name"], "mcp__search__ns__search");
+        assert_eq!(calls[1]["function"]["name"], "mcp__search__ns__apply");
+    }
+
+    /// 命名空间里声明的 custom 工具也要进 freeform 集合（否则出站按 `function_call` 发）。
+    #[test]
+    fn custom_tool_names_include_namespaced_freeform() {
+        let body = json!({"tools": [
+            {"type": "custom", "name": "top"},
+            {"type": "namespace", "namespace": "ns", "tools": [
+                {"type": "custom", "name": "inner"}
+            ]}
+        ]});
+        let names = custom_tool_names(&body);
+        assert!(names.contains("top"));
+        assert!(names.contains("ns__ns__inner"), "{names:?}");
+    }
+
+    /// 出站事件：`added` / `done` / `response.completed` 三处都要还原 `name` + `namespace`。
+    ///
+    /// 可证伪：把 `restore_tool_identity` 的调用删掉 ⇒ 三处断言全红（客户端只会看到
+    /// `mcp__search__ns__search`，认不出是哪个命名空间的工具）。
+    #[tokio::test]
+    async fn stream_restores_namespace_and_original_name() {
+        let input = vec![
+            chunk("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"mcp__search__ns__search\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n"),
+            chunk("data: [DONE]\n\n"),
+        ];
+        let stream = ResponsesSseStream::new(
+            futures_util::stream::iter(input),
+            "m".to_string(),
+            empty_custom(),
+        );
+        let events = collect_events(stream).await;
+
+        let added = events
+            .iter()
+            .find(|event| event["type"] == "response.output_item.added")
+            .expect("要有 output_item.added");
+        assert_eq!(added["item"]["name"], "search");
+        assert_eq!(added["item"]["namespace"], "mcp__search");
+
+        let done = events
+            .iter()
+            .find(|event| event["type"] == "response.output_item.done")
+            .expect("要有 output_item.done");
+        assert_eq!(done["item"]["name"], "search");
+        assert_eq!(done["item"]["namespace"], "mcp__search");
+
+        let completed = events.last().expect("要有收尾事件");
+        assert_eq!(completed["type"], "response.completed");
+        assert_eq!(completed["response"]["output"][0]["name"], "search");
+        assert_eq!(
+            completed["response"]["output"][0]["namespace"], "mcp__search",
+            "response.completed 的 output 必须与 added/done 同一形状"
+        );
+    }
+
     // ---------------------------------------------------------------------
     // freeform（custom）工具：Codex 的 `apply_patch` 走这条路
     // ---------------------------------------------------------------------

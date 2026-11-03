@@ -49,11 +49,23 @@ mv dist dist.old.$$ && npm run build:fast
 签名密钥（自动更新用）存放于 `~/.buddy-switch/buddy-switch-updater.key`，构建脚本通过
 `TAURI_SIGNING_PRIVATE_KEY` 注入。发布新版本时：
 
+0. ★ **打 tag 之前**先 `sh scripts/stamp-version.sh --tag v<版本>` **再** `npm run notes:json`，
+   把 `src/data/release-notes.json` 一起提交。
+   为什么顺序不能反：内置说明里的版本号是**离线时的兜底文案**（在线时读 Release 资产里的
+   `release-notes.json`），它比应用版本旧就会在断网时显示上一版内容 —— `pr-check` 有一条
+   门禁专门钉这件事（「打包内置的版本说明必须与当前版本一致」）。
+   本次 v2026.10.300953 就是先 tag 后补，导致该门禁在 main 的 push 上红了一次。
 1. `npm run build:app:release` 生成 `.app.tar.gz` + `.sig`（Windows NSIS 构建会额外生成当前版本的 `*_x64-setup.exe` + `.exe.sig`）。CI 会先清掉 `target/**/release/bundle`，避免 cargo cache 把旧安装包带进 Release。
 2. macOS：`UPDATE_OS=macos UPDATE_ARCH=aarch64 sh scripts/gen-update-json.sh` 生成 `latest-macos-aarch64.json`；Intel 用 `UPDATE_ARCH=x86_64`
 3. Windows：`UPDATE_OS=windows UPDATE_ARCH=x86_64 sh scripts/gen-update-json.sh` 生成 `latest-windows-x86_64.json`
-4. `python3 scripts/merge-update-manifests.py <产物目录>` 合并为 `latest.json`，并把 Windows 平台项写入 `latest-macos-x86_64.json`（兼容已安装的 Windows 客户端）
-5. 将安装包、签名更新包、`latest*.json` 一并上传到 GitHub Release
+4. Linux：`UPDATE_OS=linux UPDATE_ARCH=x86_64 sh scripts/gen-update-json.sh` 生成 `latest-linux-x86_64.json`。
+   只有 **AppImage** 能自更新（`deb` 归系统包管理器，无法原地升级）⇒ 认的是
+   `*_amd64.AppImage` + 同名 `.sig`（**不是 tar.gz**：tauri-bundler ≥2.10 把 AppImage 当
+   v2 自包含更新目标，updater 直接下载 AppImage 本体替换自身）；
+   清单同时写 `linux-x86_64-appimage` 与 `linux-x86_64` 两个平台键（前者是新版客户端的首选候选，
+   后者兜住回退路径）。
+5. `python3 scripts/merge-update-manifests.py <产物目录>` 合并为 `latest.json`，并把 Windows 平台项写入 `latest-macos-x86_64.json`（兼容已安装的 Windows 客户端）
+6. 将安装包、签名更新包、`latest*.json` 一并上传到 GitHub Release
 
 ### npm 版（webui）发布
 

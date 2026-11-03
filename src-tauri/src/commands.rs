@@ -11,8 +11,8 @@ use buddy_switch_core::modules::{
     account, app_prefs, auth_file, backup, cache, capability, checkin, client_limits,
     client_settings, codebuddy_cli, config, credit_usage, credits, diagnostics, export_import,
     gateway_ledger, migrate, oauth, process, programs, qoder, refresh, region::Region,
-    region::RegionFilter, rotate, runtime_log, session, skill, switch, token_daily, token_stats,
-    trae, travel, update, vscode_session,
+    region::RegionFilter, rotate, runtime_log, session, session_bundle, skill, switch, token_daily,
+    token_stats, trae, travel, update, vscode_session,
 };
 use tauri::{Emitter, Manager};
 // P5 §2.5 第 (2) 条：capability **默认拒绝**。表数据只在 core（`product_spec`），本文件只查表。
@@ -1666,6 +1666,83 @@ pub async fn unify_session_replicas(
     .map_err(|error| format!("统一会话副本失败: {error}"))
 }
 
+/// POST /api/sessions/export —— 把会话导出成一个 JSON 包（issue #87）。
+///
+/// **只读**：不写客户端任何数据。导出包是单个 `.json`（不是 zip —— 见
+/// `session_bundle` 模块头：本仓不为一个搬运功能引入解压攻击面）。
+///
+/// ## `uid` / `sessionIds` 都可省略
+///
+/// - 省略 `uid` ⇒ 取**当前登录账号**（与 `list_sessions` 同一口径：本仓不猜
+///   「用户指的是哪个账号」，但这里"当前账号"是有权威来源的）。
+/// - 省略 `sessionIds`（或空数组）⇒ 导出该账号**全部会话** —— v1 的口径：
+///   备份 / 换机不需要先学会多选。传了 id 就只导那几个（留给后续的多选 UI）。
+///
+/// async + spawn_blocking：要读会话正文（可能几十 MB）并写文件，不跑在 Tauri 主线程上。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn export_sessions_bundle(
+    out_path: String,
+    uid: Option<String>,
+    session_ids: Option<Vec<String>>,
+    region: Option<String>,
+) -> Result<Value, String> {
+    require_capability(Product::Workbuddy, capability::Capability::SessionCopy)?;
+    let region = parse_region(region.as_deref());
+    let explicit_uid = uid.filter(|value| !value.trim().is_empty());
+    let ids = session_ids.unwrap_or_default();
+    tauri::async_runtime::spawn_blocking(move || {
+        let uid = match explicit_uid {
+            Some(uid) => uid,
+            None => session::current_user_uid_for(region)
+                .ok_or_else(|| "读不到当前登录账号（客户端是否已登录？）".to_string())?,
+        };
+        let path = std::path::Path::new(&out_path);
+        if ids.is_empty() {
+            session_bundle::export_all_for(region, &uid, path)
+        } else {
+            session_bundle::export_sessions_for(region, &uid, &ids, path)
+        }
+    })
+    .await
+    .map_err(|error| format!("导出会话失败: {error}"))?
+}
+
+/// GET /api/sessions/import/preview —— 只读导出包，回报条数与标题（导入前给用户确认）。
+#[tauri::command]
+pub async fn preview_sessions_bundle(path: String) -> Result<Value, String> {
+    require_capability(Product::Workbuddy, capability::Capability::SessionCopy)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        session_bundle::preview_bundle(std::path::Path::new(&path))
+    })
+    .await
+    .map_err(|error| format!("读取导出包失败: {error}"))?
+}
+
+/// POST /api/sessions/import —— 把导出包里的会话**作为新会话**写进当前账号（issue #87）。
+///
+/// ★ 只做加法：每条都生成新 id，绝不覆盖既有会话（见 `session_bundle` 的硬约束）。
+/// `uid` 省略 ⇒ 当前登录账号。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn import_sessions_bundle(
+    path: String,
+    uid: Option<String>,
+    region: Option<String>,
+) -> Result<Value, String> {
+    require_capability(Product::Workbuddy, capability::Capability::SessionCopy)?;
+    let region = parse_region(region.as_deref());
+    let explicit_uid = uid.filter(|value| !value.trim().is_empty());
+    tauri::async_runtime::spawn_blocking(move || {
+        let uid = match explicit_uid {
+            Some(uid) => uid,
+            None => session::current_user_uid_for(region)
+                .ok_or_else(|| "读不到当前登录账号（客户端是否已登录？）".to_string())?,
+        };
+        session_bundle::import_sessions_for(region, &uid, std::path::Path::new(&path))
+    })
+    .await
+    .map_err(|error| format!("导入会话失败: {error}"))?
+}
+
 /// 把前端的 `client` 字符串解析成 [`vscode_session::ExtClient`]。
 ///
 /// ⚠️ **空串与未知值一律 `Err`**（不回落默认值）：本仓不猜「用户指的是哪个客户端」——
@@ -3213,7 +3290,8 @@ pub async fn save_model_fallback(scope: String, config: Value) -> Result<Value, 
 
     // 规范化：**在写盘之前**把脏值挡掉（丢掉空 from、剔除与主模型同名的 target、
     // 去重后截断到上限）。逻辑在 gateway crate 里，与 WebUI 那条路**共用同一份**。
-    let normalized = buddy_switch_gateway::model_fallback::normalize(parsed);
+    // 传 `scope`：「同名即自环」只在同作用域成立（跨区域同名是另一个上游）。
+    let normalized = buddy_switch_gateway::model_fallback::normalize(scope, parsed);
 
     let store = buddy_switch_gateway::model_fallback::shared();
     {
@@ -5406,6 +5484,17 @@ pub async fn qoder_web_session_status(scope: String, uid: String) -> Result<Valu
     crate::qoder_web::session_status(scope, uid).await
 }
 
+/// GET /api/qoder/web/session/window-cookies —— 登录窗里现有的 Cookie **名称与条数**（只读、不打上游）。
+///
+/// 前端轮询它来发现「用户已经在窗口里登录完了」（`fingerprint` 变化）。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn qoder_web_window_cookies(
+    app: tauri::AppHandle,
+    scope: String,
+) -> Result<Value, String> {
+    crate::qoder_web::window_cookies(&app, scope).await
+}
+
 /// GET /api/qoder/web/credit-packs —— 读**已缓存**会话取逐包明细（渲染用，不弹窗）。
 #[tauri::command(rename_all = "camelCase")]
 pub async fn qoder_web_credit_packs(scope: String, uid: String) -> Result<Value, String> {
@@ -5416,6 +5505,20 @@ pub async fn qoder_web_credit_packs(scope: String, uid: String) -> Result<Value,
 #[tauri::command(rename_all = "camelCase")]
 pub async fn qoder_web_session_logout(scope: String) -> Result<Value, String> {
     crate::qoder_web::session_logout(scope).await
+}
+
+/// GET /api/qoder/web/proxy —— 读出站代理配置（逐包取数用；空 = 直连）。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn qoder_web_proxy_get() -> Result<Value, String> {
+    crate::qoder_web::web_proxy_config()
+}
+
+/// POST /api/qoder/web/proxy —— 保存出站代理配置（两个字段都先过形状校验）。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn qoder_web_proxy_set(config: Value) -> Result<Value, String> {
+    let parsed: buddy_switch_core::modules::qoder::web_proxy::WebProxyConfig =
+        serde_json::from_value(config).map_err(|error| format!("代理配置格式错误: {error}"))?;
+    crate::qoder_web::web_proxy_config_save(parsed)
 }
 
 /// POST /api/qoder/pro-pack/claim —— 领取 Pro 升级包（幂等；已领过 `already=true`）。

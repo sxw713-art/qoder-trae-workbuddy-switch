@@ -36,7 +36,13 @@ import { demoModeEnabled } from "./demo-mode";
 import { t } from "./i18n";
 import type { TranslationKey } from "@/locales/zh";
 import type { CompanionSnapshot } from "./companion";
-import type { AgentHookStatus, CheckinStatusEntry, QoderGatewayQuotaView } from "./api";
+import type {
+  AgentHookStatus,
+  CheckinStatusEntry,
+  QoderGatewayQuotaView,
+  QoderWebProxyConfig,
+  QoderWebWindowCookies,
+} from "./api";
 import type { QoderGatewayConfigRaw } from "./qoder-gateway";
 
 export const screenshotDemoEnabled = demoModeEnabled;
@@ -737,6 +743,9 @@ function demoGatewayConfig(): GatewayConfig {
     log_bodies: false,
     per_key_rate_limit: null,
     max_context: true,
+    // ★ issue #129：演示站与真实默认一致（关）。开启态要演示的话会改变对外报错语义，
+    // 不适合作为默认截图状态。
+    auto_failover: false,
   };
 }
 
@@ -1741,6 +1750,8 @@ function demoTraeVariants(): TraeVariantsStatus {
     path: installed ? path : null,
     dataDir: installed ? dataDir : null,
     dataDirExists: installed,
+    // 登录态文件是否存在（issue #136）：演示数据里「装了」就等于「写得出 storage.json」。
+    storageJsonExists: installed,
     // 演示数据里两个目录取同一个值（真实机器上它们可能分叉，见
     // `TraeProgramStatus.writeDataDir` 的说明）—— 截图场景不需要复现那个分叉。
     writeDataDir: installed ? dataDir : null,
@@ -1760,6 +1771,8 @@ function demoTraeVariants(): TraeVariantsStatus {
         path: "D:\\Programs\\Trae CN\\Trae CN.exe",
         dataDir: "C:\\Users\\demo\\AppData\\Roaming\\Trae CN",
         dataDirExists: true,
+        // 登录态文件是否存在（issue #136）：演示里国内区已登录 ⇒ 文件存在。
+        storageJsonExists: true,
         writeDataDir: "C:\\Users\\demo\\AppData\\Roaming\\Trae CN",
         writeDataDirExists: true,
         programs: [
@@ -1787,6 +1800,7 @@ function demoTraeVariants(): TraeVariantsStatus {
         path: null,
         dataDir: null,
         dataDirExists: false,
+        storageJsonExists: false,
         writeDataDir: null,
         writeDataDirExists: false,
         programs: [
@@ -2191,6 +2205,8 @@ function demoQoderGatewayConfig(): QoderGatewayConfigRaw {
     daily_token_limit: 500_000,
     daily_credit_limit: 50,
     model_daily_token_limit: 0,
+    // ★ issue #129：与真实默认一致（关）。
+    auto_failover: false,
   };
 }
 
@@ -2712,6 +2728,8 @@ function demoTraeGatewayConfig(): TraeGatewayConfigRaw {
     // 抓取旁路默认关：演示站也不该呈现「已开启诊断抓取」的假状态。
     capture_enabled: false,
     max_mode: true,
+    // ★ issue #129：与真实默认一致（关）。
+    auto_failover: false,
   };
 }
 
@@ -3642,11 +3660,28 @@ export function screenshotDemoResponse(command: string, args?: Record<string, un
       return {
         hasSession: true,
         expired: false,
+        pending: false,
         source: "stored",
         cookieNames: ["qoder_session"],
         savedAtMs: Date.now() - 3_600_000,
         verifiedAtMs: Date.now() - 600_000,
       };
+    /* 登录窗 Cookie 探针（只读、不打上游）：演示站没有登录窗 ⇒ 如实回「没开」。
+       ⚠️ 不要在这里假装 `windowOpen: true` + 有 cookie：那会让演示端的登录轮询
+       永远「发现变化」并去调 probe，而 probe 在演示面里是动作（不可用）。 */
+    /* 逐包出站代理配置（只读）：演示站没有代理需求，如实回「直连」。 */
+    case "qoder_web_proxy_get":
+      return {
+        cn: "",
+        global: "",
+      } satisfies QoderWebProxyConfig;
+    case "qoder_web_window_cookies":
+      return {
+        windowOpen: false,
+        cookieCount: 0,
+        cookieNames: [] as string[],
+        fingerprint: "",
+      } satisfies QoderWebWindowCookies;
     case "qoder_program_status": {
       const scope = String((args as { scope?: unknown } | undefined)?.scope ?? "");
       return demoQoderPrograms(scope);
