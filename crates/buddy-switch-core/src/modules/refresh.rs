@@ -78,6 +78,49 @@ fn try_unlock(region: Region, account: Value) -> Value {
     }
 }
 
+/// 判断刷新响应是否代表**凭据真的失效**（应当标 `needs_relogin`）。
+///
+/// 只认明确的凭据作废信号：上游返回 401/403，或 body 带 `12153` / `invalid_grant` /
+/// `token format error` 这类 refresh token 作废标记。其余一律**不是**凭据错误：
+///
+/// - `code == -1`：来自 `config::http_request` 收到 2xx 非 JSON 响应（被吞成 `Value::Null`）
+///   或 reqwest 传输失败 —— 纯网络/解析抖动，重试即可，不该标死账号；
+/// - `code == 429`：限流，与凭据无关；
+/// - 其它未知 code：保守起见不标（标错的代价是账号被永久打挂，比漏标严重）。
+///
+/// 与 [`crate::modules::credits::is_unauthorized`] 口径不同：那边 401/403 触发「再刷新一次」，
+/// 这里 401/403 已是「刷新本身失败」的凭据类结论。
+fn is_credential_error(resp: &Value, code: i64) -> bool {
+    if code == 401 || code == 403 {
+        return true;
+    }
+    let message = resp
+        .get("message")
+        .or_else(|| resp.get("msg"))
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            resp.get("data")
+                .and_then(|d| d.get("message").or_else(|| d.get("msg")))
+                .and_then(|v| v.as_str())
+        })
+        .unwrap_or("")
+        .to_lowercase();
+    if message.is_empty() {
+        return false;
+    }
+    [
+        "12153",
+        "invalid_grant",
+        "token format error",
+        "unauthorized",
+        "expired",
+        "invalid refresh token",
+        "refresh token failed",
+    ]
+    .iter()
+    .any(|keyword| message.contains(keyword))
+}
+
 /// 刷新单账号 token（POST `{billing_base}/v2/plugin/auth/token/refresh`），成功则落盘并返回新账号。
 ///
 /// 刷新失败（refresh token 失效等）时给账号标记 needs_relogin，避免无限重试。
@@ -127,16 +170,34 @@ pub async fn refresh_account_token_for(region: Region, mut account: Value) -> Va
     let resp = http_request(&url, "POST", Some(json!({})), Some(&headers)).await;
     let code = resp.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
     if code != 0 && code != 200 {
-        account["needs_relogin"] = json!(true);
-        account["needs_relogin_reason"] = json!(format!(
-            "刷新失败(code={code}): {}",
+        // ★ 只有**明确的凭据类错误**才标 needs_relogin。上游的 `code=-1` 来自
+        // `config::http_request` 收到 HTTP 2xx 但响应体不是 JSON（被吞成 `Value::Null`）
+        // 或 reqwest 传输失败 —— 这两种都是**网络/解析抖动**，不是 refresh token 失效。
+        // 把它们也标成「需重新登录」会让账号被**永久**标死，直到下一次刷新碰巧成功
+        // （参考实现 `renew.py` 明确「刷新失败不做惩罚，可能是网络抖动」）。
+        // 凭据类错误（refresh token 真的作废）的上游特征：401/403 状态码、或 body 带
+        // `12153` / `invalid_grant` / `token format error` 这类会话作废标记 —— 这些才该标。
+        if is_credential_error(&resp, code) {
+            account["needs_relogin"] = json!(true);
+            account["needs_relogin_reason"] = json!(format!(
+                "刷新失败(code={code}): {}",
+                resp.get("message")
+                    .or_else(|| resp.get("msg"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("未知错误")
+            ));
+            let _ = upsert_account_for(region, &account);
+            return account;
+        }
+        // 传输/解析失败：只**记日志**，保留旧状态（不置 needs_relogin、不动 expiresAt）。
+        // 下次惰性刷新 / 保活还会再试，不会因为一次网络抖动就把可用账号打挂。
+        eprintln!(
+            "[refresh] 刷新遇非凭据错误（code={code}），跳过标记，保留旧状态: {}",
             resp.get("message")
                 .or_else(|| resp.get("msg"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("未知错误")
-        ));
-        let _ = upsert_account_for(region, &account);
-        return account;
+        );
     }
 
     let data = resp.get("data").cloned().unwrap_or_else(|| json!({}));
@@ -543,5 +604,49 @@ mod tests {
 
         drop(guard);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 刷新失败的「非凭据类」错误**不得**标 needs_relogin：网络/解析抖动（code=-1）
+    /// 不该把可用账号永久打挂。
+    ///
+    /// 可证伪：把 `refresh_account_token_for` 的失败分支改回「一律置 needs_relogin」，
+    /// 这条断言立即红。
+    #[test]
+    fn non_credential_errors_must_not_mark_needs_relogin() {
+        // code=-1：来自 HTTP 2xx 非 JSON 响应被吞成 Null，或 reqwest 传输失败。
+        assert!(!is_credential_error(&json!({"code": -1, "message": "未知错误"}), -1));
+        // code=-1 但 message 带「响应非 JSON（HTTP 200 …）」也仍是网络/解析层，不是凭据。
+        assert!(!is_credential_error(
+            &json!({"code": 0, "message": "响应非 JSON（HTTP 200，34 字节）：<html>…"}),
+            0
+        ));
+        // 429 限流与凭据无关。
+        assert!(!is_credential_error(&json!({"code": 429, "message": "Too Many Requests"}), 429));
+    }
+
+    /// 明确的凭据作废信号**必须**标 needs_relogin。
+    ///
+    /// 可证伪：把 `is_credential_error` 收窄成「只看 401/403」，下列带 12153 / invalid_grant
+    /// 的 200-body 形态就会漏判，断言变红。
+    #[test]
+    fn credential_errors_must_mark_needs_relogin() {
+        // 401/403 状态码：刷新本身被拒。
+        assert!(is_credential_error(&json!({"code": 401, "message": "unauthorized"}), 401));
+        assert!(is_credential_error(&json!({"code": 403, "message": "forbidden"}), 403));
+        // 200-body 带 12153（腾讯 refresh token 失效标记）。
+        assert!(is_credential_error(
+            &json!({"code": 12153, "message": "12153:refresh token failed:10000:token format error"}),
+            12153
+        ));
+        // invalid_grant：token 真的作废。
+        assert!(is_credential_error(
+            &json!({"code": 400, "message": "400 Bad Request: invalid_grant: Invalid refresh token"}),
+            400
+        ));
+        // message 在 data 嵌套层也要能识别。
+        assert!(is_credential_error(
+            &json!({"code": 0, "data": {"message": "refresh token failed"}}),
+            0
+        ));
     }
 }

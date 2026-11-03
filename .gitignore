@@ -98,3 +98,10 @@ _*.cjs
 # Trae 设备身份（含 EC 私钥），由 scripts/trae_device_gen.py 生成，绝不入库。
 /client-profile/
 /out_trae/
+
+# 本地 cargo 缓存与编译/测试日志（非版本控制）
+.cargo-cache/
+.cargo-check.sh
+.cargo-test.sh
+.cargo-build.sh
+.cargo-*.log

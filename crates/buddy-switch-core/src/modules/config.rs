@@ -1204,7 +1204,20 @@ pub async fn http_request_with_proxy(
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
             if status.is_success() {
-                serde_json::from_str(&text).unwrap_or(Value::Null)
+                // ★ 2xx 但响应体不是 JSON（上游偶发 HTML 挑战页 / 空体 / 截断）不能静默
+                // 折成 `Value::Null`：下游（如刷新）会把它读成 `code=-1` + 「未知错误」，
+                // 既掩盖真相又可能误判。保留成功状态码，但把 body 前段带出来，便于排障。
+                match serde_json::from_str::<Value>(&text) {
+                    Ok(value) => value,
+                    Err(_) => json!({
+                        "code": 0,
+                        "message": format!(
+                            "响应非 JSON（HTTP {status}，{} 字节）：{}",
+                            text.len(),
+                            text.chars().take(200).collect::<String>()
+                        ),
+                    }),
+                }
             } else {
                 serde_json::from_str(&text).unwrap_or_else(|_| {
                     json!({
