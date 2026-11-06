@@ -91,14 +91,32 @@ const dayOf = (key, over = {}) => ({
   keysPartial: false,
   ...over,
 });
-/** 窗口 = 全部日期（与 `usageWindowKeys` 的 `{kind:"preset"}` 等价）。 */
-const allWindow = { kind: "all" };
+/**
+ * 用例里的「窗口内」日期键：**取今天**。
+ *
+ * ⚠️ 此前写死 `{ kind: "all" }` —— 但 `UsageWindow` 只有 `today` / `preset(date)` /
+ * `custom` 三种变体，`{kind:"all"}` 会落进 `preset` 分支而 `days` 是 `undefined`
+ * ⇒ `from = NaN` ⇒ 窗口键集为空 ⇒ 六条断言里五条把「有数据」判成「窗外」。
+ * 这里改用真实存在的 `preset`（30 天），日期键也改成相对今天生成，
+ * 于是用例不再随日历腐烂（写死 `2026-11-05` 过 30 天就会自己掉出窗口）。
+ */
+const today = (() => {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+})();
+/** 「窗口外」日期键：100 天前（超出 `preset:30` 的覆盖范围）。 */
+const oldDay = (() => {
+  const d = new Date(Date.now() - 100 * 24 * 3600 * 1000);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+})();
+/** 窗口 = 近 30 天（`usageWindowBounds` 的 preset 分支，真实存在的变体）。 */
+const allWindow = { kind: "preset", days: 30 };
 
 /* ── ① 分母是输入侧，不是 total ───────────────────────────────────── */
 check("命中率的分母是 input（不含 output）", () => {
   const dim = {
     days: [
-      dayOf("2026-11-05", {
+      dayOf(today, {
         models: [entry({ model: "m", input: 1000, output: 9000, total: 10000, cached: 900 })],
       }),
     ],
@@ -113,7 +131,7 @@ check("命中率的分母是 input（不含 output）", () => {
 check("dimTotals 的 tokens 不含 cached（cached 是 input 的子集）", () => {
   const dim = {
     days: [
-      dayOf("2026-11-05", {
+      dayOf(today, {
         models: [entry({ model: "m", input: 1000, output: 20, total: 1020, cached: 900 })],
       }),
     ],
@@ -128,7 +146,7 @@ check("dimTotals 的 tokens 不含 cached（cached 是 input 的子集）", () =
 check("窗口内没有 cached 字段 ⇒ observed=false 且 hitRate=null", () => {
   const dim = {
     days: [
-      dayOf("2026-11-05", {
+      dayOf(today, {
         models: [entry({ model: "m", input: 1000, output: 20, total: 1020, cached: null })],
       }),
     ],
@@ -142,7 +160,7 @@ check("窗口内没有 cached 字段 ⇒ observed=false 且 hitRate=null", () =>
 check("cached 明确为 0 ⇒ observed=true 且 hitRate=0", () => {
   const dim = {
     days: [
-      dayOf("2026-11-05", {
+      dayOf(today, {
         models: [entry({ model: "m", input: 1000, output: 20, total: 1020, cached: 0 })],
       }),
     ],
@@ -159,7 +177,7 @@ check("四条维度都有数时，命中率不会翻倍（只取 models）", () 
   ];
   const dim = {
     days: [
-      dayOf("2026-11-05", {
+      dayOf(today, {
         /* 同一个请求在四个维度各出现一次 —— 混着加会得到 4000/2000 之类的错值。 */
         models: same,
         accounts: same,
@@ -177,7 +195,7 @@ check("四条维度都有数时，命中率不会翻倍（只取 models）", () 
 /* ── ⑤ input 为 0 ⇒ null（不是 0%） ─────────────────────────────── */
 check("窗口内 input 为 0 ⇒ hitRate=null", () => {
   const dim = {
-    days: [dayOf("2026-11-05", { models: [entry({ model: "m", input: 0, output: 0, total: 0, cached: 0 })] })],
+    days: [dayOf(today, { models: [entry({ model: "m", input: 0, output: 0, total: 0, cached: 0 })] })],
   };
   const hit = gatewayCacheHit(dim, allWindow);
   eq(hit.hitRate, null, "没有可判定的输入 ⇒ null");
@@ -189,8 +207,8 @@ check("窗口外的日期不参与命中率", () => {
   const dim = {
     days: [
       /* 方案外的日子里，命中率是 0；方案内是 100%。若不做窗口过滤，结果会是 50%。 */
-      dayOf("2026-01-01", { models: [entry({ model: "m", input: 1000, cached: 0, total: 1000 })] }),
-      dayOf("2026-11-05", { models: [entry({ model: "m", input: 1000, cached: 1000, total: 1000 })] }),
+      dayOf(oldDay, { models: [entry({ model: "m", input: 1000, cached: 0, total: 1000 })] }),
+      dayOf(today, { models: [entry({ model: "m", input: 1000, cached: 1000, total: 1000 })] }),
     ],
   };
   const hit = gatewayCacheHit(dim, { kind: "preset", days: 1 });
