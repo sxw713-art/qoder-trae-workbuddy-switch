@@ -142,7 +142,6 @@ export const en = {
   "wbStats.gateway.revoke": "Revoke",
   "wbStats.gateway.restore": "Restore",
   "wbStats.gateway.nameRequired": "Please enter a name",
-  "wbStats.gateway.createdNoPlaintext": "Created successfully but no plaintext returned; please retry",
   "wbStats.gateway.createFail": "Create failed",
   "wbStats.gateway.revokedToast": "Revoked",
   "wbStats.gateway.revokeFail": "Revoke failed",
@@ -157,10 +156,6 @@ export const en = {
   "wbStats.gateway.regionLabel": "Owned version",
   "wbStats.gateway.regionAria": "Owned version",
   "wbStats.gateway.create": "Create",
-  "wbStats.gateway.createdTitle": "API Key created",
-  "wbStats.gateway.createdDesc": "The full key is shown only this once; copy and save it immediately.",
-  "wbStats.gateway.keyCopied": "API Key copied",
-  "wbStats.gateway.savedClose": "I have saved it, close",
   "wbStats.gateway.revokeTitle": "Revoke API Key",
   "wbStats.gateway.revokeDesc": "After revocation, \"{name}\" becomes invalid immediately (401) and remains listed as \"revoked\".",
   "wbStats.gateway.deleteTitle": "Delete API Key",
@@ -178,6 +173,15 @@ export const en = {
   "wbStats.gateway.log.col.model": "Model",
   "wbStats.gateway.log.col.status": "Status",
   "wbStats.gateway.log.col.latency": "Latency",
+  "wbStats.gateway.log.col.credit": "Credits",
+  /* Header hint for the credits column: 0 means the upstream reported nothing,
+     not that the request was free (`usage.credit` is absent either way).
+     Second sentence: summing these rows (per-request view) is NOT the same as the
+     Credits page (balance view) — retries / other devices double-count here.
+     NOTE: twin of `shared.gateway.log.col.creditHint` (only the upstream field
+     name differs); keep both in sync. */
+  "wbStats.gateway.log.col.creditHint":
+    "Credits consumed by this request (upstream usage.credit); 0 means the upstream reported none — not the same as free. Summing these rows is the per-request view, which can differ from the balance-based view on the Credits page (retries and other devices double-count)",
   "wbStats.gateway.log.col.tokens": "Tokens",
   // The old "account strategy" card was replaced by the **shared** account pool card
   // (the three strategy modes folded into its "preferred account" dropdown); only the
@@ -271,6 +275,10 @@ export const en = {
   "wbStats.usage.trend.requests": "Requests",
   "wbStats.usage.trend.requestsHint": "Client counts log rows; gateway counts request log entries",
   "wbStats.usage.trend.gatewayNoHours": "The gateway log keeps only timestamps and durations: it can be aggregated per day, not per hour of week. Switch to the client ledger for the heatmap.",
+  "wbStats.usage.trend.cacheHit": "Cache hits",
+  "wbStats.usage.trend.cacheHitHint": "{rate} hit · {input} input",
+  "wbStats.usage.trend.cacheHitUnobserved": "No cache data in this window",
+  "wbStats.usage.trend.cacheHitTitle": "The part of gateway input that hit the upstream prefix cache. The denominator is input only (output excluded) — distinct from the double-counting bug that halved hit rate to 50% (#154)",
   "wbStats.usage.trend.totalClient": "Client tokens",
   "wbStats.usage.trend.totalGateway": "Gateway tokens",
   "wbStats.usage.trend.totalCombined": "Combined tokens",
@@ -320,6 +328,7 @@ export const en = {
   "wbStats.usage.models.colTokens": "Tokens",
   "wbStats.usage.models.colShare": "Percent",
   "wbStats.usage.models.colRequests": "Requests",
+  "wbStats.usage.models.colCacheHit": "Cache hit",
   "wbStats.usage.models.colFailed": "Failed",
   "wbStats.usage.models.dailyTitle": "Daily tokens by model",
   "wbStats.usage.models.clientNoFail": "The client ledger does not record failures — session logs only keep rows that were written",

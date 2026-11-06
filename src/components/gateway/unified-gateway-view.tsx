@@ -26,6 +26,7 @@ import { toast } from "sonner";
 
 import { Badge } from "@/components/ui/badge";
 import { DemoAction } from "@/components/demo-action";
+import { KeySecretCell } from "@/components/gateway/key-secret-cell";
 import { KeysBar } from "@/components/gateway/keys-bar";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -47,6 +48,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Switch } from "@/components/ui/switch";
 import * as api from "@/lib/api";
 import { copyText } from "@/lib/clipboard";
+import { gatewayRootUrl } from "@/lib/gateway-url";
 import { formatDate } from "@/lib/format";
 import { useT } from "@/lib/i18n";
 import {
@@ -200,7 +202,18 @@ export function UnifiedGatewayView({
   /** 端口输入框的**本地草稿**（提交前不写库；回车 / 失焦提交）。 */
   const [portDraft, setPortDraft] = useState("");
   const [createOpen, setCreateOpen] = useState(false);
-  const [plaintext, setPlaintext] = useState<{ value: string; name: string } | null>(null);
+  /**
+   * 创建成功后的**二选一面板**（2026-11-04）：
+   * 「保存到本软件」→ 明文落盘、列表出眼睛；「自行保存」→ 只有 hash。
+   * 关闭面板（X / ESC / 点遮罩）等同「自行保存」。
+   *
+   * 不复用上面的 `saving`（那是配置保存的忙态）：两件事同时可能发生，
+   * 共用一个布尔会让「保存配置」和「保存密钥」互相把按钮点亮 / 置灰。
+   */
+  const [pendingKey, setPendingKey] = useState<{ id: string; value: string; name: string } | null>(
+    null,
+  );
+  const [keySaving, setKeySaving] = useState(false);
 
   /* ── issue #76：用量 / 权限两列 + 行内展开 + 权限抽屉（与另三条产品线同形） ── */
   const [expandedKeyId, setExpandedKeyId] = useState<string | null>(null);
@@ -426,19 +439,34 @@ export function UnifiedGatewayView({
   );
   const platforms = useMemo(() => platformOrder(visibleIds), [visibleIds]);
   const activeKeyCount = keys.filter((key) => !key.revoked).length;
-  /** 接入地址（与「独立网关」同款：`bind_addr:port`）—— 概览里要能一眼看到 + 一键复制。 */
-  const baseUrl = `http://${snapshot?.config.bind_addr ?? LOOPBACK}:${snapshot?.config.port ?? ""}`;
+  /**
+   * 根地址（**不带** `/v1`）—— Anthropic 系客户端要的就是它。
+   * ★ 两档语义由 `lib/gateway-url.ts` 唯一给出（#165）：`0.0.0.0` 是**监听**通配地址，
+   * 不能当目标地址 ⇒ 展示 / 复制一律归一回环（与 Trae / Qoder 两页同款）。
+   */
+  const rootUrl = useMemo(
+    () => gatewayRootUrl(snapshot?.config.bind_addr, snapshot?.config.port),
+    [snapshot?.config.bind_addr, snapshot?.config.port],
+  );
+  /** OpenAI 系 Base URL（**含** `/v1`）—— 概览「接入地址」显示并复制的就是它。 */
+  const baseUrl = `${rootUrl}/v1`;
+  /**
+   * 端口缺失（配置加载失败 / 尚未就绪）⇒ 不给出「看起来能用」的串：
+   * 否则会渲染成 `http://127.0.0.1:/v1`，复制出去必然失败。
+   */
+  const endpointReady = Boolean(snapshot?.config.port);
   /** 概览的一句话结论（见 `verdictOf`）。 */
   const verdict = verdictOf();
 
-  /** 接入说明的代码样例（两种协议的认证头不同 —— 把协议做成 Tab，认证头就不可能给错）。 */
+  /** 接入说明的代码样例（两种协议的认证头不同 —— 把协议做成 Tab，认证头就不可能给错）。
+      ★ 端点路径自带 `/v1` ⇒ 这里一律用**根地址**拼（用 `baseUrl` 会得到 `/v1/v1/...`）。 */
   const guideSnippet =
     guideApi === "anthropic"
-      ? `curl ${baseUrl}/v1/messages \\
+      ? `curl ${rootUrl}/v1/messages \\
   -H "x-api-key: $BUDDY_SWITCH_KEY" \\
   -H "anthropic-version: 2023-06-01" \\
   -d '{"model":"${SAMPLE_MODEL}","max_tokens":256,"messages":[{"role":"user","content":"hi"}]}'`
-      : `curl ${baseUrl}/v1/chat/completions \\
+      : `curl ${rootUrl}/v1/chat/completions \\
   -H "Authorization: Bearer $BUDDY_SWITCH_KEY" \\
   -d '{"model":"${SAMPLE_MODEL}","messages":[{"role":"user","content":"hi"}]}'`;
 
@@ -467,22 +495,58 @@ export function UnifiedGatewayView({
     void save({ port: parsed });
   }
 
-  async function onCreateKey(name: string, namespaces: string[], bizNamespace: string | null) {
+  async function onCreateKey(
+    name: string,
+    namespaces: string[],
+    bizNamespace: string | null,
+    customKey: string | null,
+  ) {
     try {
-      const result = await api.createUnifiedApiKey(name, namespaces, bizNamespace);
-      setCreateOpen(false);
-      // 明文只在创建时返回一次 ⇒ 立刻展示，且**只给显式关闭出口**。
-      // ★ 后端没返回明文时**不弹空对话框**（那会让用户以为「创建了但看不到」，实际是异常）
-      if (result.key) {
-        setPlaintext({ value: result.key, name });
-        toast.success(t("unifiedGateway.created"));
-      } else {
-        toast.error(t("unifiedGateway.saveFailed"));
+      const result = await api.createUnifiedApiKey(name, namespaces, bizNamespace, customKey);
+      if (result.ok === false) {
+        // 失败时**不关对话框**：用户填的名称 / 授权集 / 自定义密钥都还在，改完可直接重试。
+        toast.error(t("unifiedGateway.saveFailed"), { description: result.error });
+        return;
       }
+      // ★ 明文只随本次响应返回 ⇒ **先把面板打开，再刷新列表**。
+      //   反过来写会让 load 的往返卡在「Key 已创建、面板还没弹」的中间态，
+      //   期间切页 / 组件卸载就等于把明文丢了（`load` 自己吞异常，不会报错，丢了也不会有提示）。
+      if (!result.record?.id || !result.key) {
+        setCreateOpen(false);
+        toast.error(t("unifiedGateway.saveFailed"));
+        return;
+      }
+      setCreateOpen(false);
+      setPendingKey({ id: result.record.id, value: result.key, name });
+      // `load` 内部已把失败转成 toast，不会 reject ⇒ 列表刷新不会影响面板里的明文。
       await load();
     } catch (error) {
       toast.error(t("unifiedGateway.saveFailed"), { description: String(error) });
     }
+  }
+
+  /** 面板「保存到本软件」：写台账 → 刷新列表让眼睛出现。失败时保留面板（关掉等于丢明文）。 */
+  async function savePendingKey() {
+    if (!pendingKey) return;
+    setKeySaving(true);
+    try {
+      await api.saveUnifiedApiKeyPlaintext(pendingKey.id, pendingKey.value);
+      setPendingKey(null);
+      // `load` 内部已把失败转成 toast（不 reject）⇒ 保存成功不会被刷新失败反报成失败。
+      await load();
+      toast.success(t("shared.gateway.keys.savedToApp"), { description: pendingKey.name });
+    } catch (error) {
+      // 失败必须留着面板：关掉就等于把明文丢了（保存没成功，就不该变成「自行保存」）。
+      setPendingKey(pendingKey);
+      toast.error(t("shared.gateway.keys.saveFailed"), { description: String(error) });
+    } finally {
+      setKeySaving(false);
+    }
+  }
+
+  /** 面板「自行保存」/ 关闭：不落盘，明文随面板一起消失。 */
+  function dismissPendingKey() {
+    setPendingKey(null);
   }
 
   async function runKeyAction(action: "revoke" | "restore" | "delete", id: string) {
@@ -555,15 +619,19 @@ export function UnifiedGatewayView({
         )}
 
         {/* 接入地址（与两个既有网关卡同构的一行：值 + 复制出口）——
-            改造前这一行只在摘要条里露了个 `addr`，没有完整 URL、也没有复制。 */}
+            改造前这一行只在摘要条里露了个 `addr`，没有完整 URL、也没有复制。
+            ★ 值必须是**能直接填进 OpenAI 客户端**的串（含 `/v1`），与下方接入说明同口径（#165）。 */}
         <div className="flex items-center gap-3 border-b border-border/60 px-5 py-3">
           <div className="min-w-0 flex-1">
             <div className="text-xs font-medium">{t("unifiedGateway.addr")}</div>
-            <div className="mt-0.5 break-all font-mono text-[11.5px] text-muted-foreground">{baseUrl}</div>
+            <div className="mt-0.5 break-all font-mono text-[11.5px] text-muted-foreground">
+              {endpointReady ? baseUrl : "—"}
+            </div>
           </div>
           <Button
             variant="outline"
             size="sm"
+            disabled={!endpointReady}
             onClick={() => void copyText(baseUrl, t("wbStats.gateway.baseUrlCopied"))}
           >
             <Copy />
@@ -696,7 +764,7 @@ export function UnifiedGatewayView({
             {guideSnippet}
           </pre>
           <p className="mt-2.5 text-[11.5px] leading-5 text-muted-foreground">
-            {t("unifiedGateway.guideBase", { openai: `${baseUrl}/v1`, anthropic: baseUrl })}
+            {t("unifiedGateway.guideBase", { openai: baseUrl, anthropic: rootUrl })}
           </p>
           <p className="mt-1.5 text-[11.5px] leading-5 text-muted-foreground">
             {t("unifiedGateway.guideModels", { sample: SAMPLE_MODEL })}
@@ -1038,8 +1106,14 @@ export function UnifiedGatewayView({
                           )}
                         </span>
                       </td>
-                      <td className="py-2 pr-4 font-mono text-xs text-muted-foreground">
-                        {key.suffix ? `${key.prefix}••••••••${key.suffix}` : `${key.prefix}…`}
+                      {/* ★ 掩码 + 眼睛（四条产品线共用 `KeySecretCell`）：
+                          默认 `prefix••••••••suffix`，有明文时可点眼睛查看完整密钥。 */}
+                      <td className="py-2 pr-4">
+                        <KeySecretCell
+                          plaintext={key.plaintext}
+                          prefix={key.prefix}
+                          suffix={key.suffix}
+                        />
                       </td>
                       <td className="py-2 pr-4 text-xs text-muted-foreground">
                         {formatDate(key.createdAt)}
@@ -1322,45 +1396,48 @@ export function UnifiedGatewayView({
         onConfirm={onCreateKey}
       />
 
-      {/* 一次性明文：**拦截遮罩与 ESC** —— 明文不可复原（库里只有 sha256），
-          误关一次就得吊销重建 + 改所有客户端配置。
-          ★ 但**右上角 X 必须真的能关**（`onOpenChange` 收到 `false` 就落 `setPlaintext(null)`）：
-          原先这里写的是 `onOpenChange={() => undefined}`，于是 X 变成一个「点了完全没反应」的
-          死按钮 —— 加上遮罩与 ESC 也被拦，用户手上就只剩底部那一个按钮，任何一次没点中
-          都表现为「整个界面卡死、哪里都点不动」（issue #80）。
-          语义上与底部按钮完全一致（用户已显式表示要关闭），不是误关。
-          另外三张 Key 表（WB / Trae / Qoder）本来就是 `!open && closePlaintext()`，此处对齐。 */}
-      <Dialog open={plaintext !== null} onOpenChange={(open) => !open && setPlaintext(null)}>
-        <DialogContent
-          className="sm:max-w-md"
-          onInteractOutside={(event) => event.preventDefault()}
-          onEscapeKeyDown={(event) => event.preventDefault()}
-        >
+      {/* 创建后的二选一面板（2026-11-04）——与另三条产品线同一形态：
+          创建时不落盘明文，明文只随本次响应回来，关掉即永久丢失。
+          故给复制按钮兜底；X / ESC / 遮罩 = 「自行保存」，不拦截。 */}
+      <Dialog open={pendingKey !== null} onOpenChange={(open) => !open && dismissPendingKey()}>
+        <DialogContent className="sm:max-w-md">
           <DialogHeader>
-            <DialogTitle>{t("unifiedGateway.created")}</DialogTitle>
-            <DialogDescription>{t("unifiedGateway.createdHint")}</DialogDescription>
+            <DialogTitle>{t("shared.gateway.keys.createdTitle")}</DialogTitle>
+            <DialogDescription>{t("shared.gateway.keys.createdDesc")}</DialogDescription>
           </DialogHeader>
-          {plaintext && (
+          {pendingKey && (
             <div className="flex items-center gap-2 rounded-lg border border-border bg-muted/40 px-3 py-2.5">
               <code className="min-w-0 flex-1 select-all break-all font-mono text-xs">
-                {plaintext.value}
+                {pendingKey.value}
               </code>
               <Button
                 variant="outline"
                 size="sm"
-                onClick={() => {
-                  // 复制按钮**不禁用**：用户可能要粘到多个客户端 / 先存进密码管理器
-                  void copyText(plaintext.value);
-                  toast.success(t("shared.clipboard.copied"));
-                }}
+                data-act="gw-key-panel-copy"
+                onClick={() => void copyText(pendingKey.value)}
               >
                 <Copy />
-                {t("unifiedGateway.copy")}
+                {t("shared.gateway.keys.copy")}
               </Button>
             </div>
           )}
           <DialogFooter>
-            <Button onClick={() => setPlaintext(null)}>{t("unifiedGateway.savedClose")}</Button>
+            <Button
+              variant="outline"
+              data-act="gw-key-panel-dismiss"
+              onClick={dismissPendingKey}
+              disabled={keySaving}
+            >
+              {t("shared.gateway.keys.saveSelf")}
+            </Button>
+            <Button
+              data-act="gw-key-panel-save"
+              onClick={() => void savePendingKey()}
+              disabled={keySaving}
+            >
+              {keySaving && <Loader2 className="animate-spin" />}
+              {t("shared.gateway.keys.saveToApp")}
+            </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
@@ -1407,10 +1484,17 @@ function CreateKeyDialog({
   open: boolean;
   onOpenChange: (open: boolean) => void;
   namespaces: readonly string[];
-  onConfirm: (name: string, namespaces: string[], bizNamespace: string | null) => Promise<void>;
+  onConfirm: (
+    name: string,
+    namespaces: string[],
+    bizNamespace: string | null,
+    customKey: string | null,
+  ) => Promise<void>;
 }) {
   const t = useT();
   const [name, setName] = useState("");
+  /* 第三行：自定义密钥（留空 ⇒ 自动生成，填写 ⇒ 原样使用）。 */
+  const [customKey, setCustomKey] = useState("");
   const [selected, setSelected] = useState<string[]>([]);
   const [biz, setBiz] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -1419,6 +1503,7 @@ function CreateKeyDialog({
   useEffect(() => {
     if (!open) return;
     setName("");
+    setCustomKey("");
     setSelected([]);
     setBiz(null);
   }, [open]);
@@ -1437,7 +1522,12 @@ function CreateKeyDialog({
     if (selected.length === 0) return;
     setBusy(true);
     try {
-      await onConfirm(name.trim() || t("unifiedGateway.unnamed"), selected, biz);
+      await onConfirm(
+        name.trim() || t("unifiedGateway.unnamed"),
+        selected,
+        biz,
+        customKey.trim() || null,
+      );
     } finally {
       setBusy(false);
     }
@@ -1518,6 +1608,23 @@ function CreateKeyDialog({
               </SelectContent>
             </Select>
             <p className="text-[11.5px] text-muted-foreground">{t("unifiedGateway.bizHint")}</p>
+          </div>
+
+          {/* ★ 末尾「自定义密钥」：留空 ⇒ 按 `sk-uni-` 规则自动生成；填写 ⇒ 原样使用。 */}
+          <div className="space-y-2">
+            <Label htmlFor="unified-key-custom">{t("shared.gateway.keys.customLabel")}</Label>
+            <Input
+              id="unified-key-custom"
+              value={customKey}
+              onChange={(event) => setCustomKey(event.target.value)}
+              placeholder={t("shared.gateway.keys.customPlaceholder")}
+              spellCheck={false}
+              autoComplete="off"
+              className="font-mono"
+            />
+            <p className="text-[11.5px] leading-5 text-muted-foreground">
+              {t("shared.gateway.keys.customHint")}
+            </p>
           </div>
         </div>
 

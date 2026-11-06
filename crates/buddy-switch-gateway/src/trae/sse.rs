@@ -25,6 +25,11 @@ pub struct TokenUsage {
     pub completion: u64,
     pub total: u64,
     pub reasoning: u64,
+    /// 命中上游前缀缓存的输入 token（`prompt` 的**子集**；0 = 上游没报）。
+    ///
+    /// ★ issue #154：进请求日志的 `cachedTokens`，账本再按账号 / 模型 / 密钥分桶
+    /// ⇒ 「命中率掉了」与「换号了」终于能在同一本账里 join。
+    pub cached: u64,
 }
 
 impl TokenUsage {
@@ -42,22 +47,65 @@ impl TokenUsage {
             completion,
             total,
             reasoning: read("reasoning_tokens"),
+            cached: cached_tokens_of(value),
         }
     }
 
     /// 转成 OpenAI `usage` 对象。
+    ///
+    /// ★ issue #154：`prompt_tokens_details.cached_tokens` **只在真有命中量时才写**。
+    ///
+    /// 为什么不是「恒发射、没命中写 0」：这是**对外 wire 形状**，多一个键会让
+    /// 严格校验的客户端（把 `usage` 当封闭结构的那种）拒绝整帧。而命中量恰恰是
+    /// 「上游报了才有」的信息 —— 没有就整个键不出现，与 `cached` 的
+    /// 「0 = 没观测到」在本函数里收敛成同一种表现（缺键）。
+    ///
+    /// 有命中量时**必须**写：否则 Trae 这条线的客户端（dsh 等）看到的
+    /// `prompt_tokens` 含命中、却没有任何命中量可读 ⇒ 表现为「缓存从不命中」，
+    /// 与 WB 线（`/v1/messages` 已给 `cache_read_input_tokens`）口径不一致。
     pub fn to_openai(self) -> Value {
-        json!({
+        let mut usage = json!({
             "prompt_tokens": self.prompt,
             "completion_tokens": self.completion,
             "total_tokens": self.total,
-        })
+        });
+        if self.cached > 0 {
+            usage["prompt_tokens_details"] = json!({ "cached_tokens": self.cached });
+        }
+        usage
     }
 
     /// 是否拿到了有效数据（全 0 视为没拿到）。
     pub fn is_meaningful(self) -> bool {
         self.total > 0 || self.prompt > 0 || self.completion > 0
     }
+}
+
+/// 从上游 `usage` 里取缓存命中 token（宽口径：四种写法）。
+///
+/// | 上游 | 字段 |
+/// |:--|:--|
+/// | DeepSeek | `prompt_cache_hit_tokens` |
+/// | OpenAI | `prompt_tokens_details.cached_tokens` |
+/// | Anthropic | `cache_read_input_tokens` |
+/// | 裸字段 | `cached_tokens` |
+///
+/// **上限钳到 `prompt_tokens`**：命中量在语义上是输入的子集，脏数据（上游报大）
+/// 会让下游的命中率 > 100%。与 `usage_tap::extract_usage` 同一处置。
+fn cached_tokens_of(usage: &Value) -> u64 {
+    let read = |key: &str| usage.get(key).and_then(Value::as_u64);
+    let hit = read("prompt_cache_hit_tokens")
+        .or_else(|| {
+            usage
+                .get("prompt_tokens_details")
+                .and_then(|details| details.get("cached_tokens"))
+                .and_then(Value::as_u64)
+        })
+        .or_else(|| read("cache_read_input_tokens"))
+        .or_else(|| read("cached_tokens"))
+        .unwrap_or(0);
+    let prompt = read("prompt_tokens").unwrap_or(0);
+    hit.min(prompt)
 }
 
 /// 一个解析完成的 SOLO 事件。
@@ -666,6 +714,57 @@ mod tests {
         assert_eq!(flushed[0].response, "tail");
     }
 
+    /// ★ issue #154：命中量必须能被解析出来（Trae 侧四种上游写法都认），
+    /// 且脏数据（命中 > prompt）钳到 prompt —— 否则下游命中率会 > 100%。
+    #[test]
+    fn cached_tokens_are_read_from_all_four_upstream_shapes() {
+        // DeepSeek
+        assert_eq!(
+            TokenUsage::from_value(&json!({
+                "prompt_tokens": 100, "completion_tokens": 1, "prompt_cache_hit_tokens": 90
+            }))
+            .cached,
+            90
+        );
+        // OpenAI 明细
+        assert_eq!(
+            TokenUsage::from_value(&json!({
+                "prompt_tokens": 100, "completion_tokens": 1,
+                "prompt_tokens_details": { "cached_tokens": 70 }
+            }))
+            .cached,
+            70
+        );
+        // Anthropic
+        assert_eq!(
+            TokenUsage::from_value(&json!({
+                "prompt_tokens": 100, "completion_tokens": 1, "cache_read_input_tokens": 60
+            }))
+            .cached,
+            60
+        );
+        // 裸字段 + 缺字段（= 0 = 上游没报）
+        assert_eq!(
+            TokenUsage::from_value(&json!({
+                "prompt_tokens": 100, "completion_tokens": 1, "cached_tokens": 50
+            }))
+            .cached,
+            50
+        );
+        assert_eq!(
+            TokenUsage::from_value(&json!({"prompt_tokens": 100, "completion_tokens": 1})).cached,
+            0
+        );
+        // 脏数：命中量报得比 prompt 还大 ⇒ 钳到 prompt
+        assert_eq!(
+            TokenUsage::from_value(&json!({
+                "prompt_tokens": 10, "completion_tokens": 1, "prompt_cache_hit_tokens": 999
+            }))
+            .cached,
+            10
+        );
+    }
+
     #[test]
     fn parse_event_reads_every_documented_solo_event() {
         let output = parse_event(
@@ -686,7 +785,8 @@ mod tests {
                 prompt: 10,
                 completion: 2,
                 total: 12,
-                reasoning: 1
+                reasoning: 1,
+                ..Default::default()
             })
         );
 
@@ -722,12 +822,43 @@ mod tests {
             completion: 2,
             total: 3,
             reasoning: 0,
+            ..Default::default()
         }
         .to_openai();
         assert_eq!(openai["prompt_tokens"], 1);
         assert_eq!(openai["total_tokens"], 3);
         // reasoning_tokens 不是 OpenAI 标准字段，不外发。
         assert!(openai.get("reasoning_tokens").is_none());
+        // ★ issue #154：没有命中量时**整个键不出现**（不是写 0）—— 见 `to_openai` 注释。
+        assert!(
+            openai.get("prompt_tokens_details").is_none(),
+            "没命中量时不得写 prompt_tokens_details（对外 wire 形状要最小）"
+        );
+    }
+
+    /// ★ issue #154：Trae 线的客户端也必须能读到命中量。
+    ///
+    /// 为什么钉这条：`to_openai()` 是 Trae 对客户端输出 `usage` 的**唯一构造点**
+    /// （流式末帧 + 非流式响应各一处）。它原来只有三个键 ⇒ 客户端看到的
+    /// `prompt_tokens` 含命中、却没有任何命中量可读，表现为「缓存从不命中」，
+    /// 与 WB 线（`/v1/messages` 给 `cache_read_input_tokens`）口径不一致 ——
+    /// 这正是 issue #154 里「同一个账号、同一个模型，两个客户端显示不同命中率」的
+    /// 另一半原因。
+    #[test]
+    fn to_openai_carries_cached_tokens_when_observed() {
+        let usage = TokenUsage {
+            prompt: 1000,
+            completion: 20,
+            total: 1020,
+            reasoning: 0,
+            cached: 900,
+        }
+        .to_openai();
+        assert_eq!(
+            usage["prompt_tokens_details"]["cached_tokens"], 900,
+            "命中量必须能被客户端读到"
+        );
+        assert_eq!(usage["prompt_tokens"], 1000, "prompt 仍是原值（含命中）");
     }
 
     #[test]
@@ -771,6 +902,7 @@ mod tests {
                 completion: 2,
                 total: 3,
                 reasoning: 0,
+                ..Default::default()
             }),
         );
         let parsed: Value =

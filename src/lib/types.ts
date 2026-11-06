@@ -64,6 +64,13 @@ export interface AccountTokenTodayEntry {
   gatewayIn: number;
   /** 经本网关的输出 token 数。 */
   gatewayOut: number;
+  /**
+   * 经本网关的输入里**命中上游前缀缓存**的部分（`gatewayIn` 的子集）。
+   *
+   * `null` = 今日还没观测到命中量（老条目 / 上游没报）——**不是「命中为 0」**。
+   * 判命中率用 `gatewayCached / gatewayIn`，别把 null 当分母。
+   */
+  gatewayCached?: number | null;
 }
 
 /**
@@ -153,6 +160,13 @@ export interface GatewayDimEntry {
   input: number;
   output: number;
   total: number;
+  /**
+   * 命中上游前缀缓存的输入 token（`input` 的**子集**，不参与 `total`）。
+   *
+   * `null` = 这天没观测到命中（老账本无此列 / 上游没报），**不是「命中为 0」**。
+   * 命中率 = `cached / input`，与后端 `token_stats::cacheHitRate` 同口径。
+   */
+  cached?: number | null;
   requests: number;
   /** HTTP `>= 400` 的条数（429 也在内）。 */
   failed: number;
@@ -1857,7 +1871,12 @@ export interface GatewayStatus {
   port: number;
   /** 是否允许非回环（局域网）监听。 */
   allowNonLoopback: boolean;
-  /** 后端返回的 Base URL（源自 snake_case `base_url`，如 http://127.0.0.1:57891/v1），优先使用。 */
+  /**
+   * 后端返回的**根地址**（源自 snake_case `base_url`，形如 `http://127.0.0.1:57891`，**不含 `/v1`**）。
+   *
+   * ★ OpenAI 系 Base URL 由前端派生（`lib/gateway-url.ts` 的 `gatewayOpenAiBaseUrlFrom`），
+   * 不要直接把本字段粘给 OpenAI 客户端 —— 少一层 `/v1` 必然 404（#165）。
+   */
   baseUrl?: string;
   /**
    * **最近一次请求失败**的可读原因（源自 snake_case `last_error`；`null` = 还没失败过）。
@@ -1986,7 +2005,11 @@ export interface GatewayPoolAccount {
   >;
 }
 
-/** API Key 记录（列表脱敏返回，绝不含明文）。字段名与后端 masked() 输出一致。 */
+/**
+ * API Key 记录（列表脱敏返回，不含 `hash`）。字段名与后端 `masked()` 输出一致。
+ *
+ * `plaintext` 只有用户选「保存到本软件」之后才有值 —— 没存的 Key 为 `null`，列表不出眼睛。
+ */
 /* ─────────── 密钥策略（issue #76）───────────
    定义放在 `types.ts` 而非 `api.ts`：`api.ts` 已经 import 本文件（单向），
    反向 import 会成环。两项策略：**用量配额**（单位 × 周期）与
@@ -2022,18 +2045,28 @@ export interface ApiKeyRecord {
    * 旧台账无此字段 ⇒ 空串 ⇒ 展示层**省略尾部**（不报错、不补造）。
    */
   suffix?: string;
+  /**
+   * ★ 2026-11-04：完整明文。旧台账（或改造前创建的 Key）没有该字段 ⇒ `null`，
+   * 列表里**不渲染眼睛按钮**（看不到完整值，也不补造）。
+   */
+  plaintext?: string | null;
   createdAt: number;
   revokedAt: number | null;
   revoked: boolean;
   lastUsedAt: number | null;
 }
 
-/** 创建 API Key 的返回：完整 key 仅此一次返回，之后无法再获取。 */
+/**
+ * 创建 API Key 的返回。
+ *
+ * ★ 2026-11-04：明文**只随本次响应返回**，创建时后端不落盘。前端拿到后立刻弹
+ * 「保存到本软件 / 自行保存」面板 —— 用户选前者才调 `save_*_api_key_plaintext` 写进台账。
+ */
 export interface CreateApiKeyResult {
   ok: boolean;
-  /** 一次性完整明文（sk-wb- 前缀）。 */
+  /** 本次创建的完整明文（自定义密钥时即用户输入值）。 */
   key?: string;
-  /** 创建后可直接加入列表的脱敏记录。 */
+  /** 创建后可直接加入列表的记录（此时 `plaintext` 为 `null`，用户保存后才会有值）。 */
   record?: ApiKeyRecord;
   error?: string;
 }

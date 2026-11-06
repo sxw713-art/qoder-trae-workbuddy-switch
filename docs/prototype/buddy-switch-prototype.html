@@ -2547,6 +2547,14 @@ function buildLedger(scopeId, u, modelDays) {
     accGw += out;
     return Math.max(0, out);
   });
+  /* ★ issue #154：网关的缓存命中量。真实值通常 95%+（同一会话连续请求命中前缀缓存），
+     这里取 0.62 让「命中率」这一列在原型里**可辨认**（99% 会看成一片满格，看不出对比）。
+     命中量是 `input` 的**子集**，`total`/`tokens` 一律不因此变化 —— 见账本模块注释。
+     ⚠️ 分母是**输入侧**（`input`），不是 `total`（含输出）：拿 total 当分母会随输出变长
+     系统性低估命中率，正是 issue #154 抱怨的那种「百分比对不上」。 */
+  const hitRatio = 0.62;
+  const gatewayInput = gatewayDays.map((v) => Math.round(v * 0.94));
+  const gatewayCached = gatewayInput.map((v) => Math.round(v * hitRatio));
 
   /* 网关模型：客户端模型放大 + 一个「仅网关」的 auto（真实网关里 auto 路由会出现） */
   const rawModels = u.models.length
@@ -2638,6 +2646,8 @@ function buildLedger(scopeId, u, modelDays) {
       tokens: gatewayTokens, requests: gatewayRows, failed,
       days: gatewayDays, models: gatewayModels, modelDays: gwModelDays,
       accounts: gatewayAccounts, endpoints: gatewayEndpoints,
+      /* issue #154：命中量与逐日值同长；命中率 = `sum(cached) / sum(input)`。 */
+      cached: gatewayCached, input: gatewayInput, hitRatio,
       coverage: `${u.days.length}/${u.days.length} 天`,
     },
     recon: { clientRows, gatewayRows, matched, matchedTokens, ratio: matchedRatio },
@@ -2928,13 +2938,19 @@ const GATEWAY = {
         { time: "13:41:20", from: "claude-sonnet-4.5", path: ["gpt-5-codex", "gemini-2.5-pro"], reason: "server", reasonText: "5xx", account: "主号 B", ms: 2100, result: "failed" },
       ],
     },
+    /* 请求日志夹具（与真实表列集一致：WB 有「版本」+「积分」，Trae 两者都没有）。
+       ★ `credit` 的三种「没有」在夹具里各留一条，否则原型会把三态演成一种：
+         · `0`     = 上游没上报（**不是免费**，表头带提示）；
+         · `0.0005` = 极小非零 ⇒ 表格显示 `<0.001`（不能落成 `0`，那会与上一条撞语义）；
+         · 缺 `credit` 键 = 升级前的老条目 ⇒ 显示 `—`（与「没上报」刻意区分）。
+       取值与 `tokens` 大致同量级（约 1k token ≈ 0.001~0.002 积分），别在这里编「1k token = 0.06」。 */
     logs: [
-      { time: "10:38:12", model: "claude-sonnet-4.5", account: "jackey", status: 200, ms: 842, tokens: 1284 },
-      { time: "10:37:44", model: "gpt-5-codex", account: "team-shared", status: 200, ms: 610, tokens: 402 },
-      { time: "10:36:02", model: "claude-opus-4.1", account: "jackey", status: 200, ms: 1420, tokens: 3105 },
-      { time: "10:34:51", model: "gpt-5-codex", account: "qa-bot", status: 429, ms: 121, tokens: 0 },
-      { time: "10:33:19", model: "claude-sonnet-4.5", account: "jackey", status: 200, ms: 733, tokens: 918 },
-      { time: "10:31:07", model: "gemini-2.5-pro", account: "team-shared", status: 200, ms: 980, tokens: 1642 },
+      { time: "10:38:12", region: "国内版", model: "claude-sonnet-4.5", account: "jackey", status: 200, ms: 842, tokens: 1284, credit: 0.002 },
+      { time: "10:37:44", region: "国际版", model: "gpt-5-codex", account: "team-shared", status: 200, ms: 610, tokens: 402, credit: 0.0005 },
+      { time: "10:36:02", region: "国内版", model: "claude-opus-4.1", account: "jackey", status: 200, ms: 1420, tokens: 3105, credit: 0.004 },
+      { time: "10:34:51", region: "国内版", model: "gpt-5-codex", account: "qa-bot", status: 429, ms: 121, tokens: 0, credit: 0 },
+      { time: "10:33:19", region: "国际版", model: "claude-sonnet-4.5", account: "jackey", status: 200, ms: 733, tokens: 918 },
+      { time: "10:31:07", region: "国内版", model: "gemini-2.5-pro", account: "team-shared", status: 200, ms: 980, tokens: 1642, credit: 0.002 },
     ],
   },
   "wb-global": {
@@ -2943,7 +2959,7 @@ const GATEWAY = {
     models: [{ name: "claude-sonnet-4.5", provider: "anthropic", scope: "国际版", available: true, efforts: ["low", "medium", "high", "xhigh", "max"], defaultEffort: "high", credits: 1.33 }],
     catalog: { source: "cached", fetchedAt: "昨天 21:04", fetchedAbs: "2026-10-02 21:04", note: "本次探测超时（8s），使用上次成功的结果" },
     pool: [{ account: "jackey-global", credits: 720, weight: 100, state: "可用", sticky: true, tier: "free", inFlight: 0, maxInFlight: 2 }],
-    logs: [{ time: "09:12:30", model: "claude-sonnet-4.5", account: "jackey-global", status: 200, ms: 1120, tokens: 640 }],
+    logs: [{ time: "09:12:30", region: "国际版", model: "claude-sonnet-4.5", account: "jackey-global", status: 200, ms: 1120, tokens: 640, credit: 0.0008 }],
   },
   "trae-cn": {
     enabled: true, port: 57892, baseUrl: "http://127.0.0.1:57892",
@@ -3032,12 +3048,14 @@ const GATEWAY = {
           creditsRemaining: 0, parkedUntil: "明天 10:00" },
       ],
     },
+    /* Qoder 的日志键是**复数** `credits`（Rust `qoder/mod.rs` 的 `record_request` 写的就是它）；
+       与 WB 的单数 `credit` 不同名，别在这里「统一」。`0` = 上游没上报（与 status 无关）。 */
     logs: [
-      { time: "10:41:07", model: "Qwen3.8-Max", account: "jackey", status: 200, ms: 764, tokens: 1120 },
-      { time: "10:39:52", model: "GLM-5.1", account: "team-qoder", status: 200, ms: 588, tokens: 486 },
-      { time: "10:38:20", model: "Qwen3.8-Max", account: "jackey", status: 200, ms: 1310, tokens: 2874 },
-      { time: "10:36:44", model: "MiniMax-M3", account: "trial-01", status: 429, ms: 96, tokens: 0 },
-      { time: "10:35:11", model: "GLM-5.1", account: "jackey", status: 200, ms: 702, tokens: 934 },
+      { time: "10:41:07", model: "Qwen3.8-Max", account: "jackey", status: 200, ms: 764, tokens: 1120, credits: 0.05 },
+      { time: "10:39:52", model: "GLM-5.1", account: "team-qoder", status: 200, ms: 588, tokens: 486, credits: 0.04 },
+      { time: "10:38:20", model: "Qwen3.8-Max", account: "jackey", status: 200, ms: 1310, tokens: 2874, credits: 0.11 },
+      { time: "10:36:44", model: "MiniMax-M3", account: "trial-01", status: 429, ms: 96, tokens: 0, credits: 0 },
+      { time: "10:35:11", model: "GLM-5.1", account: "jackey", status: 200, ms: 702, tokens: 934, credits: 0 },
     ],
   },
   "qoder-global": {
@@ -3064,9 +3082,12 @@ const GATEWAY = {
           perModel: [], blocked: null, blockedReason: null, creditsRemaining: 240 },
       ],
     },
+    /* Qoder 的日志键是**复数** `credits`（Rust `qoder/mod.rs` 写的就是它），与 WB 的单数
+       `credit` 不同名。Trae 上游**不回报**积分 ⇒ `trae-cn` / `trae-global` 的夹具刻意不带该字段，
+       页面也就不画那一列（整列恒 0 会被读成「Trae 免费」）。 */
     logs: [
-      { time: "11:05:33", model: "Ultimate", account: "jackey-global", status: 200, ms: 918, tokens: 1416 },
-      { time: "11:02:07", model: "Qwen3.8-Max", account: "jackey-global", status: 200, ms: 655, tokens: 522 },
+      { time: "11:05:33", model: "Ultimate", account: "jackey-global", status: 200, ms: 918, tokens: 1416, credits: 0.11 },
+      { time: "11:02:07", model: "Qwen3.8-Max", account: "jackey-global", status: 200, ms: 655, tokens: 522, credits: 0.05 },
     ],
   },
 };
@@ -4929,6 +4950,22 @@ function bookLabel(book) {
 function fmtCredit(n) {
   return Number(n || 0).toLocaleString("zh-CN", { minimumFractionDigits: 1, maximumFractionDigits: 1 });
 }
+
+/** 请求日志「积分」单元格 —— **逐请求口径**，与上面 `fmtCredit` 的余额口径**刻意不同**。
+ *
+ * 三态不许合并（与真实实现的 `lib/gateway.ts::formatCredit` 同一条规则）：
+ * - `null` / `undefined` ⇒ `—` —— 键不存在（升级前写入的老条目）或值读不出来；
+ * - `0`                  ⇒ `0` —— 上游**确实没上报**（**不是免费**，表头带提示）；
+ * - `0 < v < 0.001`      ⇒ `<0.001` —— 极小但非零，绝不能落成 `0`，否则与上一条撞语义。
+ *
+ * ★ 所以**不能**复用 `fmtCredit`：那支是 `n || 0` + 1 位小数，会把 `null` 抹成 `0.0`、
+ * 把 `0.0005` 抹成 `0.0` —— 两种「没有」正好被它合成一个假数字。 */
+function fmtLogCredit(v) {
+  if (v === null || v === undefined || !Number.isFinite(v)) return "—";
+  if (v === 0) return "0";
+  if (v > 0 && v < 0.001) return "<0.001";
+  return Number(v).toLocaleString("zh-CN", { maximumFractionDigits: 3 });
+}
 const sumArr = (arr) => (arr || []).reduce((a, b) => a + b, 0);
 
 /** 当前视图的账本（只有 WorkBuddy 有；Trae / Qoder 各自的数据源形状不同，见 UsagePage 的平台映射）。 */
@@ -4947,6 +4984,9 @@ function ledgerWindow(L, win, days) {
     labels: days.map((d) => d.label),
     client: cut(L.client.days),
     gateway: cut(L.gateway.days),
+    /* ★ issue #154：命中量与输入量与 `gateway` 同窗口同长（缺字段的老数据给全 0）。 */
+    cached: cut(L.gateway.cached || L.gateway.days.map(() => 0)),
+    input: cut(L.gateway.input || L.gateway.days.map(() => 0)),
     creditsClient: cut(L.credits.dailyClient),
     creditsGateway: cut(L.credits.dailyGateway),
   };
@@ -5003,8 +5043,20 @@ function ledgerTiles(L, book, w, rangeName) {
     ].join("");
   }
   if (book === "gateway") {
+    /* ★ issue #154：网关账本多一张「缓存命中」卡 —— 命中只在网关侧可观测
+       （客户端会话日志的命中量走另一套口径），所以不进「合计」那组。
+       口径：`sum(cached) / sum(input)`，**只看有观测的窗口**；
+       一句都没观测到时显示「—」而不是 0%（0% 会让人去查并不存在的缓存问题）。 */
+    const cachedInWindow = w.cached.reduce((a, b) => a + b, 0);
+    const inputInWindow = w.input.reduce((a, b) => a + b, 0);
+    const hasCacheData = w.cached.some((v) => v > 0);
+    /* 分母是**输入侧**，不是 `gT`（含输出）—— 见 `demo-data.js` 里同一处注释。 */
+    const hitRate = hasCacheData && inputInWindow > 0
+      ? `命中率 ${Math.round((cachedInWindow / inputInWindow) * 100)}%`
+      : "未观测到";
     return [
       statTile("网关 Token", fmtTok(gT), rangeName),
+      statTile("缓存命中", hasCacheData ? fmtTok(cachedInWindow) : "—", hitRate),
       statTile("日均", fmtTok(Math.round(gT / n)), "按自然日平均"),
       statTile("峰值", fmtTok(peakG), "区间内最高一天"),
       statTile("请求数", fmt(L.recon.gatewayRows), `含 ${fmt(L.gateway.failed)} 次失败`),
@@ -6461,7 +6513,10 @@ function gwSubId() {
 function uniOverviewSection() {
   const running = UNI.enabled;
   const onCount = UNI.namespaces.size;
+  /* ★ 两档语义（#165）：`base` 是**根地址**（Anthropic 系要它），`baseV1` 是 OpenAI 基址。
+     接入地址行显示 / 复制的是 `baseV1` —— 与下方「接入说明」同口径，否则照抄必然 404。 */
   const base = `http://127.0.0.1:${UNI.port}`;
+  const baseV1 = `${base}/v1`;
   const tot = uniPoolTotals();
   const verdict = uniVerdict();
   /* 失败态走深链（`?err=unified`），与既有 `?err=gateway` / `?err=usage` 同一口径。 */
@@ -6481,8 +6536,8 @@ function uniOverviewSection() {
       <span class="badge ${verdict.cls}" title="${esc(verdict.hint)}">${verdict.label}</span></div>
     <div class="srow"><div class="lab"><b>启用统一网关</b><span>在 ${esc(UNI.bind)}:${UNI.port} 上提供带命名空间前缀的单一入口</span></div>
       <button class="switch${running ? " on" : ""}" data-act="uni-toggle" aria-label="启用统一网关"></button></div>
-    <div class="srow"><div class="lab"><b>接入地址</b><span class="mono">${base}</span></div>
-      <button class="btn sm" data-act="copy|${base}">${ICON.copy}复制</button></div>
+    <div class="srow"><div class="lab"><b>接入地址</b><span class="mono">${baseV1}</span></div>
+      <button class="btn sm" data-act="copy|${baseV1}">${ICON.copy}复制</button></div>
     <div class="srow"><div class="lab"><b>监听地址</b><span class="mono">${esc(UNI.bind)}${UNI.bind === "0.0.0.0" ? " · 局域网内任何设备都能消耗你的额度" : ""}</span></div>
       <select class="inp" data-uni-bind aria-label="监听地址">
         <option value="127.0.0.1"${UNI.bind === "127.0.0.1" ? " selected" : ""}>仅本机 127.0.0.1</option>
@@ -7365,8 +7420,8 @@ function viewGateway() {
         <span class="badge ${g.enabled ? "ok" : ""}">${g.enabled ? "运行中" : "已停用"}</span></div>
       <div class="srow"><div class="lab"><b>启用本地网关</b><span>在 127.0.0.1 上提供 OpenAI / Anthropic 兼容接口</span></div>
         <button class="switch${g.enabled ? " on" : ""}" data-act="toggle|gw-enabled"></button></div>
-      <div class="srow"><div class="lab"><b>接入地址</b><span class="mono">${g.baseUrl}</span></div>
-        <button class="btn sm" data-act="copy|${g.baseUrl}">${ICON.copy}复制</button></div>
+      <div class="srow"><div class="lab"><b>接入地址</b><span class="mono">${g.baseUrl}/v1</span></div>
+        <button class="btn sm" data-act="copy|${g.baseUrl}/v1">${ICON.copy}复制</button></div>
       <div class="srow"><div class="lab"><b>上游账号凭据</b><span>账号池读取上游凭据的有效性</span></div>
         <button class="btn sm" data-act="gw-verify">${ICON.refresh}校验</button></div>
       <div class="srow"><div class="lab"><b>可用模型</b><span>${g.models.filter((m) => m.available).length} 个</span></div>
@@ -7449,12 +7504,31 @@ function viewGateway() {
   } else if (sub === "proxy") {
     main = proxyPanelHtml();
   } else {
+    /* 列集按平台分化 —— 这是**数据差异**，不是形态差异（与真实
+       `components/gateway/request-log.tsx` / `trae-request-log.tsx` 同一口径）：
+       · WB：有「版本」（每条日志带 `region`）+「积分」（上游 `usage.credit`）；
+       · Qoder：只有「积分」（上游逐请求回报 `usage.credits`，**复数**，无 region 维度）；
+       · Trae：两者都没有 —— 它的上游不回报积分，画一列恒 0 等于宣称「Trae 免费」。 */
+    const platform = curScope().platform;
+    /* 平台标识是 `workbuddy`（不是 `wb`）—— 见 `PLATFORMS` 的键。 */
+    const showRegion = platform === "workbuddy";
+    const showCredit = platform !== "trae";
+    /* 键名不同：WB 单数 `credit`、Qoder 复数 `credits`（Rust `record_request` 写的就是这个）。 */
+    const creditOf = (l) => (platform === "qoder" ? l.credits : l.credit);
+    const creditHint =
+      "本次请求消耗的积分；0 表示上游未上报，不等于免费。逐条相加是请求口径，与「积分」页的余额口径可能不同（重试 / 多设备会重复计入）";
     main = `<div class="tbl-wrap"><table class="tbl">
-      <thead><tr><th>时间</th><th>模型</th><th>上游账号</th><th>状态</th><th>耗时</th><th>Token</th></tr></thead>
+      <thead><tr><th>时间</th>${showRegion ? "<th>版本</th>" : ""}<th>模型</th><th>上游账号</th><th>状态</th><th>耗时</th>${
+        showCredit ? `<th class="num" title="${creditHint}">积分</th>` : ""
+      }<th>Token</th></tr></thead>
       <tbody>${g.logs.map((l) => `<tr>
-        <td class="mono muted nowrap">${l.time}</td><td class="mono">${esc(l.model)}</td><td>${esc(l.account)}</td>
+        <td class="mono muted nowrap">${l.time}</td>${
+          showRegion ? `<td>${esc(l.region || "—")}</td>` : ""
+        }<td class="mono">${esc(l.model)}</td><td>${esc(l.account)}</td>
         <td>${l.status === 200 ? `<span class="badge ok">200</span>` : l.status === 429 ? `<span class="badge warn">429</span>` : `<span class="badge bad">${l.status}</span>`}</td>
-        <td class="num">${l.ms} ms</td><td class="num">${l.tokens ? fmt(l.tokens) : "—"}</td>
+        <td class="num">${l.ms} ms</td>${
+          showCredit ? `<td class="num">${fmtLogCredit(creditOf(l))}</td>` : ""
+        }<td class="num">${l.tokens ? fmt(l.tokens) : "—"}</td>
       </tr>`).join("")}</tbody></table></div>`;
   }
 

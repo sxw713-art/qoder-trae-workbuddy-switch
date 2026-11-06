@@ -7,6 +7,7 @@
 // 因此本文件对 Config 以 snake_case 为准、对 Status 以 camelCase 为准，并各自保留别名兜底。
 
 import { t } from "@/lib/i18n";
+import { gatewayOpenAiBaseUrlFrom } from "@/lib/gateway-url";
 import type {
   GatewayConfig,
   GatewayPoolAccount,
@@ -318,24 +319,61 @@ export function poolOf(status: GatewayStatus | null, region: Region): {
 }
 
 /**
- * 计算对外展示的 Base URL。
+ * 计算对外展示的 **OpenAI 系 Base URL（含 `/v1`）**。
  *
- * 优先使用后端返回的 `baseUrl`；否则按监听地址与端口拼接（兜底，正常不应触发）。
- * `0.0.0.0` 对外不可直接使用，展示时回退为 `127.0.0.1`。
+ * ★ 语义是**单一形态**：无论走「后端 `baseUrl`」还是「按监听地址拼」的分支，返回的都带 `/v1`。
+ * 历史缺陷（#165 / 集成文档附录 B）：两条分支形态不同（后端值是根地址、兜底带 `/v1`），
+ * 消费方按「带 `/v1`」用 ⇒ 主路径少一层、请求 404。现在统一经 `stripV1Suffix` 收敛再拼。
+ *
+ * `0.0.0.0` 对外不可直接使用，展示时归一回环（在 `gateway-url.ts` 里，唯一一处）。
  */
 export function resolveGatewayBaseUrl(
   status: GatewayStatus | null,
   fallbackAddr: string,
   fallbackPort: number,
 ): string {
-  if (status?.baseUrl) return status.baseUrl;
-  const rawHost = status?.addr ?? fallbackAddr;
-  const host = rawHost === "0.0.0.0" ? "127.0.0.1" : rawHost;
-  const port = status?.port ?? fallbackPort;
-  return `http://${host}:${port}/v1`;
+  return gatewayOpenAiBaseUrlFrom(
+    status?.baseUrl,
+    status?.addr ?? fallbackAddr,
+    status?.port ?? fallbackPort,
+  );
 }
 
 /** 网关进程是否实际在监听（缺省视为已停止）。 */
 export function resolveGatewayRunning(status: GatewayStatus | null): boolean {
   return status?.running ?? false;
+}
+
+/**
+ * 请求日志里「积分」单元格的显示口径 —— **两个日志表共用**（WB 的 `request-log.tsx`
+ * 与 Qoder/Trae 共用的 `trae-request-log.tsx`）。
+ *
+ * 放在 `lib` 而不是各自组件里：这是一个**有业务语义**的格式（不是 `formatTokens` 那种
+ * 纯数字美化），它承载「三种没有」的区分规则。复制两份必然漂移，而漂移的后果是
+ * 「同一个账号在两个页面显示成两笔不同的钱」。
+ *
+ * ## 三种「没有」，不许合并
+ *
+ * | 输入 | 显示 | 含义 |
+ * |---|---|---|
+ * | `null` / `undefined` | `—` | 键不存在（升级前老条目）或值读不出来 |
+ * | `0` | `0` | 上游**确实没上报** —— 不是免费，表头带提示 |
+ * | `0 < v < 0.001` | `<0.001` | 极小但非零。绝不能落到 `"0"`，否则与上一行撞语义 |
+ *
+ * 保留三位小数、不取整：上游给的就是小数，取整会把 `0.02` 抹成 `0`，与「没报」撞车。
+ * 当初取值依据是一次性本机抽样（约 160/200 条 `credit > 0`，落在 0.02 ~ 0.20；
+ * 其余约 40 条为 `0` 且全部是 status 200）—— **无持久化样本、上游计价变化即失效**，
+ * 只用来解释精度决策，不是口径契约，别据此写断言。
+ *
+ * 与 `components/usage/format.ts` 的 `formatCredits`（最多 2 位、余额/聚合口径）
+ * **刻意不同名也不同精度**：那边抹掉第三位无妨，这边第三位是「花了钱」与「没报」
+ * 的分界。别把两者合并或互相替换。
+ */
+export function formatCredit(value: number | null | undefined): string {
+  if (value == null || !Number.isFinite(value)) return "—";
+  /* `-0` 会被 `Intl.NumberFormat` 渲染成字符串 `"-0"`（`-0 === 0` 但符号位还在），
+     那种格子看起来像「退了一笔钱」。零就是零。 */
+  if (value === 0) return "0";
+  if (value > 0 && value < 0.001) return "<0.001";
+  return new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 3 }).format(value);
 }

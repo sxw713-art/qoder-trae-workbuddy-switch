@@ -1450,6 +1450,22 @@ function bookLabel(book) {
 function fmtCredit(n) {
   return Number(n || 0).toLocaleString("zh-CN", { minimumFractionDigits: 1, maximumFractionDigits: 1 });
 }
+
+/** 请求日志「积分」单元格 —— **逐请求口径**，与上面 `fmtCredit` 的余额口径**刻意不同**。
+ *
+ * 三态不许合并（与真实实现的 `lib/gateway.ts::formatCredit` 同一条规则）：
+ * - `null` / `undefined` ⇒ `—` —— 键不存在（升级前写入的老条目）或值读不出来；
+ * - `0`                  ⇒ `0` —— 上游**确实没上报**（**不是免费**，表头带提示）；
+ * - `0 < v < 0.001`      ⇒ `<0.001` —— 极小但非零，绝不能落成 `0`，否则与上一条撞语义。
+ *
+ * ★ 所以**不能**复用 `fmtCredit`：那支是 `n || 0` + 1 位小数，会把 `null` 抹成 `0.0`、
+ * 把 `0.0005` 抹成 `0.0` —— 两种「没有」正好被它合成一个假数字。 */
+function fmtLogCredit(v) {
+  if (v === null || v === undefined || !Number.isFinite(v)) return "—";
+  if (v === 0) return "0";
+  if (v > 0 && v < 0.001) return "<0.001";
+  return Number(v).toLocaleString("zh-CN", { maximumFractionDigits: 3 });
+}
 const sumArr = (arr) => (arr || []).reduce((a, b) => a + b, 0);
 
 /** 当前视图的账本（只有 WorkBuddy 有；Trae / Qoder 各自的数据源形状不同，见 UsagePage 的平台映射）。 */
@@ -1468,6 +1484,9 @@ function ledgerWindow(L, win, days) {
     labels: days.map((d) => d.label),
     client: cut(L.client.days),
     gateway: cut(L.gateway.days),
+    /* ★ issue #154：命中量与输入量与 `gateway` 同窗口同长（缺字段的老数据给全 0）。 */
+    cached: cut(L.gateway.cached || L.gateway.days.map(() => 0)),
+    input: cut(L.gateway.input || L.gateway.days.map(() => 0)),
     creditsClient: cut(L.credits.dailyClient),
     creditsGateway: cut(L.credits.dailyGateway),
   };
@@ -1524,8 +1543,20 @@ function ledgerTiles(L, book, w, rangeName) {
     ].join("");
   }
   if (book === "gateway") {
+    /* ★ issue #154：网关账本多一张「缓存命中」卡 —— 命中只在网关侧可观测
+       （客户端会话日志的命中量走另一套口径），所以不进「合计」那组。
+       口径：`sum(cached) / sum(input)`，**只看有观测的窗口**；
+       一句都没观测到时显示「—」而不是 0%（0% 会让人去查并不存在的缓存问题）。 */
+    const cachedInWindow = w.cached.reduce((a, b) => a + b, 0);
+    const inputInWindow = w.input.reduce((a, b) => a + b, 0);
+    const hasCacheData = w.cached.some((v) => v > 0);
+    /* 分母是**输入侧**，不是 `gT`（含输出）—— 见 `demo-data.js` 里同一处注释。 */
+    const hitRate = hasCacheData && inputInWindow > 0
+      ? `命中率 ${Math.round((cachedInWindow / inputInWindow) * 100)}%`
+      : "未观测到";
     return [
       statTile("网关 Token", fmtTok(gT), rangeName),
+      statTile("缓存命中", hasCacheData ? fmtTok(cachedInWindow) : "—", hitRate),
       statTile("日均", fmtTok(Math.round(gT / n)), "按自然日平均"),
       statTile("峰值", fmtTok(peakG), "区间内最高一天"),
       statTile("请求数", fmt(L.recon.gatewayRows), `含 ${fmt(L.gateway.failed)} 次失败`),
@@ -2982,7 +3013,10 @@ function gwSubId() {
 function uniOverviewSection() {
   const running = UNI.enabled;
   const onCount = UNI.namespaces.size;
+  /* ★ 两档语义（#165）：`base` 是**根地址**（Anthropic 系要它），`baseV1` 是 OpenAI 基址。
+     接入地址行显示 / 复制的是 `baseV1` —— 与下方「接入说明」同口径，否则照抄必然 404。 */
   const base = `http://127.0.0.1:${UNI.port}`;
+  const baseV1 = `${base}/v1`;
   const tot = uniPoolTotals();
   const verdict = uniVerdict();
   /* 失败态走深链（`?err=unified`），与既有 `?err=gateway` / `?err=usage` 同一口径。 */
@@ -3002,8 +3036,8 @@ function uniOverviewSection() {
       <span class="badge ${verdict.cls}" title="${esc(verdict.hint)}">${verdict.label}</span></div>
     <div class="srow"><div class="lab"><b>启用统一网关</b><span>在 ${esc(UNI.bind)}:${UNI.port} 上提供带命名空间前缀的单一入口</span></div>
       <button class="switch${running ? " on" : ""}" data-act="uni-toggle" aria-label="启用统一网关"></button></div>
-    <div class="srow"><div class="lab"><b>接入地址</b><span class="mono">${base}</span></div>
-      <button class="btn sm" data-act="copy|${base}">${ICON.copy}复制</button></div>
+    <div class="srow"><div class="lab"><b>接入地址</b><span class="mono">${baseV1}</span></div>
+      <button class="btn sm" data-act="copy|${baseV1}">${ICON.copy}复制</button></div>
     <div class="srow"><div class="lab"><b>监听地址</b><span class="mono">${esc(UNI.bind)}${UNI.bind === "0.0.0.0" ? " · 局域网内任何设备都能消耗你的额度" : ""}</span></div>
       <select class="inp" data-uni-bind aria-label="监听地址">
         <option value="127.0.0.1"${UNI.bind === "127.0.0.1" ? " selected" : ""}>仅本机 127.0.0.1</option>
@@ -3886,8 +3920,8 @@ function viewGateway() {
         <span class="badge ${g.enabled ? "ok" : ""}">${g.enabled ? "运行中" : "已停用"}</span></div>
       <div class="srow"><div class="lab"><b>启用本地网关</b><span>在 127.0.0.1 上提供 OpenAI / Anthropic 兼容接口</span></div>
         <button class="switch${g.enabled ? " on" : ""}" data-act="toggle|gw-enabled"></button></div>
-      <div class="srow"><div class="lab"><b>接入地址</b><span class="mono">${g.baseUrl}</span></div>
-        <button class="btn sm" data-act="copy|${g.baseUrl}">${ICON.copy}复制</button></div>
+      <div class="srow"><div class="lab"><b>接入地址</b><span class="mono">${g.baseUrl}/v1</span></div>
+        <button class="btn sm" data-act="copy|${g.baseUrl}/v1">${ICON.copy}复制</button></div>
       <div class="srow"><div class="lab"><b>上游账号凭据</b><span>账号池读取上游凭据的有效性</span></div>
         <button class="btn sm" data-act="gw-verify">${ICON.refresh}校验</button></div>
       <div class="srow"><div class="lab"><b>可用模型</b><span>${g.models.filter((m) => m.available).length} 个</span></div>
@@ -3970,12 +4004,31 @@ function viewGateway() {
   } else if (sub === "proxy") {
     main = proxyPanelHtml();
   } else {
+    /* 列集按平台分化 —— 这是**数据差异**，不是形态差异（与真实
+       `components/gateway/request-log.tsx` / `trae-request-log.tsx` 同一口径）：
+       · WB：有「版本」（每条日志带 `region`）+「积分」（上游 `usage.credit`）；
+       · Qoder：只有「积分」（上游逐请求回报 `usage.credits`，**复数**，无 region 维度）；
+       · Trae：两者都没有 —— 它的上游不回报积分，画一列恒 0 等于宣称「Trae 免费」。 */
+    const platform = curScope().platform;
+    /* 平台标识是 `workbuddy`（不是 `wb`）—— 见 `PLATFORMS` 的键。 */
+    const showRegion = platform === "workbuddy";
+    const showCredit = platform !== "trae";
+    /* 键名不同：WB 单数 `credit`、Qoder 复数 `credits`（Rust `record_request` 写的就是这个）。 */
+    const creditOf = (l) => (platform === "qoder" ? l.credits : l.credit);
+    const creditHint =
+      "本次请求消耗的积分；0 表示上游未上报，不等于免费。逐条相加是请求口径，与「积分」页的余额口径可能不同（重试 / 多设备会重复计入）";
     main = `<div class="tbl-wrap"><table class="tbl">
-      <thead><tr><th>时间</th><th>模型</th><th>上游账号</th><th>状态</th><th>耗时</th><th>Token</th></tr></thead>
+      <thead><tr><th>时间</th>${showRegion ? "<th>版本</th>" : ""}<th>模型</th><th>上游账号</th><th>状态</th><th>耗时</th>${
+        showCredit ? `<th class="num" title="${creditHint}">积分</th>` : ""
+      }<th>Token</th></tr></thead>
       <tbody>${g.logs.map((l) => `<tr>
-        <td class="mono muted nowrap">${l.time}</td><td class="mono">${esc(l.model)}</td><td>${esc(l.account)}</td>
+        <td class="mono muted nowrap">${l.time}</td>${
+          showRegion ? `<td>${esc(l.region || "—")}</td>` : ""
+        }<td class="mono">${esc(l.model)}</td><td>${esc(l.account)}</td>
         <td>${l.status === 200 ? `<span class="badge ok">200</span>` : l.status === 429 ? `<span class="badge warn">429</span>` : `<span class="badge bad">${l.status}</span>`}</td>
-        <td class="num">${l.ms} ms</td><td class="num">${l.tokens ? fmt(l.tokens) : "—"}</td>
+        <td class="num">${l.ms} ms</td>${
+          showCredit ? `<td class="num">${fmtLogCredit(creditOf(l))}</td>` : ""
+        }<td class="num">${l.tokens ? fmt(l.tokens) : "—"}</td>
       </tr>`).join("")}</tbody></table></div>`;
   }
 

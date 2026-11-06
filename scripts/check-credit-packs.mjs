@@ -13,7 +13,8 @@
  *
  * ## 钉住四条
  *
- * 1. **秒 → 毫秒**：`secondsToMs` 之后必须落在 2026 年，而不是 1970（#144 的指纹）；
+ * 1. **秒 → 毫秒**：`secondsToMs` 之后必须等于 2026-11-21 02:40（+08:00），而不是 1970
+ *    （#144 的指纹）。注意断言的是**固定 fixture 的换算结果**，不读系统时钟 —— 与运行日历无关；
  * 2. **`remaining <= 0` / `total <= 0` 剔除**（#143 / #144 共用的判据）；
  * 3. **排序**：已过期垫底 → 未过期按到期升序 → `null`（永久）垫在未过期的最后；
  * 4. **`ratio` 是 0..100**（抽屉直接拼 `%`，给 0..1 就是 1/100 宽的进度条）。
@@ -24,7 +25,7 @@
  * 用法：`node scripts/check-credit-packs.mjs`（已挂进 `npm run check:scope`）。
  */
 
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync, statSync } from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import path from "node:path";
 
@@ -43,6 +44,18 @@ async function loadTs(relative) {
 const { normalizePacks, toDetailPacks, packIsExpired, packRatio, secondsToMs } = await loadTs(
   "src/lib/credit-packs.ts",
 );
+/* 临期窗口的镜像常量（#144 复核 §3.3）：与后端 `EXPIRING_SOON_SECS` 必须同值。 */
+const { TRAE_EXPIRING_SOON_MS } = await loadTs("src/lib/credit-expiry.ts");
+
+/** 递归列出 `src/**` 的 ts/tsx（用法断言的扫描面）。 */
+function walkTs(dir, out = []) {
+  for (const entry of readdirSync(dir)) {
+    const abs = path.join(dir, entry);
+    if (statSync(abs).isDirectory()) walkTs(abs, out);
+    else if (/\.(ts|tsx)$/.test(entry)) out.push(abs);
+  }
+  return out;
+}
 
 let failed = 0;
 let passed = 0;
@@ -78,16 +91,15 @@ const pack = (over = {}) => ({
   ...over,
 });
 
-check("★ 秒 → 毫秒：Trae 的 Unix 秒必须落在 2026 年，不是 1970（#144 回归）", () => {
+check("★ 秒 → 毫秒：Trae 的 Unix 秒必须换算成 2026-11-21 02:40（+08:00），不是 1970（#144 回归）", () => {
   const ms = secondsToMs(SEC_2026_11_21);
   eq(ms, SEC_2026_11_21 * 1000, "secondsToMs 的倍率");
-  const year = new Date(ms).getUTCFullYear();
-  if (year !== 2026) {
-    throw new Error(`按毫秒解释后落在 ${year} 年 —— 这正是「1970-01-22」的成因`);
-  }
-  /* 反证：直接当毫秒解释会落到 1970（把错误方向也钉住，避免有人「顺手」改回裸值）。 */
-  const wrong = new Date(SEC_2026_11_21).getUTCFullYear();
-  eq(wrong, 1970, "未换算时的年份（这是错误方向，仅作对照）");
+  /* 钉住绝对值：输入是常量、不读 `Date.now()`，所以这条断言与运行年份无关
+     （2027 年跑同样是这个时刻，不是「必须在 2026 年」）。 */
+  eq(new Date(ms).toISOString(), "2026-11-20T18:40:00.000Z", "换算后的绝对时刻（= 2026-11-21 02:40 +08:00）");
+  /* 反证：直接当毫秒解释会落到 1970-01-22 02:40（+08:00，即截图里那串时间的来源）——
+     把错误方向也钉住，避免有人「顺手」改回裸值。 */
+  eq(new Date(SEC_2026_11_21).toISOString(), "1970-01-21T18:40:00.000Z", "未换算时的时刻（这是错误方向，仅作对照）");
   eq(secondsToMs(null), null, "null 必须原样透传（永久有效 ≠ 0）");
 });
 
@@ -239,10 +251,36 @@ check("★ 打上游的三处自动刷新都接到 opt-in 开关（新增视图�
   }
 });
 
+/* ── 临期窗口：只认后端标记，缺标记时用**镜像常量**（#144 复核 §3.3）────────
+ *
+ * 这条失败模式很隐蔽：同一个包在卡片上说「临期」、点开抽屉却不说 —— 因为两处用了
+ * 不同窗口（前端写死 7 天 vs 后端 14 天）。#144 复核当时数出五处实现，其中三处是
+ * 前端自设窗口；现在收敛成「后端标记 + 一个镜像常量」。
+ */
+check("★ 临期窗口只剩两档：后端标记，或镜像后端的 14 天常量（不许再写死 7 天）", () => {
+  eq(TRAE_EXPIRING_SOON_MS, 14 * DAY, "TRAE_EXPIRING_SOON_MS 必须镜像后端 EXPIRING_SOON_SECS");
+  const offenders = [];
+  for (const file of walkTs(path.join(root, "src"))) {
+    const code = readFileSync(file, "utf8")
+      .split("\n")
+      .filter((line) => !/^\s*(\*|\/\/|\/\*)/.test(line))
+      .join("\n");
+    /* 只抓「7 天窗口」这一种写法：`7 * 86_400_000` / `7 * 86400000` / `7 * 24 * 3600`。 */
+    if (/\b7\s*\*\s*(?:86_?400_?000|24\s*\*\s*3600)/.test(code)) {
+      offenders.push(path.relative(root, file));
+    }
+  }
+  if (offenders.length > 0) {
+    throw new Error(
+      `这些文件仍在前端自设 7 天临期窗口（应用后端标记或 TRAE_EXPIRING_SOON_MS）：${offenders.join("、")}`,
+    );
+  }
+});
+
 if (failed > 0) {
   console.error(`\ncredit-packs 门禁：${passed} 通过 / ${failed} 失败`);
   process.exit(1);
 }
 console.log(
-  `credit-packs 门禁：${passed} 项通过（秒→毫秒 · 过滤 · 排序 · ratio · 临期标记 · 调用点 · opt-in 接线）`,
+  `credit-packs 门禁：${passed} 项通过（秒→毫秒 · 过滤 · 排序 · ratio · 临期标记 · 调用点 · opt-in 接线 · 临期窗口）`,
 );

@@ -161,7 +161,6 @@ export const zh = {
   "wbStats.gateway.revoke": "吊销",
   "wbStats.gateway.restore": "恢复",
   "wbStats.gateway.nameRequired": "请填写名称",
-  "wbStats.gateway.createdNoPlaintext": "创建成功但未返回明文，请重试",
   "wbStats.gateway.createFail": "创建失败",
   "wbStats.gateway.revokedToast": "已吊销",
   "wbStats.gateway.revokeFail": "吊销失败",
@@ -176,10 +175,6 @@ export const zh = {
   "wbStats.gateway.regionLabel": "归属版本",
   "wbStats.gateway.regionAria": "归属版本",
   "wbStats.gateway.create": "创建",
-  "wbStats.gateway.createdTitle": "API Key 已创建",
-  "wbStats.gateway.createdDesc": "完整 Key 只显示这一次，请立即复制保存。",
-  "wbStats.gateway.keyCopied": "API Key 已复制",
-  "wbStats.gateway.savedClose": "我已保存，关闭",
   "wbStats.gateway.revokeTitle": "吊销 API Key",
   "wbStats.gateway.revokeDesc": "吊销后「{name}」立即失效（401），列表中保留为「已吊销」状态。",
   "wbStats.gateway.deleteTitle": "删除 API Key",
@@ -199,6 +194,14 @@ export const zh = {
   "wbStats.gateway.log.col.model": "模型",
   "wbStats.gateway.log.col.status": "状态",
   "wbStats.gateway.log.col.latency": "耗时",
+  "wbStats.gateway.log.col.credit": "积分",
+  /* 「积分」列的表头提示：0 是**上游没上报**，不是免费 —— 后端日志里
+     `credit: 0` 与「这次真没花积分」不可区分，只能如实标注来源缺失。
+     第二句防的是另一个误解：**逐条相加 ≠ 「积分」页的数字**（那边是余额口径，
+     权威但不重复；这边是请求口径，重试 / 多设备会重复计入）。
+     ⚠️ 与 `shared.gateway.log.col.creditHint` 成对维护（只差上游字段名），改一处要同步另一处。 */
+  "wbStats.gateway.log.col.creditHint":
+    "本次请求消耗的积分（上游 usage.credit）；0 表示上游未上报，不等于免费。逐条相加是请求口径，与「积分」页的余额口径可能不同（重试 / 多设备会重复计入）",
   "wbStats.gateway.log.col.tokens": "Token",
   // 「账号策略」卡已被**两侧共用的账号池卡**取代（策略三档并入卡上的「指定账号」
   // 下拉），下列键随之作废并删除；保存结果的两条仍在使用。
@@ -301,6 +304,10 @@ export const zh = {
   "wbStats.usage.trend.requests": "请求数",
   "wbStats.usage.trend.requestsHint": "客户端按会话日志条目；网关按日志条数",
   "wbStats.usage.trend.gatewayNoHours": "网关日志只记时间戳与耗时：能算逐日，不能算「一周七天 × 24 小时」。要按小时看，请切到客户端账本。",
+  "wbStats.usage.trend.cacheHit": "缓存命中",
+  "wbStats.usage.trend.cacheHitHint": "命中率 {rate} · 输入 {input}",
+  "wbStats.usage.trend.cacheHitUnobserved": "窗口内未观测到命中量",
+  "wbStats.usage.trend.cacheHitTitle": "经本网关的输入里，命中上游前缀缓存的部分。分母是输入侧（不含输出），与「命中量被算两遍」是两回事 —— 后者曾让命中率凭空腰斩到 50%（#154）",
   "wbStats.usage.trend.totalClient": "客户端 Token",
   "wbStats.usage.trend.totalGateway": "网关 Token",
   "wbStats.usage.trend.totalCombined": "合计 Token",
@@ -350,6 +357,7 @@ export const zh = {
   "wbStats.usage.models.colTokens": "Token",
   "wbStats.usage.models.colShare": "占比",
   "wbStats.usage.models.colRequests": "请求",
+  "wbStats.usage.models.colCacheHit": "命中率",
   "wbStats.usage.models.colFailed": "失败",
   "wbStats.usage.models.dailyTitle": "每日 Token · 按模型",
   "wbStats.usage.models.clientNoFail": "客户端账本不记请求失败 —— 会话日志只留成功落盘的条目",

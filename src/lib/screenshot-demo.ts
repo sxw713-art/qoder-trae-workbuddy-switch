@@ -872,8 +872,10 @@ function demoApiKeys(): ApiKeyRecord[] {
      列表按 `prefix••••••••suffix` 渲染。夹具缺它 ⇒ 演示站显示 `sk-wb-a1b2…`
      而真机显示 `sk-wb-a1b2••••••••7d31` —— 那正是「演示数据自造结构」的红线。 */
   return [
-    { id: "demo-key-1", name: "Cursor", region: "cn", prefix: "sk-wb-a1b2", suffix: "7d31", createdAt: atLocalTime(3, 17, 3), revokedAt: null, revoked: false, lastUsedAt: atLocalTime(0, 17, 10) },
-    { id: "demo-key-2", name: "Claude Code", region: "global", prefix: "sk-wb-c3d4", suffix: "9e02", createdAt: atLocalTime(3, 17, 5), revokedAt: null, revoked: false, lastUsedAt: atLocalTime(0, 16, 41) },
+    /* ★ 前两把带 `plaintext`（列表里点眼睛可看，演示也能看到新形态）；
+       第三把刻意**不带** —— 旧台账形态：只有掩码、没有眼睛。 */
+    { id: "demo-key-1", name: "Cursor", region: "cn", prefix: "sk-wb-a1b2", suffix: "7d31", plaintext: "sk-wb-a1b2c3d4e5f60718293a4b5c6d7e7d31", createdAt: atLocalTime(3, 17, 3), revokedAt: null, revoked: false, lastUsedAt: atLocalTime(0, 17, 10) },
+    { id: "demo-key-2", name: "Claude Code", region: "global", prefix: "sk-wb-c3d4", suffix: "9e02", plaintext: "sk-wb-c3d4e5f6a1b2c3d4e5f60718293a9e02", createdAt: atLocalTime(3, 17, 5), revokedAt: null, revoked: false, lastUsedAt: atLocalTime(0, 16, 41) },
     { id: "demo-key-3", name: "OpenWebUI", region: "cn", prefix: "sk-wb-e5f6", suffix: "b4a8", createdAt: atLocalTime(4, 10, 0), revokedAt: atLocalTime(1, 12, 30), revoked: true, lastUsedAt: atLocalTime(2, 9, 12) },
   ];
 }
@@ -929,12 +931,27 @@ function demoStrategyMap(): AccountStrategyMap {
   };
 }
 
+/** 请求日志夹具 —— 带 `credit`，与真实日志同形（上游报 `usage.credit`）。
+ *
+ * ## 为什么 token 是十万级
+ *
+ * 真实日志的 prompt 动辄 12 万（长上下文 + 缓存命中）；一次本机抽样的每 1k token
+ * 约 0.0003 ~ 0.0105 积分（中位 0.0013）—— **只用来给夹具取量级，不是计价口径**
+ * （无持久化样本，上游改价即失效）。夹具若沿用「800 token / 0.06 积分」这种
+ * 组合，两列放在一起就不成立 —— 那等于教读者「1k token = 0.06 积分」，差 40 倍。
+ * 所以这里 token 取真实量级、`credit` 按同比例给。
+ *
+ * `credit: 0` 表示上游没带 usage（后端写 0.0），**与 status 无关**：失败行没有 usage，
+ * 成功行也可能缺。真实数据里 `0` 主要来自 status 200 的上报缺失 —— 夹具因此特意放
+ * 一条「200 且 0」的行，免得截图把「0」教成「失败专属」（那正是表头提示
+ * 「0 ≠ 免费」要防的误解）。 */
 function demoGatewayLogs(): GatewayLogEntry[] {
   return [
-    { ts: atLocalTime(0, 17, 10), endpoint: "/v1/chat/completions", method: "POST", region: "cn", account: t("shared.demo.account.a"), model: "GLM-5.3", status: 200, latencyMs: 1200, promptTokens: 800, completionTokens: 434, stream: true },
-    { ts: atLocalTime(0, 17, 9), endpoint: "/v1/messages", method: "POST", region: "global", account: t("shared.demo.account.b"), model: "GPT-5.6", status: 402, latencyMs: 800, promptTokens: null, completionTokens: null, stream: true },
-    { ts: atLocalTime(0, 17, 7), endpoint: "/v1/chat/completions", method: "POST", region: "cn", account: t("shared.demo.account.a"), model: "DeepSeek-V4-Pro", status: 200, latencyMs: 2400, promptTokens: 2100, completionTokens: 900, stream: true },
-    { ts: atLocalTime(0, 17, 2), endpoint: "/v1/messages", method: "POST", region: "global", account: t("shared.demo.account.b"), model: "Claude-Sonnet-4.5", status: 429, latencyMs: 300, promptTokens: null, completionTokens: null, stream: true },
+    { ts: atLocalTime(0, 17, 10), endpoint: "/v1/chat/completions", method: "POST", region: "cn", account: t("shared.demo.account.a"), model: "GLM-5.3", status: 200, latencyMs: 1200, promptTokens: 121400, completionTokens: 1380, credit: 0.05, stream: true },
+    { ts: atLocalTime(0, 17, 9), endpoint: "/v1/messages", method: "POST", region: "global", account: t("shared.demo.account.b"), model: "GPT-5.6", status: 402, latencyMs: 800, promptTokens: null, completionTokens: null, credit: 0, stream: true },
+    { ts: atLocalTime(0, 17, 7), endpoint: "/v1/chat/completions", method: "POST", region: "cn", account: t("shared.demo.account.a"), model: "DeepSeek-V4-Pro", status: 200, latencyMs: 2400, promptTokens: 142000, completionTokens: 2100, credit: 0.13, stream: true },
+    { ts: atLocalTime(0, 17, 5), endpoint: "/v1/chat/completions", method: "POST", region: "cn", account: t("shared.demo.account.a"), model: "DeepSeek-V4-Pro", status: 200, latencyMs: 1900, promptTokens: 98000, completionTokens: 760, credit: 0, stream: true },
+    { ts: atLocalTime(0, 17, 2), endpoint: "/v1/messages", method: "POST", region: "global", account: t("shared.demo.account.b"), model: "Claude-Sonnet-4.5", status: 429, latencyMs: 300, promptTokens: null, completionTokens: null, credit: 0, stream: true },
   ];
 }
 
@@ -1138,28 +1155,40 @@ function demoGatewayUsageDim(): GatewayUsageDim {
       const accountTokens = spread(day.total, accountWeights);
       const endpointRequests = spread(Math.max(1, Math.round(day.total / 148000)), endpointWeights);
       const failed = index % 7 === 3 ? 5 : index % 5 === 0 ? 2 : 0;
+      /* ★ issue #154：演示命中量。真实值 95%+，这里取 0.86 让「命中率」列**可辨认**
+         （满格 99% 看不出对比）。命中量是 `input` 的子集，`total` 不因它变化。
+         每个模型给不同比例 —— 命中率那一列的用处正是「哪个模型没命中」。 */
+      const hitRatios = [0.94, 0.72, 0.55, 0.9];
       return {
         key: day.key,
         truncated: day.truncated,
         partial: index === 0,
-        models: modelTokens.map((total, i) => ({
-          model: models[i],
-          input: Math.round(total * 0.9),
-          output: total - Math.round(total * 0.9),
-          total,
-          requests: Math.max(1, Math.round(total / 148000)),
-          failed: i === 0 ? failed : 0,
-          credit: Math.round((total / 34000) * 1000) / 1000,
-        })),
-        accounts: accountTokens.map((total, i) => ({
-          account: accounts[i],
-          input: Math.round(total * 0.9),
-          output: total - Math.round(total * 0.9),
-          total,
-          requests: Math.max(1, Math.round(total / 148000)),
-          failed: i === 0 ? failed : 0,
-          credit: Math.round((total / 34000) * 1000) / 1000,
-        })),
+        models: modelTokens.map((total, i) => {
+          const input = Math.round(total * 0.9);
+          return {
+            model: models[i],
+            input,
+            output: total - input,
+            total,
+            cached: Math.round(input * (hitRatios[i] ?? 0.8)),
+            requests: Math.max(1, Math.round(total / 148000)),
+            failed: i === 0 ? failed : 0,
+            credit: Math.round((total / 34000) * 1000) / 1000,
+          };
+        }),
+        accounts: accountTokens.map((total, i) => {
+          const input = Math.round(total * 0.9);
+          return {
+            account: accounts[i],
+            input,
+            output: total - input,
+            total,
+            cached: Math.round(input * (hitRatios[i] ?? 0.8)),
+            requests: Math.max(1, Math.round(total / 148000)),
+            failed: i === 0 ? failed : 0,
+            credit: Math.round((total / 34000) * 1000) / 1000,
+          };
+        }),
         endpoints: endpointRequests.map((requests, i) => ({
           endpoint: endpoints[i],
           input: 0,
@@ -1169,15 +1198,19 @@ function demoGatewayUsageDim(): GatewayUsageDim {
           failed: i === 0 ? failed : 0,
           credit: 0,
         })),
-        keys: keyTokens.map((total, i) => ({
-          key: keyBuckets[i],
-          input: Math.round(total * 0.9),
-          output: total - Math.round(total * 0.9),
-          total,
-          requests: Math.max(1, Math.round(total / 148000)),
-          failed: i === 0 ? failed : 0,
-          credit: Math.round((total / 34000) * 1000) / 1000,
-        })),
+        keys: keyTokens.map((total, i) => {
+          const input = Math.round(total * 0.9);
+          return {
+            key: keyBuckets[i],
+            input,
+            output: total - input,
+            total,
+            cached: Math.round(input * (hitRatios[i] ?? 0.8)),
+            requests: Math.max(1, Math.round(total / 148000)),
+            failed: i === 0 ? failed : 0,
+            credit: Math.round((total / 34000) * 1000) / 1000,
+          };
+        }),
         /* 首日只是下界（v4 之前没有 key 维度）—— 演示「覆盖披露」那一行。 */
         keysPartial: index === 0,
       };
@@ -2445,7 +2478,8 @@ function demoQoderGatewayModels(scope: string): unknown {
 }
 
 /**
- * Qoder 多 Key（脱敏；**明文 / 哈希一律不出现**）。
+ * Qoder 多 Key（脱敏；**不下发 hash**）。前两把带 `plaintext`（演示「保存到本软件」之后
+ * 的形态，列表里点眼睛可看），第三把刻意保持旧形态（无明文 ⇒ 不出眼睛）。
  *
  * 每个区域各一组，且**都带一条已吊销的**（与 WB / Trae 演示数据同形）：已吊销行必须
  * 同时给出「恢复 + 删除」两个出口，这条产品纪律要在演示里就能看见。
@@ -2459,6 +2493,7 @@ function demoQoderApiKeys(): { keys: unknown[] } {
         region: "cn",
         prefix: "sk-qoder-5b2e",
         suffix: "c14f",
+        plaintext: "sk-qoder-5b2e0f7c9a1d4b6e8f2a3c5d7e9b1c14f",
         createdAt: atLocalTime(23, 10, 12),
         revokedAt: null,
         revoked: false,
@@ -2470,6 +2505,7 @@ function demoQoderApiKeys(): { keys: unknown[] } {
         region: "cn",
         prefix: "sk-qoder-9a07",
         suffix: "4e83",
+        plaintext: "sk-qoder-9a07123456789abcdef0123456789a4e83",
         createdAt: atLocalTime(13, 15, 40),
         revokedAt: atLocalTime(1, 9, 20),
         revoked: true,
@@ -2490,14 +2526,24 @@ function demoQoderApiKeys(): { keys: unknown[] } {
   };
 }
 
-/** Qoder 请求日志（元数据；条目带 `region` —— 一本日志记两个区域的请求）。 */
+/** Qoder 请求日志（元数据；条目带 `region` —— 一本日志记两个区域的请求）。
+ *
+ * `credits` 是**复数**：Rust 侧 `qoder/mod.rs` 的 `record_request` 写的就是这个键，
+ * 与 WB 的单数 `credit` 不同名（前端由 `QoderGatewayLogEntry` 区分，别在这里"统一"）。
+ * `0` 来自 `usage_credits` 的兜底（usage 没有可用 credits 就返回 0.0），**与 status 无关**：
+ * 成功行也可能写 0，故夹具特意放一条「200 且 0」，与 WB 侧同一口径。
+ *
+ * ⚠️ 这里**不声称** token 与 credits 有可换算关系：本机没有任何 Qoder 历史日志可对照，
+ * Qoder 的计价是上游按 credits 结算（可能含按次/模型倍率），不像 WB 那样近似线性于 token。
+ * 取值只求与 WB 同数量级、看着不荒谬，别拿它当换算样例。 */
 function demoQoderGatewayLogs(): unknown {
   const now = Math.floor(Date.now() / 1000);
   const logs = [
-    { ts: (now - 70) * 1000, endpoint: "/v1/chat/completions", method: "POST", region: "cn", account: "q1", model: "Qwen3.8-Max", status: 200, latencyMs: 764, promptTokens: 1420, completionTokens: 386, stream: true, error: null },
-    { ts: (now - 620) * 1000, endpoint: "/v1/messages", method: "POST", region: "cn", account: "q1", model: "GLM-5.1", status: 200, latencyMs: 588, promptTokens: 986, completionTokens: 254, stream: false, error: null },
-    { ts: (now - 1800) * 1000, endpoint: "/v1/chat/completions", method: "POST", region: "cn", account: "q3", model: "MiniMax-M3", status: 429, latencyMs: 96, promptTokens: 0, completionTokens: 0, stream: true, error: t("shared.demo.qoder.gateway.modelRateLimited") },
-    { ts: (now - 4200) * 1000, endpoint: "/v1/chat/completions", method: "POST", region: "global", account: "qg1", model: "Ultimate", status: 200, latencyMs: 918, promptTokens: 1104, completionTokens: 312, stream: true, error: null },
+    { ts: (now - 70) * 1000, endpoint: "/v1/chat/completions", method: "POST", region: "cn", account: "q1", model: "Qwen3.8-Max", status: 200, latencyMs: 764, promptTokens: 1420, completionTokens: 386, credits: 0.05, stream: true, error: null },
+    { ts: (now - 620) * 1000, endpoint: "/v1/messages", method: "POST", region: "cn", account: "q1", model: "GLM-5.1", status: 200, latencyMs: 588, promptTokens: 986, completionTokens: 254, credits: 0.04, stream: false, error: null },
+    { ts: (now - 1800) * 1000, endpoint: "/v1/chat/completions", method: "POST", region: "cn", account: "q3", model: "MiniMax-M3", status: 429, latencyMs: 96, promptTokens: 0, completionTokens: 0, credits: 0, stream: true, error: t("shared.demo.qoder.gateway.modelRateLimited") },
+    { ts: (now - 2600) * 1000, endpoint: "/v1/messages", method: "POST", region: "cn", account: "q1", model: "GLM-5.1", status: 200, latencyMs: 612, promptTokens: 1208, completionTokens: 288, credits: 0, stream: false, error: null },
+    { ts: (now - 4200) * 1000, endpoint: "/v1/chat/completions", method: "POST", region: "global", account: "qg1", model: "Ultimate", status: 200, latencyMs: 918, promptTokens: 1104, completionTokens: 312, credits: 0.11, stream: true, error: null },
   ];
   return { logs };
 }
@@ -2961,8 +3007,8 @@ function demoTraeApiKeys(): { keys: TraeApiKeyRecord[] } {
      所以这里也必须是 `sk-trae-0a1b` + `cdef`，**不是**带省略号的整串。 */
   return {
     keys: [
-      { id: "demo-trae-key-1", name: t("shared.demo.trae.key.cursorCn"), variant: "trae_work", prefix: "sk-trae-9f2c", suffix: "7d31", createdAt: atLocalTime(3, 17, 3), revokedAt: null, revoked: false, lastUsedAt: atLocalTime(0, 17, 10) },
-      { id: "demo-trae-key-2", name: t("shared.demo.trae.key.continueCode"), variant: "trae_cn", prefix: "sk-trae-6d18", suffix: "a0e9", createdAt: atLocalTime(2, 20, 12), revokedAt: null, revoked: false, lastUsedAt: atLocalTime(0, 16, 58) },
+      { id: "demo-trae-key-1", name: t("shared.demo.trae.key.cursorCn"), variant: "trae_work", prefix: "sk-trae-9f2c", suffix: "7d31", plaintext: "sk-trae-9f2c1a3b5c7d9e0f2a4b6c8d0e1f7d31", createdAt: atLocalTime(3, 17, 3), revokedAt: null, revoked: false, lastUsedAt: atLocalTime(0, 17, 10) },
+      { id: "demo-trae-key-2", name: t("shared.demo.trae.key.continueCode"), variant: "trae_cn", prefix: "sk-trae-6d18", suffix: "a0e9", plaintext: "sk-trae-6d180f1e2d3c4b5a69788796a5b4a0e9", createdAt: atLocalTime(2, 20, 12), revokedAt: null, revoked: false, lastUsedAt: atLocalTime(0, 16, 58) },
       { id: "demo-trae-key-3", name: t("shared.demo.trae.key.cherryGlobal"), variant: "global", prefix: "sk-trae-4b7e", suffix: "2f4a", createdAt: atLocalTime(2, 9, 40), revokedAt: null, revoked: false, lastUsedAt: atLocalTime(0, 16, 41) },
       { id: "demo-trae-key-4", name: t("shared.demo.trae.key.legacy"), variant: "cn", prefix: "sk-trae-0a1b", suffix: "cdef", createdAt: atLocalTime(9, 8, 0), revokedAt: atLocalTime(1, 12, 30), revoked: true, lastUsedAt: atLocalTime(3, 10, 5) },
     ],

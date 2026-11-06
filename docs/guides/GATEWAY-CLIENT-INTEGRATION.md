@@ -140,7 +140,8 @@ webui/CLI：`buddy-switch serve` 后同样在「网关」页打开开关。
 
 Anthropic 系客户端**自己会拼 `/v1/messages`**；给它带 `/v1` 的地址会拼成 `/v1/v1/messages` → 404。
 
-> ⚠️ 界面上的「Base URL」一行显示的是**根地址**（后端 `base_url` 字段就是 `http://host:port`）。照抄进 OpenAI 系客户端会缺 `/v1` —— 见附录 B。
+> ✅ 界面「接入地址」行显示并复制的就是**OpenAI 基址（含 `/v1`）**，可直接填进 OpenAI 系客户端；
+> Anthropic 系请把末尾的 `/v1` 去掉（或看「接入说明」卡里给出的根地址）。口径收口见附录 B。
 
 ### 2.4 模型名不用手填（但也不能瞎填）
 
@@ -460,6 +461,8 @@ DSH 判断一个模型能不能收图**只看配置里声明的输入模态**，
   `usage.input_tokens` 由网关按请求体**估算**占位（上游的真实 `prompt_tokens` 要到流末
   才到），末帧 `message_delta` 用真实值覆盖。所以占用率是「先估后校」——同一轮里可能
   先看到估算值，流结束即变成真实值；`cache_read_input_tokens` 只在上游报了缓存命中时非 0。
+  **`input_tokens` 不含命中量**（上游 `prompt_tokens` 减掉命中量后才发出）：Anthropic 语义里
+  两者是相加关系，客户端按 `input_tokens + cache_read_input_tokens` 算总输入与命中率才对。
 
 ### 3.5 WorkBuddy 侧客户端
 
@@ -658,26 +661,25 @@ Trae IDE 与 SOLO 桌面端**支持自定义模型**（国内版 v3.3.51 起灰�
 | Qoder 网关 Key / 配置 | `~/.buddy-switch/qoder/gateway_keys.json` / `gateway_config.json` |
 | 统一入口 Key / 配置 | `~/.buddy-switch/gateway_unified_keys.json` / `gateway_unified.json` |
 
-## 附录 B：已知偏差（界面接入指引的 Base URL）
+## 附录 B：Base URL 口径（已收口，issue #165）
 
-**现象**：「API 服务」页 →「接入指引」里，**OpenAI 协议**的片段（Codex / opencode / 通用）给出的 Base URL **缺 `/v1`**；Anthropic 协议（Claude Code）的片段是对的。
+**曾经的偏差**：界面「接入地址」给的是根地址（`http://host:port`），照抄进 OpenAI 系客户端缺 `/v1` ⇒ 404；而同一屏的「接入说明」卡又写着带 `/v1` 的串，自相矛盾。
 
-**根因**：后端 `GatewayStatusView.base_url` 的值是 `http://host:port`（**不含 `/v1`**，见 `gateway/state.rs` 的 `GatewayConfig::base_url()` 与其单测）；而前端 `resolveGatewayBaseUrl` 的**兜底分支**返回的是 `http://host:port/v1`。主路径走后端值 ⇒ 拿到不带 `/v1` 的串。接入指引的 `rootUrl = baseUrl.replace(/\/v1\/?$/,"")` 因此没做任何剥离，OpenAI 片段就少了 `/v1`。
+**根因**：后端 `GatewayStatusView.base_url` 是根地址，而前端 `resolveGatewayBaseUrl` 的兜底分支返回带 `/v1` 的串 —— 两条分支形态不同，消费方按「带 `/v1`」用就少一层。
 
-**影响**：照抄界面片段配置 Codex / opencode / 通用 OpenAI 客户端 ⇒ 请求打到 `/chat/completions`（少一层 `/v1`）⇒ **404**。Anthropic 系不受影响。
+**现在的约定**（改这块前先读）：
 
-**本文怎么处理**：本文所有片段一律按**正确值**给出（OpenAI 系带 `/v1`，Anthropic 系不带）。
+- 后端 `base_url` **只给根地址**，不带 `/v1`；
+- 前端派生只有一处入口 `src/lib/gateway-url.ts`：`gatewayRootUrl`（根地址）/ `gatewayOpenAiBaseUrl`（含 `/v1`）/ `gatewayOpenAiBaseUrlFrom`（收敛两条分支，恒定带 `/v1`）；
+- 四个网关页（WB / Trae / Qoder / 统一）一律调用，**禁止手拼** `http://${host}:${port}`；
+- `0.0.0.0` 是监听通配地址，展示与复制一律归一回环。
 
-**建议修法**（择一，属代码改动）：
-- 让 `GatewayConfig::base_url()` 返回带 `/v1` 的值，并同步 `resolveGatewayBaseUrl` 的兜底分支与 `state.rs` 的单测；或
-- 让两个接入指引按协议自行拼 `/v1`，与 `resolveGatewayBaseUrl` 的语义解耦。
-
-> 注意：现有门禁 `scripts/check-scope-registry.cjs` 的夹具用的是 `baseUrl: "http://127.0.0.1:8080/v1"`（**带 `/v1`**），所以这个偏差在门禁下**看不出来** —— 改的时候记得把夹具也一起改成后端真实值，否则修完仍然是绿的。
+**门禁**：`scripts/check-gateway-url.mjs`（已挂进 `npm run check:scope`）跑真断言钉住上面四条，含「`src/**` 不许手拼」的扫描。
 
 ## 附录 C：安全边界
 
 - 网关默认**只监听 `127.0.0.1`**。改成 `0.0.0.0` 需要二次风险确认 —— 局域网内任何设备都能消耗你的额度。
-- API Key **明文只在创建时返回一次**；库里只有 `sha256` + 前缀 4 位 + 尾 4 位，**不可逆推**。列表里的 `••••` 不是 Key。
+- API Key 默认以掩码展示（前缀 + 尾 4 位）；**点列表里的眼睛可查看完整明文**，但前提是创建时在弹窗里选了「保存到本软件」——选「自行保存」的 Key 与旧台账一样只有掩码、不显示眼睛。校验只认 `sha256`，掩码里的 `••••` 不是 Key。
 - Key 与 region / variant **强绑定**，客户端无法自行越域（跨域前缀默认返回 400，而非静默改名）。
 - Trae 网关**没有任何可用 Key 时拒绝一切请求**（不像某些实现「留空即不鉴权」）—— 任何人猜到 57894 端口也白嫖不到。
 - 本工具的数据全部在 `~/.buddy-switch/` 下，不上传第三方。
